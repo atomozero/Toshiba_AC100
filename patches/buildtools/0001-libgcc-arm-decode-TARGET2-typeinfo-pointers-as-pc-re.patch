@@ -1,0 +1,27 @@
+From e23af78e8035fc4c9364e5da71677dc60df54d86 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 12:59:04 +0200
+Subject: [PATCH] libgcc/arm: decode TARGET2 typeinfo pointers as pc-relative
+ indirect on Haiku
+
+ld's armelf_haiku emulation uses TARGET2_TYPE=got-rel, like Linux, but
+_Unwind_decode_typeinfo_ptr() treated Haiku as an 'absolute' platform,
+so the C++ personality routine would interpret a pc-relative GOT offset
+as a type_info address.
+---
+ gcc/libgcc/config/arm/unwind-arm.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/gcc/libgcc/config/arm/unwind-arm.h b/gcc/libgcc/config/arm/unwind-arm.h
+index b5b27fb85c..ffb191cffe 100644
+--- a/gcc/libgcc/config/arm/unwind-arm.h
++++ b/gcc/libgcc/config/arm/unwind-arm.h
+@@ -74,7 +74,7 @@ static inline _Unwind_Ptr _Unwind_gnu_Find_got (_Unwind_Ptr ptr)
+       tmp += _Unwind_gnu_Find_got (ptr);
+       tmp = *(_Unwind_Word *) tmp;
+ #elif (defined(linux) && !defined(__uClinux__)) || defined(__NetBSD__) \
+-    || defined(__FreeBSD__) || defined(__fuchsia__)
++    || defined(__FreeBSD__) || defined(__fuchsia__) || defined(__HAIKU__)
+       /* Pc-relative indirect.  */
+ #define _GLIBCXX_OVERRIDE_TTYPE_ENCODING (DW_EH_PE_pcrel | DW_EH_PE_indirect)
+       tmp += ptr;
