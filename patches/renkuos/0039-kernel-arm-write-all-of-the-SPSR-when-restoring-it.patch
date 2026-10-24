@@ -1,0 +1,64 @@
+From 38ff19da312682c09d7d510a495cbb7ad1d25e1c Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 19:35:54 +0200
+Subject: [PATCH 039/203] kernel/arm: write all of the SPSR when restoring it
+
+"msr spsr, rN" only writes the control and flags fields of the SPSR
+(SPSR_fc), leaving bits 8-23 as they were. The exception entry and exit
+code copies the interrupted context's SPSR this way, so the E (data
+endianness), A, GE and IT bits came from whatever the SPSR_svc held
+before. On QEMU that is zero; on the Toshiba AC100 the firmware leaves
+the E bit set, and the first return from an exception switched the CPU
+to big endian data accesses: every value then loaded from memory was
+byte swapped, e.g. return addresses popped off the stack.
+
+Use spsr_fsxc to write the whole register.
+---
+ src/system/kernel/arch/arm/arch_asm.S        | 2 +-
+ src/system/kernel/arch/arm/arch_exceptions.S | 6 +++---
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/system/kernel/arch/arm/arch_asm.S b/src/system/kernel/arch/arm/arch_asm.S
+index c4addd43a6..977e3ca640 100644
+--- a/src/system/kernel/arch/arm/arch_asm.S
++++ b/src/system/kernel/arch/arm/arch_asm.S
+@@ -267,7 +267,7 @@ FUNCTION(arch_return_to_userland):
+ 	mrs		ip, cpsr
+ 	bic		ip, ip, #(CPSR_MODE_MASK | CPSR_T | CPSR_F | CPSR_I)
+ 	orr		ip, ip, #(CPSR_MODE_USR | CPSR_F)
+-	msr		spsr, ip
++	msr		spsr_fsxc, ip
+ 
+ 	// use system mode to load user mode SP and LR
+ 	ldr		r4, [r0, #IFRAME_usr_sp]
+diff --git a/src/system/kernel/arch/arm/arch_exceptions.S b/src/system/kernel/arch/arm/arch_exceptions.S
+index 09210ce38f..5a5dccce10 100644
+--- a/src/system/kernel/arch/arm/arch_exceptions.S
++++ b/src/system/kernel/arch/arm/arch_exceptions.S
+@@ -33,7 +33,7 @@
+ 	str		r0, [sp, #-4]!				/* Push return address */
+ 	str		lr, [sp, #-4]!				/* Push SVC lr */
+ 	str		r2, [sp, #-4]!				/* Push SVC sp */
+-	msr		spsr, r3					/* Restore correct spsr */
++	msr		spsr_fsxc, r3					/* Restore correct spsr */
+ 	ldmdb	r1, {r0-r3}					/* Restore 4 regs from xxx mode */
+ 	sub		sp, sp, #(4*15)				/* Adjust the stack pointer */
+ 	stmia	sp, {r0-r12}				/* Push the user mode registers */
+@@ -46,7 +46,7 @@
+ 
+ .macro PULL_FRAME_FROM_SVC_AND_EXIT
+ 	ldr		r0, [sp], #0x0004			/* Get the SPSR from stack */
+-	msr		spsr, r0					/* restore SPSR */
++	msr		spsr_fsxc, r0					/* restore SPSR */
+ 	ldmia	sp, {r0-r14}^				/* Restore registers (usr mode) */
+ 	mov		r0, r0						/* NOP for previous instruction */
+ 	add		sp, sp, #(4*15)				/* Adjust the stack pointer */
+@@ -70,7 +70,7 @@
+ 
+ .macro	PULL_FRAME_AND_EXIT
+ 	ldr		r0, [sp], #4				/* Get SPSR from stack */
+-	msr		spsr, r0
++	msr		spsr_fsxc, r0
+ 	ldmia	sp, {r0-r14}^				/* Restore user mode registers */
+ 	add		sp, sp, #(4*17)				/* Adjust the stack pointer */
+ 	ldr		lr, [sp], #4				/* Pull the return address */

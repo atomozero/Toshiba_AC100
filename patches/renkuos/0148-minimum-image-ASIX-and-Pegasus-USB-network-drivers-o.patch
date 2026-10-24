@@ -1,0 +1,29 @@
+From 7db248623f113a752750fdc4e05d219228cf0f8b Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 19 Oct 2026 23:13:38 +0200
+Subject: [PATCH 148/203] minimum image: ASIX and Pegasus USB network drivers
+ on ARM
+
+USB network adapters and phones are the only network of machines whose
+own network has no driver yet.
+---
+ build/jam/images/definitions/minimum | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
+index efabc3d0c3..9f437c9b6f 100644
+--- a/build/jam/images/definitions/minimum
++++ b/build/jam/images/definitions/minimum
+@@ -364,6 +364,12 @@ SYSTEM_ADD_ONS_DRIVERS_NET = [ FFilterByBuildFeatures
+ 	usb_davicom
+ 	usb_rndis
+ 	wb840
++
++	# USB network adapters for machines without a usable network otherwise
++	arm @{
++		asix88xxx
++		pegasus
++	}@ # arm
+ ] ;
+ 
+ SYSTEM_ADD_ONS_DRIVERS_POWER = [ FFilterByBuildFeatures

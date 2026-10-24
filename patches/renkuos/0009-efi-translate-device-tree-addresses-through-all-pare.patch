@@ -1,0 +1,146 @@
+From 8c981cd922a268a3a2965ccb3e8be16f3d38b754 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 13:40:19 +0200
+Subject: [PATCH 009/203] efi: translate device tree addresses through all
+ parent buses
+
+dtb_get_reg() only applied the 'ranges' of the direct parent and mixed
+up the property length in bytes with an index in cells. Devices behind
+several buses, like the UART of the Versatile Express motherboard
+(bus -> motherboard -> iofpga), ended up at the wrong address and the
+loader hung polling it.
+
+Walk up to the root, applying each parent's 'ranges' (an empty one being
+an identity mapping). Also do not reprogram the UART baud rate when its
+input clock is unknown (dtb_get_clock_frequency() returns -1, not 0).
+---
+ src/system/boot/platform/efi/dtb.cpp | 97 +++++++++++++++++-----------
+ 1 file changed, 59 insertions(+), 38 deletions(-)
+
+diff --git a/src/system/boot/platform/efi/dtb.cpp b/src/system/boot/platform/efi/dtb.cpp
+index a2cfedb65b..25fec216f9 100644
+--- a/src/system/boot/platform/efi/dtb.cpp
++++ b/src/system/boot/platform/efi/dtb.cpp
+@@ -376,6 +376,25 @@ dtb_get_size_cells(const void* fdt, int node)
+ }
+ 
+ 
++/*!	Reads a number of up to three cells; for three cells (PCI addresses) the
++	leading cell with the address space flags is skipped.
++*/
++static uint64
++read_cells(const uint32* cells, uint32 count)
++{
++	switch (count) {
++		case 1:
++			return fdt32_to_cpu(cells[0]);
++		case 2:
++			return ((uint64)fdt32_to_cpu(cells[0]) << 32) | fdt32_to_cpu(cells[1]);
++		case 3:
++			return ((uint64)fdt32_to_cpu(cells[1]) << 32) | fdt32_to_cpu(cells[2]);
++		default:
++			return 0;
++	}
++}
++
++
+ bool
+ dtb_get_reg(const void* fdt, int node, size_t idx, addr_range& range)
+ {
+@@ -404,48 +423,50 @@ dtb_get_reg(const void* fdt, int node, size_t idx, addr_range& range)
+ 		default: panic("unsupported sizeCells");
+ 	}
+ 
+-	int parent = fdt_parent_offset(fdt, node);
+-	if (parent >= 0) {
+-		uint32 parentAddressCells = dtb_get_address_cells(fdt, parent);
+-
+-		uint32 rangesSize = 0;
+-		uint32 *ranges = (uint32 *)fdt_getprop(fdt, parent, "ranges", (int *)&rangesSize);
+-		if (ranges == NULL)
+-			return true;
+-
+-		uint32 rangesPos = 0;
+-		while (rangesSize >= (rangesPos + parentAddressCells + addressCells + sizeCells)) {
+-			addr_t childAddress;
+-			addr_t parentAddress;
+-			size_t rangeSize;
++	// Translate the address through the "ranges" of every parent bus up to
++	// the root, as devices can sit behind several levels of buses.
++	int child = node;
++	while (true) {
++		int parent = fdt_parent_offset(fdt, child);
++		if (parent < 0 || fdt_parent_offset(fdt, parent) < 0) {
++			// the root node does not translate
++			break;
++		}
+ 
+-			if (addressCells == 1) {
+-				childAddress = fdt32_to_cpu(*(uint32*)(ranges+rangesPos));
+-			} else {
+-				childAddress = fdt64_to_cpu(*(uint64*)(ranges+rangesPos));
+-			}
+-			rangesPos += addressCells;
++		int rangesLength;
++		const uint32* ranges = (const uint32*)fdt_getprop(fdt, parent, "ranges",
++			&rangesLength);
++		if (ranges == NULL) {
++			// not translatable, keep what we have
++			break;
++		}
+ 
+-			if (parentAddressCells == 1) {
+-				parentAddress = fdt32_to_cpu(*(uint32*)(ranges+rangesPos));
+-			} else {
+-				parentAddress = fdt64_to_cpu(*(uint64*)(ranges+rangesPos));
++		uint32 childCells = dtb_get_address_cells(fdt, child);
++		uint32 parentCells = dtb_get_address_cells(fdt, parent);
++		uint32 rangeSizeCells = dtb_get_size_cells(fdt, child);
++		uint32 entryCells = childCells + parentCells + rangeSizeCells;
++
++		// an empty "ranges" means an identity mapping
++		bool translated = rangesLength == 0;
++		for (int i = 0; !translated
++				&& (i + 1) * entryCells * 4 <= (uint32)rangesLength; i++) {
++			const uint32* entry = ranges + i * entryCells;
++			uint64 childAddress = read_cells(entry, childCells);
++			uint64 parentAddress = read_cells(entry + childCells, parentCells);
++			uint64 rangeSize = read_cells(entry + childCells + parentCells,
++				rangeSizeCells);
++
++			if (range.start >= childAddress
++				&& range.start - childAddress < rangeSize) {
++				range.start = range.start - childAddress + parentAddress;
++				translated = true;
+ 			}
+-			rangesPos += parentAddressCells;
++		}
+ 
+-			if (sizeCells == 1) {
+-				rangeSize = fdt32_to_cpu(*(uint32*)(ranges+rangesPos));
+-			} else {
+-				rangeSize = fdt64_to_cpu(*(uint64*)(ranges+rangesPos));
+-			}
+-			rangesPos += sizeCells;
++		if (!translated)
++			break;
+ 
+-			if ((range.start >= childAddress) && (range.start <= childAddress + rangeSize)) {
+-				range.start -= childAddress;
+-				range.start += parentAddress;
+-				break;
+-			}
+-		}
++		child = parent;
+ 	}
+ 
+ 	return true;
+@@ -573,7 +594,7 @@ dtb_handle_fdt(const void* fdt, int node)
+ 				// Without a known input clock we cannot compute a baud
+ 				// divisor, so keep what the firmware has set up
+ 				gUARTSkipInit = fdt_getprop(fdt, node, "skip-init", NULL) != NULL
+-					|| uart.clock == 0;
++					|| uart.clock <= 0;
+ 			}
+ 		}
+ 	}

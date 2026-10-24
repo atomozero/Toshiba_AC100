@@ -1,0 +1,60 @@
+From 707e411eb03deb509ae630128f13f64f7e7490c8 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 22:35:39 +0200
+Subject: [PATCH 053/203] usb: use non-cacheable memory for DMA on ARM
+
+The USB host controllers read and write their descriptors and the
+transfer buffers by DMA, which is not coherent with the data cache on
+ARM. Map the memory the stack hands out to the controllers as normal
+non-cacheable memory.
+---
+ .../bus_managers/usb/PhysicalMemoryAllocator.cpp       | 10 ++++++++++
+ src/add-ons/kernel/bus_managers/usb/Stack.cpp          |  7 +++++++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/src/add-ons/kernel/bus_managers/usb/PhysicalMemoryAllocator.cpp b/src/add-ons/kernel/bus_managers/usb/PhysicalMemoryAllocator.cpp
+index 11b4584961..fad662dc9f 100644
+--- a/src/add-ons/kernel/bus_managers/usb/PhysicalMemoryAllocator.cpp
++++ b/src/add-ons/kernel/bus_managers/usb/PhysicalMemoryAllocator.cpp
+@@ -15,6 +15,10 @@
+ 
+ #include "PhysicalMemoryAllocator.h"
+ 
++#ifdef __ARM__
++#	include <vm/vm.h>
++#endif
++
+ 
+ //#define TRACE_PHYSICAL_MEMORY_ALLOCATOR
+ #ifdef TRACE_PHYSICAL_MEMORY_ALLOCATOR
+@@ -91,6 +95,12 @@ PhysicalMemoryAllocator::PhysicalMemoryAllocator(const char *name,
+ 
+ 	fPhysicalBase = physicalEntry.address;
+ 
++#ifdef __ARM__
++	// The controllers access this memory by DMA, which is not coherent with
++	// the data cache on ARM
++	vm_set_area_memory_type(fArea, fPhysicalBase, B_WRITE_COMBINING_MEMORY);
++#endif
++
+ 	fNoMemoryCondition.Init(this, "USB PMA");
+ 	fStatus = B_OK;
+ }
+diff --git a/src/add-ons/kernel/bus_managers/usb/Stack.cpp b/src/add-ons/kernel/bus_managers/usb/Stack.cpp
+index 06e95e61e1..6e61c4ad56 100644
+--- a/src/add-ons/kernel/bus_managers/usb/Stack.cpp
++++ b/src/add-ons/kernel/bus_managers/usb/Stack.cpp
+@@ -347,6 +347,13 @@ Stack::AllocateArea(void **logicalAddress, phys_addr_t *physicalAddress, size_t
+ 		return B_ERROR;
+ 	}
+ 
++#ifdef __ARM__
++	// The controllers access this memory by DMA, which is not coherent with
++	// the data cache on ARM
++	vm_set_area_memory_type(area, physicalEntry.address,
++		B_WRITE_COMBINING_MEMORY);
++#endif
++
+ 	memset(logAddress, 0, size);
+ 	if (logicalAddress)
+ 		*logicalAddress = logAddress;

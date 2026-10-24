@@ -1,0 +1,76 @@
+From 7a2114aeccf3ffdf64cdd50cacc222df68ec0d64 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 10:35:51 +0200
+Subject: [PATCH 002/203] ARM: link kernel and loader against the
+ cross-compiler libgcc
+
+The prebuilt libgcc-kernel.a from gcc_syslibs_devel is built for a VFP
+with 32 double registers and uses d16-d31 (e.g. in __aeabi_d2ulz), which
+faults on VFPv3-D16 CPUs such as Tegra 2. Use the libgcc.a built along
+with the cross tools instead, like x86_64 does for its EFI loader.
+
+Also fix the host build of RPattern.cpp (missing <stddef.h> for offsetof)
+and an include in soc_tegra.cpp.
+---
+ build/jam/SystemLibraryRules             | 10 ++++++++++
+ configure                                |  5 +++++
+ src/system/kernel/arch/arm/soc_tegra.cpp |  2 +-
+ 3 files changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/build/jam/SystemLibraryRules b/build/jam/SystemLibraryRules
+index ea4b90a7da..e28d67a113 100644
+--- a/build/jam/SystemLibraryRules
++++ b/build/jam/SystemLibraryRules
+@@ -219,6 +219,12 @@ rule TargetKernelLibgcc asPath
+ 	# Invoking with <asPath> = true will return the full library path.
+ 
+ 	if $(TARGET_PLATFORM) = haiku {
++		if $(TARGET_KERNEL_ARCH) = arm && $(TARGET_BOOT_LIBGCC) {
++			# use the libgcc.a built by the cross-compiler, the prebuilt
++			# libgcc-kernel.a requires a VFP with 32 double registers
++			return $(TARGET_BOOT_LIBGCC) ;
++		}
++
+ 		# return libgcc-kernel.a from the gcc_syslibs_devel build feature.
+ 		local flags ;
+ 		if $(asPath) = true {
+@@ -260,6 +266,10 @@ rule TargetBootLibgcc architecture : asPath
+ 		if $(asPath) = true {
+ 			flags += path ;
+ 		}
++		if $(architecture) = arm && $(TARGET_BOOT_LIBGCC) {
++			# see TargetKernelLibgcc
++			return $(TARGET_BOOT_LIBGCC) ;
++		}
+ 		if $(architecture) = arm {
+ 			return [
+ 				BuildFeatureAttribute QUALIFIED $(architecture):gcc_syslibs_devel
+diff --git a/configure b/configure
+index f3dbd57133..4e1e9532de 100755
+--- a/configure
++++ b/configure
+@@ -344,6 +344,11 @@ standard_gcc_settings()
+ 			boot32CxxHeaders="$headers/$gccMachine/32"
+ 			bootCxxHeaders="$headers/$gccMachine"
+ 			;;
++		arm-*)
++			# Kernel and boot loader use the libgcc.a built by the cross-compiler,
++			# so that they match its FPU configuration (e.g. VFPv3-D16)
++			bootLibgcc=`$gcc -print-file-name=libgcc.a`
++			;;
+ 	esac
+ 
+ 	# determine whether graphite loop optimization should/can be used
+diff --git a/src/system/kernel/arch/arm/soc_tegra.cpp b/src/system/kernel/arch/arm/soc_tegra.cpp
+index f5ca1931b6..27f03aca7b 100644
+--- a/src/system/kernel/arch/arm/soc_tegra.cpp
++++ b/src/system/kernel/arch/arm/soc_tegra.cpp
+@@ -6,7 +6,7 @@
+ 
+ #include "soc_tegra.h"
+ 
+-#include <int.h>
++#include <KernelExport.h>
+ #include <timer.h>
+ #include <vm/vm.h>
+ 

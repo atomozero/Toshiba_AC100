@@ -1,0 +1,38 @@
+From e586e5bd7fdbb66fe4aad27f726b04e61ad110ad Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 20:55:31 +0200
+Subject: [PATCH 045/203] kernel/vfs: wait for the boot device to show up
+
+Devices on buses that are scanned asynchronously, like SD cards behind
+the MMC bus, may not be published yet when the boot partition is looked
+for: on the Toshiba AC100 the SD card was still answering ACMD41 with
+"busy" when the kernel panicked with "did not find any boot
+partitions". Look for the boot partitions again for up to 15 seconds
+before giving up.
+---
+ src/system/kernel/fs/vfs_boot.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/system/kernel/fs/vfs_boot.cpp b/src/system/kernel/fs/vfs_boot.cpp
+index d7bcfafc6f..b2b7ebb35a 100644
+--- a/src/system/kernel/fs/vfs_boot.cpp
++++ b/src/system/kernel/fs/vfs_boot.cpp
+@@ -498,6 +498,18 @@ vfs_mount_boot_file_system(kernel_args* args)
+ 
+ 	PartitionStack partitions;
+ 	status_t status = get_boot_partitions(bootVolume, partitions);
++
++	// Some boot devices are published asynchronously and may still be
++	// initializing (e.g. an SD card waiting to power up), so give them some
++	// time to show up.
++	for (int32 tries = 0; status == B_OK && partitions.IsEmpty() && tries < 30;
++			tries++) {
++		if (tries == 0)
++			dprintf("vfs_mount_boot_file_system(): waiting for the boot device\n");
++		snooze(500000);
++		status = get_boot_partitions(bootVolume, partitions);
++	}
++
+ 	if (status < B_OK) {
+ 		panic("get_boot_partitions failed!");
+ 	}

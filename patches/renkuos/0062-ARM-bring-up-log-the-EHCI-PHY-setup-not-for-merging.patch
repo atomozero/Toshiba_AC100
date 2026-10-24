@@ -1,0 +1,35 @@
+From 31877d3c9c8173c590c0e940c0a1669db7fc7c57 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 23:28:11 +0200
+Subject: [PATCH 062/203] ARM bring-up: log the EHCI PHY setup (not for
+ merging)
+
+---
+ src/add-ons/kernel/busses/usb/ehci.cpp | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/ehci.cpp b/src/add-ons/kernel/busses/usb/ehci.cpp
+index 72a028e4f6..dd30a497ea 100644
+--- a/src/add-ons/kernel/busses/usb/ehci.cpp
++++ b/src/add-ons/kernel/busses/usb/ehci.cpp
+@@ -396,11 +396,15 @@ init_device(device_node* node, void** device_cookie)
+ 			return B_ERROR;
+ 		}
+ 
+-		if (kFDTControllers[index].setup_phy != NULL
+-			&& kFDTControllers[index].setup_phy(fdt, fdtDevice, registers)
+-				!= B_OK) {
+-			free(bus);
+-			return B_ERROR;
++		if (kFDTControllers[index].setup_phy != NULL) {
++			status_t phyStatus = kFDTControllers[index].setup_phy(fdt,
++				fdtDevice, registers);
++			dprintf("AC100: ehci %#" B_PRIx64 " PHY setup: %s\n", registers,
++				strerror(phyStatus));
++			if (phyStatus != B_OK) {
++				free(bus);
++				return B_ERROR;
++			}
+ 		}
+ 
+ 		bus->is_fdt = true;

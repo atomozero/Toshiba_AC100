@@ -1,0 +1,137 @@
+From b55da33b11fd2ffb049dc8b37439e94e9e03b7fd Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 20 Oct 2026 00:24:40 +0200
+Subject: [PATCH 154/203] sdhci: keep DMA coherent with the CPU caches on ARM
+
+The SDHCI DMA engines do not snoop the CPU caches on ARM SoCs such as the
+NVIDIA Tegra 2. The ADMA2 descriptor table and the bounce buffer are now
+uncached there, and the buffers of a transfer are written back before it and
+discarded after a read, including the PL310 outer cache. Other architectures
+are not affected.
+---
+ src/add-ons/kernel/busses/mmc/sdhci.cpp | 91 +++++++++++++++++++++++++
+ 1 file changed, 91 insertions(+)
+
+diff --git a/src/add-ons/kernel/busses/mmc/sdhci.cpp b/src/add-ons/kernel/busses/mmc/sdhci.cpp
+index 076f93cf50..7e071f0782 100644
+--- a/src/add-ons/kernel/busses/mmc/sdhci.cpp
++++ b/src/add-ons/kernel/busses/mmc/sdhci.cpp
+@@ -129,6 +129,16 @@ SdhciBus::SdhciBus(struct registers* registers, uint8_t irq, bool poll,
+ 		return;
+ 	}
+ 	fDmaDescriptorsPhysical = entry.address;
++#ifdef __ARM__
++	// The DMA engine does not snoop the CPU caches here: keep the descriptor
++	// table and the bounce buffer out of them
++	fStatus = vm_set_area_memory_type(fDmaArea, entry.address,
++		B_UNCACHED_MEMORY);
++	if (fStatus != B_OK) {
++		ERROR("Could not make the DMA memory uncached\n");
++		return;
++	}
++#endif
+ 	fBounceBuffer = (uint8*)fDmaDescriptors + B_PAGE_SIZE;
+ 	fBouncePhysical = entry.address + B_PAGE_SIZE;
+ 	TRACE("DMA memory: descriptor table at %" B_PRIxPHYSADDR
+@@ -844,6 +854,70 @@ SdhciBus::_AbortTransfer(const char* reason)
+ }
+ 
+ 
++#ifdef __ARM__
++/*!	The DMA engine is not coherent with the CPU data caches on ARM. Before a
++	transfer, write back (and for reads also discard) the cached lines of the
++	buffer, so that no dirty line is later evicted over the data the controller
++	wrote; after a read, discard them again, as they may have been fetched
++	speculatively while the transfer was running.
++*/
++static void
++sync_dma_buffer(phys_addr_t address, size_t size, bool isWrite)
++{
++	uint32 ctr;
++	asm volatile ("mrc p15, 0, %0, c0, c0, 1" : "=r" (ctr));
++	const addr_t lineSize = 4 << ((ctr >> 16) & 0xf);
++
++	const phys_addr_t end = address + size;
++	while (address < end) {
++		phys_addr_t page = ROUNDDOWN(address, B_PAGE_SIZE);
++		size_t chunk = std::min(end, page + B_PAGE_SIZE) - address;
++
++		addr_t virtualPage;
++		void* handle;
++		if (vm_get_physical_page(page, &virtualPage, &handle) != B_OK) {
++			panic("sdhci: could not map DMA buffer page %#" B_PRIxPHYSADDR,
++				page);
++			return;
++		}
++
++		addr_t start = virtualPage + (address - page);
++		for (addr_t line = start & ~(lineSize - 1); line < start + chunk;
++				line += lineSize) {
++			if (isWrite) {
++				// DCCMVAC: clean to the point of coherency
++				asm volatile ("mcr p15, 0, %0, c7, c10, 1" : : "r" (line)
++					: "memory");
++			} else {
++				// DCCIMVAC: clean and invalidate to the point of coherency
++				asm volatile ("mcr p15, 0, %0, c7, c14, 1" : : "r" (line)
++					: "memory");
++			}
++		}
++		asm volatile ("dsb" : : : "memory");
++
++		// The outer cache too. For reads, discard the inner lines again, so
++		// that none of them is refilled from it with old data meanwhile.
++		if (isWrite)
++			arm_outer_cache_clean_range(address, chunk);
++		else {
++			arm_outer_cache_flush_range(address, chunk);
++			for (addr_t line = start & ~(lineSize - 1); line < start + chunk;
++					line += lineSize) {
++				// DCIMVAC: invalidate to the point of coherency
++				asm volatile ("mcr p15, 0, %0, c7, c6, 1" : : "r" (line)
++					: "memory");
++			}
++			asm volatile ("dsb" : : : "memory");
++		}
++
++		vm_put_physical_page(virtualPage, handle);
++		address += chunk;
++	}
++}
++#endif
++
++
+ /*!	Runs one data command and its data phase.
+ 	\a physical is used for DMA. For PIO, the data is copied from/to \a buffer
+ 	if it is not NULL (kernel address), and from/to \a physical otherwise.
+@@ -931,6 +1005,18 @@ SdhciBus::_TransferChunk(uint8 command, uint32 argument, uint32 blockCount,
+ 			break;
+ 	}
+ 
++#ifdef __ARM__
++	// The descriptor table and the bounce buffer are uncached, any other
++	// buffer has to be made coherent with the caches by hand. The barrier
++	// makes sure the descriptors are in memory before the transfer starts.
++	const bool cachedBuffer = dataMode != kDataModePio
++		&& (physical < fDmaDescriptorsPhysical
++			|| physical >= fDmaDescriptorsPhysical + 2 * B_PAGE_SIZE);
++	if (cachedBuffer)
++		sync_dma_buffer(physical, length, isWrite);
++	asm volatile ("dsb" : : : "memory");
++#endif
++
+ 	// For multiple block transfers, the DMA boundary is set to the largest
+ 	// value. The device node properties make sure the DMA resource never gives
+ 	// us a buffer crossing it, but SDMA boundary interrupts are handled below
+@@ -1099,6 +1185,11 @@ SdhciBus::_TransferChunk(uint8 command, uint32 argument, uint32 blockCount,
+ 	}
+ 
+ 	fRegisters->interrupt_status = kDataStatusBits;
++
++#ifdef __ARM__
++	if (cachedBuffer && !isWrite)
++		sync_dma_buffer(physical, length, false);
++#endif
+ 	return B_OK;
+ }
+ 

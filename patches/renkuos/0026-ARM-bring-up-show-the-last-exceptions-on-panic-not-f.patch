@@ -1,0 +1,121 @@
+From 398f504c45b933cba5eaa89d7d227dea35de8c38 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 17:44:16 +0200
+Subject: [PATCH 026/203] ARM bring-up: show the last exceptions on panic (not
+ for merging)
+
+---
+ .../private/kernel/arch/arm/arm_boot_marker.h |  1 +
+ src/system/kernel/arch/arm/arch_int.cpp       | 47 +++++++++++++++++++
+ src/system/kernel/debug/debug.cpp             |  1 +
+ 3 files changed, 49 insertions(+)
+
+diff --git a/headers/private/kernel/arch/arm/arm_boot_marker.h b/headers/private/kernel/arch/arm/arm_boot_marker.h
+index c83fa90124..dfec40db79 100644
+--- a/headers/private/kernel/arch/arm/arm_boot_marker.h
++++ b/headers/private/kernel/arch/arm/arm_boot_marker.h
+@@ -128,6 +128,7 @@ void arm_boot_marker(int index);
+ void arm_boot_marker_value(int row, uint32 value);
+ void arm_boot_marker_text(const char* text);
+ void arm_boot_check_text(int row);
++void arm_boot_show_exceptions(int row);
+ #endif
+ 
+ 
+diff --git a/src/system/kernel/arch/arm/arch_int.cpp b/src/system/kernel/arch/arm/arch_int.cpp
+index 21527d2b48..e6d5a5187d 100644
+--- a/src/system/kernel/arch/arm/arch_int.cpp
++++ b/src/system/kernel/arch/arm/arch_int.cpp
+@@ -232,9 +232,14 @@ private:
+ };
+ 
+ 
++static void arm_log_exception(uint32 type, uint32 fsr, uint32 far,
++	struct iframe* frame);
++
++
+ extern "C" void
+ arch_arm_undefined(struct iframe *iframe)
+ {
++	arm_log_exception(5, 0, 0, iframe);
+ 	print_iframe("Undefined Instruction", iframe);
+ 	IFrameScope scope(iframe); // push/pop iframe
+ 
+@@ -358,9 +363,49 @@ arch_arm_handle_access_flag_fault(addr_t far, uint32 fsr, bool isWrite, bool isE
+ }
+ 
+ 
++// bring-up aid: the last exceptions taken, shown by panic()
++struct arm_exception_record {
++	uint32	kind;	// type << 28 | spsr[7:0] << 16 | fsr
++	uint32	far;
++	uint32	pc;
++};
++static arm_exception_record sExceptionLog[4];
++static uint32 sExceptionCount;
++
++
++static void
++arm_log_exception(uint32 type, uint32 fsr, uint32 far, struct iframe* frame)
++{
++	arm_exception_record& record = sExceptionLog[sExceptionCount++ % 4];
++	record.kind = (type << 28) | ((frame->spsr & 0xff) << 16) | (fsr & 0xffff);
++	record.far = far;
++	record.pc = frame->pc;
++}
++
++
++/*!	Shows the three exceptions before the latest one (which is the one that
++	led to the panic) and the total count, starting at \a row.
++*/
++void
++arm_boot_show_exceptions(int row)
++{
++	for (uint32 i = 0; i < 3; i++) {
++		uint32 index = sExceptionCount - 2 - i;
++		const arm_exception_record& record = (sExceptionCount >= i + 2)
++			? sExceptionLog[index % 4] : arm_exception_record();
++		arm_boot_marker_value(row + i * 3, record.kind);
++		arm_boot_marker_value(row + i * 3 + 1, record.far);
++		arm_boot_marker_value(row + i * 3 + 2, record.pc);
++	}
++	arm_boot_marker_value(row + 9, sExceptionCount);
++}
++
++
+ static void
+ arch_arm_page_fault(struct iframe *frame, addr_t far, uint32 fsr, bool isWrite, bool isExec)
+ {
++	arm_log_exception(isExec ? 1 : 2, fsr, far, frame);
++
+ 	if (arch_arm_handle_access_flag_fault(far, fsr, isWrite, isExec))
+ 		return;
+ 
+@@ -500,6 +545,7 @@ arch_arm_prefetch_abort(struct iframe *frame)
+ extern "C" void
+ arch_arm_irq(struct iframe *iframe)
+ {
++	arm_log_exception(3, 0, 0, iframe);
+ 	IFrameScope scope(iframe);
+ 
+ 	InterruptController *ic = InterruptController::Get();
+@@ -530,6 +576,7 @@ arch_arm_irq(struct iframe *iframe)
+ extern "C" void
+ arch_arm_fiq(struct iframe *iframe)
+ {
++	arm_log_exception(4, 0, 0, iframe);
+ 	IFrameScope scope(iframe);
+ 
+ 	panic("FIQ not implemented yet!");
+diff --git a/src/system/kernel/debug/debug.cpp b/src/system/kernel/debug/debug.cpp
+index 6f965dd57f..43c77dc73d 100644
+--- a/src/system/kernel/debug/debug.cpp
++++ b/src/system/kernel/debug/debug.cpp
+@@ -2140,6 +2140,7 @@ panic(const char* format, ...)
+ 			sPanicShown = true;
+ 			arm_boot_marker(34);
+ 			arm_boot_check_text(203);
++			arm_boot_show_exceptions(303);
+ 			arm_boot_marker_value(3,
+ 				(uint32)(addr_t)__builtin_return_address(0));
+ 

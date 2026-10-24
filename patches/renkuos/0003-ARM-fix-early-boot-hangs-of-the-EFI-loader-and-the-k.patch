@@ -1,0 +1,99 @@
+From c971f7b6e355f0f4110347f954b04eda20893340 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 11:08:33 +0200
+Subject: [PATCH 003/203] ARM: fix early boot hangs of the EFI loader and the
+ kernel
+
+- efi/arm: do not switch gUART to the kernel's virtual UART address. The
+  loader keeps running on the firmware's identity mapping until
+  arch_enter_kernel() and the following dprintf()s caused a data abort.
+- kernel/arm: align the exception mode stacks. Depending on the link
+  layout they ended up at odd addresses and the first abort recursed
+  forever on the unaligned stmdb.
+- keep using the soft-float libgcc-boot.a for the EFI loader; only the
+  kernel needs the cross-compiler libgcc.a.
+---
+ build/jam/SystemLibraryRules                       | 4 ----
+ configure                                          | 4 ++--
+ src/system/boot/platform/efi/arch/arm/arch_mmu.cpp | 7 +++----
+ src/system/kernel/arch/arm/arch_exceptions.S       | 3 +++
+ 4 files changed, 8 insertions(+), 10 deletions(-)
+
+diff --git a/build/jam/SystemLibraryRules b/build/jam/SystemLibraryRules
+index e28d67a113..bce228e570 100644
+--- a/build/jam/SystemLibraryRules
++++ b/build/jam/SystemLibraryRules
+@@ -266,10 +266,6 @@ rule TargetBootLibgcc architecture : asPath
+ 		if $(asPath) = true {
+ 			flags += path ;
+ 		}
+-		if $(architecture) = arm && $(TARGET_BOOT_LIBGCC) {
+-			# see TargetKernelLibgcc
+-			return $(TARGET_BOOT_LIBGCC) ;
+-		}
+ 		if $(architecture) = arm {
+ 			return [
+ 				BuildFeatureAttribute QUALIFIED $(architecture):gcc_syslibs_devel
+diff --git a/configure b/configure
+index 4e1e9532de..37599c0181 100755
+--- a/configure
++++ b/configure
+@@ -345,8 +345,8 @@ standard_gcc_settings()
+ 			bootCxxHeaders="$headers/$gccMachine"
+ 			;;
+ 		arm-*)
+-			# Kernel and boot loader use the libgcc.a built by the cross-compiler,
+-			# so that they match its FPU configuration (e.g. VFPv3-D16)
++			# The kernel uses the libgcc.a built by the cross-compiler, so that
++			# it matches its FPU configuration (e.g. VFPv3-D16)
+ 			bootLibgcc=`$gcc -print-file-name=libgcc.a`
+ 			;;
+ 	esac
+diff --git a/src/system/boot/platform/efi/arch/arm/arch_mmu.cpp b/src/system/boot/platform/efi/arch/arm/arch_mmu.cpp
+index 1acd293c02..4e9d6f99bb 100644
+--- a/src/system/boot/platform/efi/arch/arm/arch_mmu.cpp
++++ b/src/system/boot/platform/efi/arch/arm/arch_mmu.cpp
+@@ -8,7 +8,6 @@
+ 
+ #include <arm_mmu.h>
+ #include <kernel.h>
+-#include <arch/generic/debug_uart.h>
+ #include <arch_kernel.h>
+ #include <boot/platform.h>
+ #include <boot/stage2.h>
+@@ -32,8 +31,6 @@
+ static constexpr bool kTraceMemoryMap = false;
+ static constexpr bool kTracePageDirectory = false;
+ 
+-extern DebugUART* gUART;
+-
+ 
+ // Ignore memory above 512GB
+ #define PHYSICAL_MEMORY_LOW		0x00000000
+@@ -283,9 +280,11 @@ arch_mmu_generate_post_efi_page_tables(size_t memoryMapSize,
+ 			ARM_MMU_L2_FLAG_B | ARM_MMU_L2_FLAG_C | ARM_MMU_L2_FLAG_HAIKU_KERNEL_RW);
+ 	}
+ 
++	// Only the kernel gets the new virtual UART address: the boot loader keeps
++	// running on the firmware's identity mapping until arch_enter_kernel()
++	// switches the page tables, and still prints until then.
+ 	map_range_to_new_area(gKernelArgs.arch_args.uart.regs,
+ 		ARM_MMU_L2_FLAG_B | ARM_MMU_L2_FLAG_HAIKU_KERNEL_RW | ARM_MMU_L2_FLAG_XN);
+-	gUART->SetBase(gKernelArgs.arch_args.uart.regs.start);
+ 
+ 	sort_address_ranges(gKernelArgs.virtual_allocated_range,
+ 		gKernelArgs.num_virtual_allocated_ranges);
+diff --git a/src/system/kernel/arch/arm/arch_exceptions.S b/src/system/kernel/arch/arm/arch_exceptions.S
+index 2ee1347613..f120a1b575 100644
+--- a/src/system/kernel/arch/arm/arch_exceptions.S
++++ b/src/system/kernel/arch/arm/arch_exceptions.S
+@@ -121,6 +121,9 @@ _vectors_end:
+ 
+ .data
+ 
++/* exception mode stacks, aligned as required by the AAPCS */
++.balign 8
++
+ 	.rept	64
+ 	.word	0xdeadbeef
+ 	.endr

@@ -1,0 +1,133 @@
+From 051180238f95568b532d63fae62aa76619ebac56 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 23:21:38 +0200
+Subject: [PATCH 125/203] ARM bring-up: log the timer interrupts and ICIs of
+ each CPU
+
+On the AC100 the second CPU stops running anything after a minute or two.
+Every 30 seconds log, per CPU, the private timer interrupts and ICIs taken
+and the last timeout set, to see which of them stops first (not for
+merging).
+---
+ src/add-ons/kernel/busses/i2c/nvec/nvec.cpp   | 17 +++++++++++++++++
+ src/system/kernel/arch/arm/arch_int_gicv2.cpp |  6 ++++++
+ src/system/kernel/arch/arm/soc_tegra.cpp      | 18 ++++++++++++++----
+ 3 files changed, 37 insertions(+), 4 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+index 322749ef71..6ed551b88d 100644
+--- a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
++++ b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+@@ -29,6 +29,7 @@
+ 
+ #include <fs/select_sync_pool.h>
+ #include <kernel.h>
++#include <smp.h>
+ #include <lock.h>
+ #include <util/AutoLock.h>
+ 
+@@ -273,6 +274,13 @@ struct nvec_handle {
+ };
+ 
+ 
++extern "C" {
++extern uint32 gArmTimerInterrupts[];
++extern uint32 gArmICIs[];
++extern bigtime_t gArmTimerLastSet[];
++extern bigtime_t gArmTimerLastTimeout[];
++}
++
+ static device_manager_info* gDeviceManager;
+ static nvec_device* sPowerOffDevice;
+ 
+@@ -1062,6 +1070,15 @@ poll_thread(void* data)
+ 				device->keyEvents, device->mouseBytes, device->touchpadResets,
+ 				device->protocolErrors, device->state,
+ 				read_reg(device, I2C_SL_STATUS));
++
++			// bring-up aid: is the second CPU still taking interrupts?
++			for (int32 cpu = 0; cpu < smp_get_num_cpus(); cpu++) {
++				TRACE_ALWAYS("CPU %" B_PRId32 ": %" B_PRIu32 " timer interrupts, %"
++					B_PRIu32 " ICIs, last timeout %" B_PRId64 " us set at %"
++					B_PRId64 " ms\n", cpu, gArmTimerInterrupts[cpu],
++					gArmICIs[cpu], gArmTimerLastTimeout[cpu],
++					gArmTimerLastSet[cpu] / 1000);
++			}
+ 		}
+ 	}
+ 	return B_OK;
+diff --git a/src/system/kernel/arch/arm/arch_int_gicv2.cpp b/src/system/kernel/arch/arm/arch_int_gicv2.cpp
+index 77c67f2b5c..8bd0ae8b81 100644
+--- a/src/system/kernel/arch/arm/arch_int_gicv2.cpp
++++ b/src/system/kernel/arch/arm/arch_int_gicv2.cpp
+@@ -16,6 +16,11 @@
+ 
+ #define ICI_IRQ 0
+ 
++// bring-up aid: inter-processor interrupts received per CPU
++extern "C" {
++uint32 gArmICIs[SMP_MAX_CPUS];
++}
++
+ 
+ GICv2InterruptController::GICv2InterruptController(phys_addr_t gicd_addr, phys_addr_t gicc_addr)
+ : InterruptController()
+@@ -124,6 +129,7 @@ void GICv2InterruptController::HandleInterrupt()
+ 	if ((irqnr == 1022) || (irqnr == 1023)) {
+ 		dprintf("spurious interrupt (%d)\n", irqnr);
+ 	} else if (irqnr == ICI_IRQ) {
++		gArmICIs[smp_get_current_cpu()]++;
+ 		smp_intercpu_interrupt_handler(smp_get_current_cpu());
+ 	} else {
+ 		io_interrupt_handler(irqnr, B_LEVEL_TRIGGERED);
+diff --git a/src/system/kernel/arch/arm/soc_tegra.cpp b/src/system/kernel/arch/arm/soc_tegra.cpp
+index 7aaf0bbbf4..15ce2a0c87 100644
+--- a/src/system/kernel/arch/arm/soc_tegra.cpp
++++ b/src/system/kernel/arch/arm/soc_tegra.cpp
+@@ -39,6 +39,14 @@
+ #define TWD_INTERRUPT_STATUS	0x0c
+ 
+ 
++// bring-up aid: timer interrupts per CPU, and the last timeout set
++extern "C" {
++uint32 gArmTimerInterrupts[SMP_MAX_CPUS];
++bigtime_t gArmTimerLastSet[SMP_MAX_CPUS];
++bigtime_t gArmTimerLastTimeout[SMP_MAX_CPUS];
++}
++
++
+ static inline uint32
+ read_reg(volatile uint32* regs, uint32 offset)
+ {
+@@ -111,6 +119,10 @@ void
+ TegraTimer::SetTimeout(bigtime_t timeout)
+ {
+ 	if (fTWD != NULL) {
++		int32 cpu = smp_get_current_cpu();
++		gArmTimerLastSet[cpu] = Time();
++		gArmTimerLastTimeout[cpu] = timeout;
++
+ 		// one-shot on this CPU's private timer
+ 		uint64 ticks = (uint64)timeout * fTWDFrequency / 1000000;
+ 		if (ticks < 1)
+@@ -199,8 +211,6 @@ TegraTimer::_HandleEventInterrupt(void* data)
+ }
+ 
+ 
+-// bring-up aid: timer interrupts per CPU
+-static uint32 sTWDInterrupts[SMP_MAX_CPUS];
+ 
+ 
+ int32
+@@ -211,9 +221,9 @@ TegraTimer::_HandleTWDInterrupt(void* data)
+ 	write_reg(timer->fTWD, TWD_INTERRUPT_STATUS, 1);
+ 
+ 	int32 cpu = smp_get_current_cpu();
+-	if (++sTWDInterrupts[cpu] % 100000 == 0) {
++	if (++gArmTimerInterrupts[cpu] % 100000 == 0) {
+ 		dprintf("Tegra: CPU %" B_PRId32 ": %" B_PRIu32 " timer interrupts at %"
+-			B_PRId64 " ms\n", cpu, sTWDInterrupts[cpu],
++			B_PRId64 " ms\n", cpu, gArmTimerInterrupts[cpu],
+ 			timer->Time() / 1000);
+ 	}
+ 	return timer_interrupt();

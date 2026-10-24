@@ -1,0 +1,89 @@
+From dacdbedd8d212c0a16f2a68c2124b6cdf4da07be Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 17:52:44 +0200
+Subject: [PATCH 027/203] ARM bring-up: track r11 across exception handling
+ (not for merging)
+
+---
+ src/system/kernel/arch/arm/arch_int.cpp | 35 +++++++++++++++++++++----
+ 1 file changed, 30 insertions(+), 5 deletions(-)
+
+diff --git a/src/system/kernel/arch/arm/arch_int.cpp b/src/system/kernel/arch/arm/arch_int.cpp
+index e6d5a5187d..314982c49f 100644
+--- a/src/system/kernel/arch/arm/arch_int.cpp
++++ b/src/system/kernel/arch/arm/arch_int.cpp
+@@ -232,8 +232,8 @@ private:
+ };
+ 
+ 
+-static void arm_log_exception(uint32 type, uint32 fsr, uint32 far,
+-	struct iframe* frame);
++static struct arm_exception_record* arm_log_exception(uint32 type,
++	uint32 fsr, uint32 far, struct iframe* frame);
+ 
+ 
+ extern "C" void
+@@ -368,18 +368,25 @@ struct arm_exception_record {
+ 	uint32	kind;	// type << 28 | spsr[7:0] << 16 | fsr
+ 	uint32	far;
+ 	uint32	pc;
++	uint32	frame;
++	uint32	r11In;
++	uint32	r11Out;
+ };
+ static arm_exception_record sExceptionLog[4];
+ static uint32 sExceptionCount;
+ 
+ 
+-static void
++static arm_exception_record*
+ arm_log_exception(uint32 type, uint32 fsr, uint32 far, struct iframe* frame)
+ {
+ 	arm_exception_record& record = sExceptionLog[sExceptionCount++ % 4];
+ 	record.kind = (type << 28) | ((frame->spsr & 0xff) << 16) | (fsr & 0xffff);
+ 	record.far = far;
+ 	record.pc = frame->pc;
++	record.frame = (uint32)(addr_t)frame;
++	record.r11In = frame->r11;
++	record.r11Out = 0;
++	return &record;
+ }
+ 
+ 
+@@ -398,16 +405,34 @@ arm_boot_show_exceptions(int row)
+ 		arm_boot_marker_value(row + i * 3 + 2, record.pc);
+ 	}
+ 	arm_boot_marker_value(row + 9, sExceptionCount);
++
++	// for the two exceptions before the panic: frame address, r11 on entry,
++	// r11 when the handler returned, and r11 in the frame memory now
++	for (uint32 i = 0; i < 2; i++) {
++		if (sExceptionCount < i + 2)
++			break;
++		const arm_exception_record& record
++			= sExceptionLog[(sExceptionCount - 2 - i) % 4];
++		int extraRow = (row % 100) + 7 + (i == 0 ? 200 : 100);
++		arm_boot_marker_value(extraRow, record.frame);
++		arm_boot_marker_value(extraRow + 1, record.r11In);
++		arm_boot_marker_value(extraRow + 2, record.r11Out);
++		arm_boot_marker_value(extraRow + 3,
++			((struct iframe*)(addr_t)record.frame)->r11);
++	}
+ }
+ 
+ 
+ static void
+ arch_arm_page_fault(struct iframe *frame, addr_t far, uint32 fsr, bool isWrite, bool isExec)
+ {
+-	arm_log_exception(isExec ? 1 : 2, fsr, far, frame);
++	arm_exception_record* record = arm_log_exception(isExec ? 1 : 2, fsr, far,
++		frame);
+ 
+-	if (arch_arm_handle_access_flag_fault(far, fsr, isWrite, isExec))
++	if (arch_arm_handle_access_flag_fault(far, fsr, isWrite, isExec)) {
++		record->r11Out = frame->r11;
+ 		return;
++	}
+ 
+ 	if (gKernelStartup) {
+ 		// bring-up aid: page faults are unexpected this early

@@ -1,0 +1,39 @@
+From eb6f25579d1a7b6246ed43730bfdae383ae0816b Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 21:25:59 +0200
+Subject: [PATCH 117/203] nvec: reset the touchpad before enabling it
+
+It keeps its state while the machine is off: after a warm boot it
+acknowledged the commands but sent no packets. Reset it first, as Linux'
+psmouse does.
+---
+ src/add-ons/kernel/busses/i2c/nvec/nvec.cpp | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+index 05a71866b7..0c3916795d 100644
+--- a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
++++ b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+@@ -1141,9 +1141,12 @@ start_ec(nvec_device* device)
+ 	static const uint8 kKeyboardWakeKeys[] = { NVEC_KBD,
+ 		KBD_CNFG_WAKE_KEY_REPORTING, 1 };
+ 	static const uint8 kKeyboardLEDs[] = { NVEC_KBD, KBD_SET_LEDS, 0 };
+-	// touchpad: stream its bytes to us, then set the default (3 byte packet)
+-	// mode and enable it
++	// touchpad: stream its bytes to us, reset it (it keeps its state while
++	// the machine is off, and may not send anything otherwise: answers
++	// fa aa 00), then set the default (3 byte packet) mode and enable it
+ 	static const uint8 kMouseStream[] = { NVEC_PS2, PS2_AUTO_RECEIVE_N, 6 };
++	static const uint8 kMouseReset[] = { NVEC_PS2, PS2_SEND_COMMAND, 0xff,
++		3 };
+ 	static const uint8 kMouseDefaults[] = { NVEC_PS2, PS2_SEND_COMMAND, 0xf6,
+ 		1 };
+ 	static const uint8 kMouseEnable[] = { NVEC_PS2, PS2_SEND_COMMAND, 0xf4,
+@@ -1166,6 +1169,7 @@ start_ec(nvec_device* device)
+ 	nvec_write(device, kKeyboardLEDs, sizeof(kKeyboardLEDs));
+ 
+ 	nvec_write(device, kMouseStream, sizeof(kMouseStream));
++	nvec_write(device, kMouseReset, sizeof(kMouseReset));
+ 	nvec_write(device, kMouseDefaults, sizeof(kMouseDefaults));
+ 	nvec_write(device, kMouseEnable, sizeof(kMouseEnable));
+ }

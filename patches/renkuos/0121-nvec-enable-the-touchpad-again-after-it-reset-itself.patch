@@ -1,0 +1,102 @@
+From 0decc8967560cb88ec8d26ed1789d0247a9f4136 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 22:53:48 +0200
+Subject: [PATCH 121/203] nvec: enable the touchpad again after it reset itself
+
+On the AC100 the touchpad stopped working after some heavy load: when it
+resets (or the EC resets it) it sends "aa 00" instead of a packet and
+nothing more until it is enabled again. Do so, as Linux' psmouse does.
+
+Keep logging the statistics every 30 seconds, now also with the counts of
+keys, touchpad bytes and touchpad resets (bring-up).
+---
+ src/add-ons/kernel/busses/i2c/nvec/nvec.cpp | 44 ++++++++++++++++-----
+ 1 file changed, 35 insertions(+), 9 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+index 0c3916795d..d7857a4270 100644
+--- a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
++++ b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+@@ -230,6 +230,10 @@ struct nvec_device {
+ 	sem_id				mouseSem;
+ 	uint8				packet[3];
+ 	uint32				packetPosition;
++	bool				selfTestByte;	// an 0xaa came instead of a packet
++	uint32				touchpadResets;	// bring-up statistics
++	uint32				keyEvents;
++	uint32				mouseBytes;
+ 	uint32				buttons;
+ 	int32				clicks;
+ 	bigtime_t			lastClick;
+@@ -846,9 +850,31 @@ handle_key_event(nvec_device* device, const nvec_msg* message)
+ }
+ 
+ 
++// the touchpad's default (3 byte packet) mode, and enabling its reports
++static const uint8 kMouseDefaults[] = { NVEC_PS2, PS2_SEND_COMMAND, 0xf6, 1 };
++static const uint8 kMouseEnable[] = { NVEC_PS2, PS2_SEND_COMMAND, 0xf4, 1 };
++
++
+ static void
+ handle_mouse_byte(nvec_device* device, uint8 byte)
+ {
++	device->mouseBytes++;
++
++	// "aa 00" instead of a packet: the touchpad reset itself (or the EC did)
++	// and passed its self test; it sends nothing until it is enabled again
++	// (as in Linux' psmouse)
++	bool reset = device->packetPosition == 0 && device->selfTestByte
++		&& byte == 0x00;
++	device->selfTestByte = device->packetPosition == 0 && byte == 0xaa;
++	if (reset) {
++		device->touchpadResets++;
++		device->packetPosition = 0;
++		TRACE_ALWAYS("the touchpad was reset, enabling it again\n");
++		nvec_write(device, kMouseDefaults, sizeof(kMouseDefaults));
++		nvec_write(device, kMouseEnable, sizeof(kMouseEnable));
++		return;
++	}
++
+ 	// the first byte of a packet always has bit 3 set; also skip those with
+ 	// the overflow bits, which the touchpad does not use: this resyncs on
+ 	// the self test result (0xaa 0x00) that follows its reset
+@@ -1026,12 +1052,15 @@ poll_thread(void* data)
+ 		}
+ 
+ 		// bring-up aid: is the EC still talking to us?
+-		if (next % 6 == 0 && next <= 60) {
++		if (next % 6 == 0) {
+ 			TRACE_ALWAYS("%" B_PRIu32 " interrupts, %" B_PRIu32 " messages (%"
+-				B_PRIu32 " events), %" B_PRIu32 " protocol errors, state %"
+-				B_PRId32 ", status %#" B_PRIx32 "\n", device->interrupts,
+-				device->messages, device->events, device->protocolErrors,
+-				device->state, read_reg(device, I2C_SL_STATUS));
++				B_PRIu32 " events: %" B_PRIu32 " keys, %" B_PRIu32 " touchpad "
++				"bytes, %" B_PRIu32 " touchpad resets), %" B_PRIu32 " protocol "
++				"errors, state %" B_PRId32 ", status %#" B_PRIx32 "\n",
++				device->interrupts, device->messages, device->events,
++				device->keyEvents, device->mouseBytes, device->touchpadResets,
++				device->protocolErrors, device->state,
++				read_reg(device, I2C_SL_STATUS));
+ 		}
+ 	}
+ 	return B_OK;
+@@ -1085,6 +1114,7 @@ rx_thread(void* data)
+ 
+ 		switch (message.data[0] & 0x8f) {
+ 			case NVEC_KB_EVT:
++				device->keyEvents++;
+ 				handle_key_event(device, &message);
+ 				break;
+ 
+@@ -1147,10 +1177,6 @@ start_ec(nvec_device* device)
+ 	static const uint8 kMouseStream[] = { NVEC_PS2, PS2_AUTO_RECEIVE_N, 6 };
+ 	static const uint8 kMouseReset[] = { NVEC_PS2, PS2_SEND_COMMAND, 0xff,
+ 		3 };
+-	static const uint8 kMouseDefaults[] = { NVEC_PS2, PS2_SEND_COMMAND, 0xf6,
+-		1 };
+-	static const uint8 kMouseEnable[] = { NVEC_PS2, PS2_SEND_COMMAND, 0xf4,
+-		1 };
+ 
+ 	nvec_write(device, kGlobalEvents, sizeof(kGlobalEvents));
+ 	nvec_write(device, kFirmwareVersion, sizeof(kFirmwareVersion));

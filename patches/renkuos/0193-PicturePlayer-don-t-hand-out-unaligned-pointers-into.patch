@@ -1,0 +1,82 @@
+From bdd4fcfe321b1cd6713214412b0caf3e7cd87354 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 24 Oct 2026 00:18:25 +0200
+Subject: [PATCH 193/203] PicturePlayer: don't hand out unaligned pointers into
+ the picture data
+
+The picture data is packed (each op starts with a 6 byte header), so the
+pointers DataReader::Get() returned were often not aligned for their type.
+Reading a float through them is fine on x86, but on ARM the compiler uses
+vldr, which faults: app_server died with SIGBUS playing a picture. Hand out
+an aligned copy, owned by the reader, when the data is not aligned.
+---
+ src/kits/interface/PicturePlayer.cpp | 33 ++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/src/kits/interface/PicturePlayer.cpp b/src/kits/interface/PicturePlayer.cpp
+index e0ab3f2769..d4915793fd 100644
+--- a/src/kits/interface/PicturePlayer.cpp
++++ b/src/kits/interface/PicturePlayer.cpp
+@@ -19,6 +19,7 @@
+ 
+ #include <AffineTransform.h>
+ #include <DataIO.h>
++#include <List.h>
+ #include <Font.h>
+ #include <Gradient.h>
+ #include <PictureProtocol.h>
+@@ -774,6 +775,12 @@ public:
+ 		{
+ 		}
+ 
++		~DataReader()
++		{
++			for (int32 i = 0; i < fCopies.CountItems(); i++)
++				free(fCopies.ItemAt(i));
++		}
++
+ 		size_t
+ 		Remaining() const
+ 		{
+@@ -788,6 +795,8 @@ public:
+ 				return false;
+ 
+ 			typed = reinterpret_cast<const T *>(fBuffer);
++			if (!_Align(typed, sizeof(T) * count))
++				return false;
+ 			fRemaining -= sizeof(T) * count;
+ 			fBuffer += sizeof(T) * count;
+ 			return true;
+@@ -821,8 +830,32 @@ public:
+ 		}
+ 
+ private:
++		/*!	The picture data is packed: the values are often not aligned for
++			their type, which is fine on x86 but makes floats fault on ARM.
++			Hand out an aligned copy then, which lives as long as the reader.
++		*/
++		template<typename T>
++		bool
++		_Align(const T*& typed, size_t size)
++		{
++			if ((addr_t)typed % alignof(T) == 0 || size == 0)
++				return true;
++
++			void* copy = malloc(size);
++			if (copy == NULL)
++				return false;
++			if (!fCopies.AddItem(copy)) {
++				free(copy);
++				return false;
++			}
++			memcpy(copy, typed, size);
++			typed = reinterpret_cast<const T*>(copy);
++			return true;
++		}
++
+ 		const uint8*	fBuffer;
+ 		size_t			fRemaining;
++		BList			fCopies;
+ };
+ 
+ 

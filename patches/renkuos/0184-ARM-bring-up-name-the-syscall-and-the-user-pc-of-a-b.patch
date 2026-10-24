@@ -1,0 +1,45 @@
+From 032544afa5a0667a8db97c75f8be13aa85125320 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Fri, 23 Oct 2026 19:01:44 +0200
+Subject: [PATCH 184/203] ARM bring-up: name the syscall and the user pc of a
+ bad address (not for merging)
+
+---
+ src/system/kernel/vm/vm.cpp | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/system/kernel/vm/vm.cpp b/src/system/kernel/vm/vm.cpp
+index c8ac0bca49..91820923ae 100644
+--- a/src/system/kernel/vm/vm.cpp
++++ b/src/system/kernel/vm/vm.cpp
+@@ -37,6 +37,7 @@
+ #include <fs/fd.h>
+ #include <heap.h>
+ #include <kernel.h>
++#include <ksyscalls.h>
+ #include <interrupts.h>
+ #include <lock.h>
+ #include <low_resource_manager.h>
+@@ -3788,6 +3789,22 @@ vm_page_fault(addr_t address, addr_t faultAddress, bool isWrite, bool isExecute,
+ 				thread_get_current_thread_id());
+ 
+ 			Thread* thread = thread_get_current_thread();
++#ifdef __arm__
++			// bring-up: which syscall was handed the bad address, and from
++			// where in userland
++			if (thread != NULL) {
++				struct iframe* userFrame = thread->arch_info.userFrame;
++				dprintf("AC100: bad address in syscall %" B_PRIu32 " (%s) of "
++					"team %" B_PRId32 ", user pc %#" B_PRIx32 " lr %#" B_PRIx32
++					"\n", thread->arch_info.lastSyscall,
++					thread->arch_info.lastSyscall < kSyscallCount
++						? kExtendedSyscallInfos[thread->arch_info.lastSyscall].name
++						: "?",
++					thread->team->id,
++					userFrame != NULL ? (uint32)userFrame->pc : 0,
++					userFrame != NULL ? (uint32)userFrame->usr_lr : 0);
++			}
++#endif
+ 			if (thread != NULL && thread->fault_handler != 0) {
+ 				// this will cause the arch dependant page fault handler to
+ 				// modify the IP on the interrupt frame or whatever to return

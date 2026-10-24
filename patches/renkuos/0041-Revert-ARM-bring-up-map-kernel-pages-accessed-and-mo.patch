@@ -1,0 +1,27 @@
+From ed4e6b80a92cbbbf3737f62e885eee8c052b4d3d Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 19:36:34 +0200
+Subject: [PATCH 041/203] Revert "ARM bring-up: map kernel pages accessed and
+ modified (experiment, not for merging)"
+
+This reverts commit 5302adcf4bab21c10658476706a095d16ef4644f.
+---
+ .../arch/arm/paging/32bit/ARMVMTranslationMap32Bit.cpp       | 5 -----
+ 1 file changed, 5 deletions(-)
+
+diff --git a/src/system/kernel/arch/arm/paging/32bit/ARMVMTranslationMap32Bit.cpp b/src/system/kernel/arch/arm/paging/32bit/ARMVMTranslationMap32Bit.cpp
+index a412d24b5a..cf7e54417c 100644
+--- a/src/system/kernel/arch/arm/paging/32bit/ARMVMTranslationMap32Bit.cpp
++++ b/src/system/kernel/arch/arm/paging/32bit/ARMVMTranslationMap32Bit.cpp
+@@ -220,11 +220,6 @@ ARMVMTranslationMap32Bit::Map(addr_t va, phys_addr_t pa, uint32 attributes,
+ 		"virtual address: %#" B_PRIxADDR ", existing pte: %#" B_PRIx32, va,
+ 		pt[index]);
+ 
+-	// bring-up experiment: kernel mappings start out accessed and modified,
+-	// so that they never take access flag or dirty bit faults
+-	if (fIsKernelMap)
+-		attributes |= PAGE_ACCESSED | PAGE_MODIFIED;
+-
+ 	ARMPagingMethod32Bit::PutPageTableEntryInTable(&pt[index], pa, attributes,
+ 		memoryType, fIsKernelMap);
+ 

@@ -1,0 +1,105 @@
+From 7525a7219e1b28ab97cd5cb2865b4fc504f183b8 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 09:43:26 +0200
+Subject: [PATCH 071/203] ehci: Tegra 2 transceiver settings, TX FIFO threshold
+ and integrated TT port
+
+- The controller reset in the UTMI PHY bring-up put the transceiver
+  settings back to their defaults; set the drive strength, the full and
+  low speed slew rates and the termination of the Tegra 2 device trees,
+  as Linux' utmi_phy_power_on() does.
+- Set the TX FIFO fill threshold after every controller reset, as Linux'
+  ehci-tegra.c does.
+- For a full or low speed device on a root port behind the integrated
+  TT, only the hub address must stay 0; the port number is still needed,
+  as in Linux' qh_make().
+---
+ src/add-ons/kernel/busses/usb/ehci.cpp        | 37 ++++++++++++++-----
+ src/add-ons/kernel/busses/usb/ehci_hardware.h |  2 +
+ 2 files changed, 30 insertions(+), 9 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/ehci.cpp b/src/add-ons/kernel/busses/usb/ehci.cpp
+index 7b612e1256..ad2f25e60d 100644
+--- a/src/add-ons/kernel/busses/usb/ehci.cpp
++++ b/src/add-ons/kernel/busses/usb/ehci.cpp
+@@ -100,6 +100,11 @@ typedef struct {
+ #define UTMIP_FORCE_PDCHRP_POWERDOWN	(1 << 2)
+ #define UTMIP_FORCE_PDDR_POWERDOWN		(1 << 4)
+ #define IC_ENB1							(1 << 3)
++#define UTMIP_XCVR_SETUP(x)				((x) & 0xf)
++#define UTMIP_XCVR_SETUP_MSB(x)			((((x) & 0x70) >> 4) << 22)
++#define UTMIP_XCVR_LSRSLEW(x)			(((x) & 0x3) << 8)
++#define UTMIP_XCVR_LSFSLEW(x)			(((x) & 0x3) << 10)
++#define UTMIP_XCVR_TERM_RANGE_ADJ(x)	(((x) & 0xf) << 18)
+ #define TEGRA_PORTSC_PTS_MASK			(3U << 30)
+ #define TEGRA_PORTSC_STS				(1 << 29)
+ 
+@@ -233,10 +238,20 @@ tegra20_utmi_phy_init(fdt_device_module_info* fdt, fdt_device* fdtDevice,
+ 		*USB_REG(TEGRA_USB_PORTSC1)
+ 			&= ~(TEGRA_PORTSC_PTS_MASK | TEGRA_PORTSC_STS);
+ 
+-		*USB_REG(TEGRA_UTMIP_XCVR_CFG0) &= ~(UTMIP_FORCE_PD_POWERDOWN
+-			| UTMIP_FORCE_PD2_POWERDOWN | UTMIP_FORCE_PDZI_POWERDOWN);
+-		*USB_REG(TEGRA_UTMIP_XCVR_CFG1) &= ~(UTMIP_FORCE_PDDISC_POWERDOWN
+-			| UTMIP_FORCE_PDCHRP_POWERDOWN | UTMIP_FORCE_PDDR_POWERDOWN);
++		// The controller reset put the transceiver settings back to their
++		// defaults: use the values of the Tegra 2 device trees (HS drive
++		// strength, FS/LS slew rates, termination), as Linux does
++		tegra_set_bits(USB_REG(TEGRA_UTMIP_XCVR_CFG0),
++			UTMIP_FORCE_PD_POWERDOWN | UTMIP_FORCE_PD2_POWERDOWN
++				| UTMIP_FORCE_PDZI_POWERDOWN | UTMIP_XCVR_SETUP(0xf)
++				| UTMIP_XCVR_SETUP_MSB(0x7f) | UTMIP_XCVR_LSRSLEW(3)
++				| UTMIP_XCVR_LSFSLEW(3),
++			UTMIP_XCVR_SETUP(9) | UTMIP_XCVR_SETUP_MSB(9)
++				| UTMIP_XCVR_LSRSLEW(1) | UTMIP_XCVR_LSFSLEW(1));
++		tegra_set_bits(USB_REG(TEGRA_UTMIP_XCVR_CFG1),
++			UTMIP_FORCE_PDDISC_POWERDOWN | UTMIP_FORCE_PDCHRP_POWERDOWN
++				| UTMIP_FORCE_PDDR_POWERDOWN | UTMIP_XCVR_TERM_RANGE_ADJ(0xf),
++			UTMIP_XCVR_TERM_RANGE_ADJ(6));
+ 	}
+ #undef USB_REG
+ 
+@@ -2212,6 +2227,10 @@ EHCI::ControllerReset()
+ 		// the reset put the dual role controller back into idle mode
+ 		WriteOpReg(EHCI_USBMODE, (ReadOpReg(EHCI_USBMODE)
+ 			& ~EHCI_USBMODE_CM_MASK) | EHCI_USBMODE_CM_HOST);
++
++		// The reset also cleared the TX FIFO fill threshold, which Linux'
++		// ehci-tegra.c sets to 10 on Tegra 2
++		WriteOpReg(EHCI_TXFILLTUNING, 10 << EHCI_TXFILLTUNING_THRES_SHIFT);
+ 	}
+ 
+ 	return B_OK;
+@@ -3130,14 +3149,14 @@ EHCI::InitQueueHead(ehci_qh *queueHead, Pipe *pipe)
+ 			queueHead->endpoint_chars |= EHCI_QH_CHARS_CONTROL;
+ 
+ 		// With an integrated transaction translator, a full or low speed
+-		// device on a root port is reached without a split transaction to
+-		// some hub: the hub address and port must stay 0, as Linux does for
+-		// TDI controllers.
++		// device on a root port is reached through the controller's own TT,
++		// which answers to hub address 0: leave the hub address 0 but keep
++		// the port, as Linux does for TDI controllers.
++		queueHead->endpoint_caps |= pipe->HubPort() << EHCI_QH_CAPS_PORT_SHIFT;
+ 		if ((fFlags & kIntegratedTT) == 0
+ 			|| pipe->HubAddress() != fRootHubAddress) {
+ 			queueHead->endpoint_caps
+-				|= (pipe->HubPort() << EHCI_QH_CAPS_PORT_SHIFT)
+-				| (pipe->HubAddress() << EHCI_QH_CAPS_HUB_SHIFT);
++				|= pipe->HubAddress() << EHCI_QH_CAPS_HUB_SHIFT;
+ 		}
+ 	}
+ 
+diff --git a/src/add-ons/kernel/busses/usb/ehci_hardware.h b/src/add-ons/kernel/busses/usb/ehci_hardware.h
+index b006ce0c36..aacb05ce7d 100644
+--- a/src/add-ons/kernel/busses/usb/ehci_hardware.h
++++ b/src/add-ons/kernel/busses/usb/ehci_hardware.h
+@@ -105,6 +105,8 @@
+ #define EHCI_PORTSC_PSPD_FULL	0
+ #define EHCI_PORTSC_PSPD_LOW	1
+ #define EHCI_PORTSC_PSPD_HIGH	2
++#define EHCI_TXFILLTUNING		0x24		// TX FIFO fill tuning (TDI)
++#define EHCI_TXFILLTUNING_THRES_SHIFT	16
+ #define EHCI_USBMODE			0x68		// USB Mode
+ #define EHCI_USBMODE_CM_MASK	0x03		// Controller Mode
+ #define EHCI_USBMODE_CM_HOST	0x03

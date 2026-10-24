@@ -1,0 +1,45 @@
+From 59909ce5f563375d78072ae7d96417c8054343ed Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 19 Oct 2026 22:53:18 +0200
+Subject: [PATCH 147/203] Pulse: draw the vendor name in place of a missing
+ logo
+
+Without a logo (ARM, for example) the name was drawn small near the top of
+the chip; it now takes the logo's square, as large as it fits.
+---
+ src/apps/pulse/NormalPulseView.cpp | 20 ++++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/src/apps/pulse/NormalPulseView.cpp b/src/apps/pulse/NormalPulseView.cpp
+index e64c36c74b..1b1fd1b475 100644
+--- a/src/apps/pulse/NormalPulseView.cpp
++++ b/src/apps/pulse/NormalPulseView.cpp
+@@ -261,10 +261,26 @@ NormalPulseView::Draw(BRect rect)
+ 			9 + (fChipRect.Width() - fBrandLogo->Bounds().Width()) / 2,
+ 			fChipRect.top + 6));
+ 	} else {
++		// no logo for this vendor: its name in the logo's place, as large as
++		// fits, centered in the same 48 x 48 square
++		BFont font(be_bold_font);
++		font.SetSize(18);
++		float width = font.StringWidth(fVendor);
++		float maxWidth = fChipRect.Width() - 16;
++		if (width > maxWidth) {
++			font.SetSize(std::max(8.0f, 18 * maxWidth / width));
++			width = font.StringWidth(fVendor);
++		}
++		font_height fontHeight;
++		font.GetHeight(&fontHeight);
++
++		PushState();
++		SetFont(&font);
+ 		SetHighColor(240, 240, 240);
+-		float width = StringWidth(fVendor);
+-		MovePenTo(10 + (fChipRect.Width() - width) / 2, fChipRect.top + 20);
++		MovePenTo(10 + (fChipRect.Width() - width) / 2,
++			fChipRect.top + 6 + (48 + fontHeight.ascent) / 2);
+ 		DrawString(fVendor);
++		PopState();
+ 	}
+ 
+ 	// Draw processor type and speed

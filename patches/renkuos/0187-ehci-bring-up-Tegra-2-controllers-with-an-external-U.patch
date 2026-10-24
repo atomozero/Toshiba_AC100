@@ -1,0 +1,342 @@
+From 31bb95de04384ec02e9d4172726281556d7f1b56 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Fri, 23 Oct 2026 21:50:41 +0200
+Subject: [PATCH 187/203] ehci: bring up Tegra 2 controllers with an external
+ ULPI PHY
+
+The USB2 controller of a Tegra 2 talks to an external PHY over ULPI (on the
+Toshiba AC100 a USB3315, behind which sit an SMSC 2512 hub and the Wi-Fi).
+Set it up as the TRM (26.3.3) and Linux do: PLLP_OUT4 at 24 MHz out of the
+CDEV2 pad as the link clock, the ULPI pins, the PHY reset GPIO from the
+device tree, the link and its trimmers, and the VBUS fix-up in the PHY.
+Logs the PHY IDs and the registers for bring-up.
+---
+ src/add-ons/kernel/busses/usb/ehci.cpp | 287 ++++++++++++++++++++++++-
+ 1 file changed, 279 insertions(+), 8 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/ehci.cpp b/src/add-ons/kernel/busses/usb/ehci.cpp
+index ffe3860972..8776a99356 100644
+--- a/src/add-ons/kernel/busses/usb/ehci.cpp
++++ b/src/add-ons/kernel/busses/usb/ehci.cpp
+@@ -120,6 +120,40 @@ typedef struct {
+ #define TEGRA_PORTSC_PTS_MASK			(3U << 30)
+ #define TEGRA_PORTSC_STS				(1 << 29)
+ 
++// ULPI (USB2 with an external PHY)
++#define TEGRA20_APB_MISC_BASE			0x70000000
++#define TEGRA20_GPIO_BASE				0x6000d000
++#define TEGRA_CAR_PLLP_OUTB				0x0a8
++#define TEGRA_CLOCK_CDEV2				(64 + 29)	// CLK_ENB_DEV2_OUT
++#define TEGRA_TRISTATE_REG_A			0x014
++#define TEGRA_TRISTATE_REG_B			0x018
++#define TEGRA_TRISTATE_REG_D			0x020
++#define TEGRA_PIN_MUX_CTL_A				0x080
++#define TEGRA_PIN_MUX_CTL_C				0x088
++#define TEGRA_GPIO_REG(gpio, reg)		(((gpio) / 32) * 0x80 \
++	+ (((gpio) / 8) % 4) * 4 + (reg))
++#define TEGRA_GPIO_MSK_CNF				0x800
++#define TEGRA_GPIO_MSK_OE				0x810
++#define TEGRA_GPIO_MSK_OUT				0x820
++#define TEGRA_USB_ULPI_VIEWPORT			0x170
++#define TEGRA_ULPI_TIMING_CTRL_0		0x424
++#define TEGRA_ULPI_TIMING_CTRL_1		0x428
++#define USB_SUSP_CLR					(1 << 5)
++#define ULPI_PHY_ENB					(1 << 13)
++#define UHSIC_RESET						(1 << 14)
++#define ULPI_OUTPUT_PINMUX_BYP			(1 << 10)
++#define ULPI_CLKOUT_PINMUX_BYP			(1 << 11)
++#define ULPI_DATA_TRIMMER_LOAD			(1 << 0)
++#define ULPI_DATA_TRIMMER_SEL(x)		(((x) & 0x7) << 1)
++#define ULPI_STPDIRNXT_TRIMMER_LOAD		(1 << 16)
++#define ULPI_STPDIRNXT_TRIMMER_SEL(x)	(((x) & 0x7) << 17)
++#define ULPI_DIR_TRIMMER_LOAD			(1 << 24)
++#define ULPI_DIR_TRIMMER_SEL(x)			(((x) & 0x7) << 25)
++#define ULPI_VIEW_WAKEUP				(1U << 31)
++#define ULPI_VIEW_RUN					(1 << 30)
++#define ULPI_VIEW_WRITE					(1 << 29)
++#define ULPI_VIEW_ADDR(x)				(((x) & 0xff) << 16)
++
+ // PLL-U delays per oscillator frequency (OSC_CTRL[31:30]: 13, 19.2, 12 and
+ // 26 MHz): enable delay, stable count, active delay, crystal frequency count,
+ // debounce time, bias time
+@@ -193,6 +227,245 @@ tegra20_usb_ahb_setup(phys_addr_t registers)
+ }
+ 
+ 
++static status_t
++tegra_ulpi_wait(volatile uint32* view, uint32 mask)
++{
++	bigtime_t start = system_time();
++	while ((*view & mask) != 0) {
++		if (system_time() - start > 2000)
++			return B_TIMED_OUT;
++		spin(1);
++	}
++	return B_OK;
++}
++
++
++//!	Reads a register of the external PHY through the ULPI viewport.
++static int32
++tegra_ulpi_read(volatile uint32* view, uint8 reg)
++{
++	*view = ULPI_VIEW_WAKEUP | ULPI_VIEW_WRITE;
++	if (tegra_ulpi_wait(view, ULPI_VIEW_WAKEUP) != B_OK)
++		return B_TIMED_OUT;
++	*view = ULPI_VIEW_RUN | ULPI_VIEW_ADDR(reg);
++	if (tegra_ulpi_wait(view, ULPI_VIEW_RUN) != B_OK)
++		return B_TIMED_OUT;
++	return (*view >> 8) & 0xff;
++}
++
++
++static status_t
++tegra_ulpi_write(volatile uint32* view, uint8 reg, uint8 value)
++{
++	*view = ULPI_VIEW_WAKEUP | ULPI_VIEW_WRITE;
++	if (tegra_ulpi_wait(view, ULPI_VIEW_WAKEUP) != B_OK)
++		return B_TIMED_OUT;
++	*view = ULPI_VIEW_RUN | ULPI_VIEW_WRITE | ULPI_VIEW_ADDR(reg) | value;
++	return tegra_ulpi_wait(view, ULPI_VIEW_RUN);
++}
++
++
++/*!	Returns the reset GPIO of the external ULPI PHY ("nvidia,phy-reset-gpio"
++	of the node "nvidia,phy" points to), or -1.
++*/
++static int32
++tegra_ulpi_reset_gpio(fdt_device_module_info* fdt, fdt_device* fdtDevice,
++	bool* _activeLow)
++{
++	// older device trees have the GPIO in the controller's node
++	int length;
++	const uint32* gpio = (const uint32*)fdt->get_prop(fdtDevice,
++		"nvidia,phy-reset-gpio", &length);
++	if (gpio != NULL && length >= 12) {
++		*_activeLow = (B_BENDIAN_TO_HOST_INT32(gpio[2]) & 1) != 0;
++		return B_BENDIAN_TO_HOST_INT32(gpio[1]);
++	}
++
++	const uint32* phy = (const uint32*)fdt->get_prop(fdtDevice, "nvidia,phy",
++		&length);
++	if (phy == NULL || length < 4)
++		return -1;
++
++	device_node* busNode = fdt->get_bus(fdtDevice);
++	fdt_bus_module_info* busModule;
++	struct fdt_bus* bus;
++	if (busNode == NULL || gDeviceManager->get_driver(busNode,
++			(driver_module_info**)&busModule, (void**)&bus) != B_OK) {
++		return -1;
++	}
++	device_node* phyNode = busModule->node_by_phandle(bus,
++		B_BENDIAN_TO_HOST_INT32(phy[0]));
++	fdt_device_module_info* phyModule;
++	fdt_device* phyDevice;
++	if (phyNode == NULL || gDeviceManager->get_driver(phyNode,
++			(driver_module_info**)&phyModule, (void**)&phyDevice) != B_OK) {
++		dprintf("AC100: ulpi: PHY node %p has no driver\n", phyNode);
++		return -1;
++	}
++
++	gpio = (const uint32*)phyModule->get_prop(phyDevice,
++		"nvidia,phy-reset-gpio", &length);
++	if (gpio == NULL || length < 12)
++		return -1;
++	*_activeLow = (B_BENDIAN_TO_HOST_INT32(gpio[2]) & 1) != 0;
++	return B_BENDIAN_TO_HOST_INT32(gpio[1]);
++}
++
++
++/*!	Brings up a Tegra 2 USB controller with an external ULPI PHY (the USB2
++	controller), following the TRM (26.3.3) and Linux: the 24 MHz link clock
++	on the CDEV2 pad, the ULPI pins, the PHY reset GPIO, then the link.
++*/
++static status_t
++tegra20_ulpi_phy_init(fdt_device_module_info* fdt, fdt_device* fdtDevice,
++	phys_addr_t registers, uint32 clock)
++{
++	bool activeLow = true;
++	int32 resetGPIO = tegra_ulpi_reset_gpio(fdt, fdtDevice, &activeLow);
++
++	volatile uint32* car;
++	area_id carArea = map_physical_memory("tegra car", TEGRA20_CAR_BASE,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&car);
++	volatile uint8* misc;
++	area_id miscArea = map_physical_memory("tegra apb misc",
++		TEGRA20_APB_MISC_BASE, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&misc);
++	volatile uint8* gpio;
++	area_id gpioArea = map_physical_memory("tegra gpio", TEGRA20_GPIO_BASE,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&gpio);
++	volatile uint8* usb;
++	area_id usbArea = map_physical_memory("tegra usb phy", registers,
++		0x1000, B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++		(void**)&usb);
++	if (carArea < B_OK || miscArea < B_OK || gpioArea < B_OK
++		|| usbArea < B_OK) {
++		delete_area(carArea);
++		delete_area(miscArea);
++		delete_area(gpioArea);
++		delete_area(usbArea);
++		return B_NO_MEMORY;
++	}
++#define MISC_REG(offset)	((volatile uint32*)(misc + (offset)))
++#define GPIO_REG(offset)	((volatile uint32*)(gpio + (offset)))
++#define USB_REG(offset)		((volatile uint32*)(usb + (offset)))
++
++	dprintf("AC100: ulpi: before: PLLP_OUTB %#" B_PRIx32 ", mux A %#" B_PRIx32
++		" C %#" B_PRIx32 ", tristate A %#" B_PRIx32 " B %#" B_PRIx32 " D %#"
++		B_PRIx32 ", reset GPIO %" B_PRId32 " (active %s)\n",
++		car[TEGRA_CAR_PLLP_OUTB / 4], *MISC_REG(TEGRA_PIN_MUX_CTL_A),
++		*MISC_REG(TEGRA_PIN_MUX_CTL_C), *MISC_REG(TEGRA_TRISTATE_REG_A),
++		*MISC_REG(TEGRA_TRISTATE_REG_B), *MISC_REG(TEGRA_TRISTATE_REG_D),
++		resetGPIO, activeLow ? "low" : "high");
++
++	// The link clock: PLLP_OUT4 at 24 MHz (216 / 9) out of the CDEV2 pad
++	uint32 outb = car[TEGRA_CAR_PLLP_OUTB / 4];
++	if ((outb >> 24) != 16 || (outb & (7 << 16)) != (7 << 16)) {
++		outb &= 0xffff;
++		car[TEGRA_CAR_PLLP_OUTB / 4] = outb | (16 << 24) | (1 << 18);
++		spin(2);
++		car[TEGRA_CAR_PLLP_OUTB / 4] = outb | (16 << 24) | (7 << 16);
++	}
++	tegra_set_bits(MISC_REG(TEGRA_PIN_MUX_CTL_C), 3 << 4, 3 << 4);
++	tegra_set_bits(MISC_REG(TEGRA_TRISTATE_REG_A), 1 << 5, 0);
++
++	// the ULPI pins: UAA, UAB and UDA
++	tegra_set_bits(MISC_REG(TEGRA_PIN_MUX_CTL_A), (3 << 8) | (3 << 2) | 3,
++		(3 << 8) | (3 << 2) | 3);
++	tegra_set_bits(MISC_REG(TEGRA_TRISTATE_REG_B), (1 << 19) | (1 << 18), 0);
++	tegra_set_bits(MISC_REG(TEGRA_TRISTATE_REG_D), 1 << 13, 0);
++
++	// Reset the controller, with its clock running
++	uint32 bank = clock / 32;
++	uint32 bit = 1U << (clock % 32);
++	car[TEGRA_CAR_CLK_OUT_ENB(bank) / 4] |= bit;
++	car[TEGRA_CAR_RST_DEVICES(bank) / 4] |= bit;
++	spin(2);
++	car[TEGRA_CAR_RST_DEVICES(bank) / 4] &= ~bit;
++	spin(2);
++
++	// Hold the PHY in reset while its clock starts
++	uint32 gpioBit = 0;
++	if (resetGPIO >= 0) {
++		gpioBit = 1U << (resetGPIO % 8);
++		*GPIO_REG(TEGRA_GPIO_REG(resetGPIO, TEGRA_GPIO_MSK_OUT))
++			= (gpioBit << 8) | (activeLow ? 0 : gpioBit);
++		*GPIO_REG(TEGRA_GPIO_REG(resetGPIO, TEGRA_GPIO_MSK_OE))
++			= (gpioBit << 8) | gpioBit;
++		*GPIO_REG(TEGRA_GPIO_REG(resetGPIO, TEGRA_GPIO_MSK_CNF))
++			= (gpioBit << 8) | gpioBit;
++	}
++	uint32 cdev2 = 1U << (TEGRA_CLOCK_CDEV2 % 32);
++	car[TEGRA_CAR_CLK_OUT_ENB(TEGRA_CLOCK_CDEV2 / 32) / 4] |= cdev2;
++	snooze(5000);
++	if (resetGPIO >= 0) {
++		*GPIO_REG(TEGRA_GPIO_REG(resetGPIO, TEGRA_GPIO_MSK_OUT))
++			= (gpioBit << 8) | (activeLow ? gpioBit : 0);
++	}
++	snooze(2000);
++
++	// Select the ULPI link
++	*USB_REG(TEGRA_USB_SUSP_CTRL) |= UHSIC_RESET;
++	*USB_REG(TEGRA_ULPI_TIMING_CTRL_0)
++		|= ULPI_OUTPUT_PINMUX_BYP | ULPI_CLKOUT_PINMUX_BYP;
++	*USB_REG(TEGRA_USB_SUSP_CTRL) |= ULPI_PHY_ENB;
++
++	uint32 trimmers = ULPI_DATA_TRIMMER_SEL(4) | ULPI_STPDIRNXT_TRIMMER_SEL(4)
++		| ULPI_DIR_TRIMMER_SEL(4);
++	*USB_REG(TEGRA_ULPI_TIMING_CTRL_1) = 0;
++	*USB_REG(TEGRA_ULPI_TIMING_CTRL_1) = trimmers;
++	spin(10);
++	*USB_REG(TEGRA_ULPI_TIMING_CTRL_1) = trimmers | ULPI_DATA_TRIMMER_LOAD
++		| ULPI_STPDIRNXT_TRIMMER_LOAD | ULPI_DIR_TRIMMER_LOAD;
++
++	// Talk to the PHY: its IDs, then the VBUS fix-up Linux applies (VBUS is
++	// floating: use the external VBUS indicator)
++	volatile uint32* view = USB_REG(TEGRA_USB_ULPI_VIEWPORT);
++	int32 id[4];
++	for (int i = 0; i < 4; i++)
++		id[i] = tegra_ulpi_read(view, i);
++	status_t status = tegra_ulpi_write(view, 0x08, 0x40);
++	if (status == B_OK)
++		status = tegra_ulpi_write(view, 0x0b, 0x80);
++	dprintf("AC100: ulpi: PHY vendor %02" B_PRIx32 "%02" B_PRIx32 ", product "
++		"%02" B_PRIx32 "%02" B_PRIx32 ", setup %s\n", id[1], id[0], id[3],
++		id[2], strerror(status));
++
++	*USB_REG(TEGRA_USB_SUSP_CTRL) |= USB_SUSP_CLR;
++	snooze(500);
++	*USB_REG(TEGRA_USB_SUSP_CTRL) &= ~USB_SUSP_CLR;
++
++	bigtime_t start = system_time();
++	while ((*USB_REG(TEGRA_USB_SUSP_CTRL) & USB_PHY_CLK_VALID) == 0
++		&& system_time() - start < 100000) {
++		spin(10);
++	}
++	bool valid = (*USB_REG(TEGRA_USB_SUSP_CTRL) & USB_PHY_CLK_VALID) != 0;
++
++	dprintf("AC100: ulpi: after: PLLP_OUTB %#" B_PRIx32 ", SUSP_CTRL %#"
++		B_PRIx32 ", TIMING %#" B_PRIx32 " %#" B_PRIx32 ", PORTSC1 %#"
++		B_PRIx32 ", PHY clock %s\n", car[TEGRA_CAR_PLLP_OUTB / 4],
++		*USB_REG(TEGRA_USB_SUSP_CTRL), *USB_REG(TEGRA_ULPI_TIMING_CTRL_0),
++		*USB_REG(TEGRA_ULPI_TIMING_CTRL_1), *USB_REG(TEGRA_USB_PORTSC1),
++		valid ? "valid" : "NOT valid");
++#undef MISC_REG
++#undef GPIO_REG
++#undef USB_REG
++
++	delete_area(usbArea);
++	delete_area(gpioArea);
++	delete_area(miscArea);
++	delete_area(carArea);
++
++	if (!valid)
++		return B_TIMED_OUT;
++
++	tegra20_usb_ahb_setup(registers);
++	return B_OK;
++}
++
++
+ /*!	Brings the UTMI PHY of a Tegra 2 USB controller up, the way the boot
+ 	firmware and Linux do. The firmware may have used the controller, but left
+ 	it in a state where the PHY clock is not valid, and accessing the
+@@ -205,7 +478,7 @@ tegra20_utmi_phy_init(fdt_device_module_info* fdt, fdt_device* fdtDevice,
+ 	int length;
+ 	const char* phyType = (const char*)fdt->get_prop(fdtDevice, "phy_type",
+ 		&length);
+-	if (phyType == NULL || strcmp(phyType, "utmi") != 0)
++	if (phyType == NULL)
+ 		return B_OK;
+ 
+ 	const uint32* clocks = (const uint32*)fdt->get_prop(fdtDevice, "clocks",
+@@ -214,6 +487,11 @@ tegra20_utmi_phy_init(fdt_device_module_info* fdt, fdt_device* fdtDevice,
+ 		return B_BAD_DATA;
+ 	uint32 clock = B_BENDIAN_TO_HOST_INT32(clocks[1]);
+ 
++	if (strcmp(phyType, "ulpi") == 0)
++		return tegra20_ulpi_phy_init(fdt, fdtDevice, registers, clock);
++	if (strcmp(phyType, "utmi") != 0)
++		return B_OK;
++
+ 	volatile uint32* car;
+ 	area_id carArea = map_physical_memory("tegra car", TEGRA20_CAR_BASE,
+ 		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+@@ -584,13 +862,6 @@ supports_device(device_node* parent)
+ 		if (mode != NULL && strcmp(mode, "host") != 0)
+ 			return 0.0f;
+ 
+-		// TODO: ULPI ports need their link clock, the reset GPIO and the
+-		// external PHY set up, which nobody does yet
+-		const char* phyType = (const char*)fdt->get_prop(fdtDevice,
+-			"phy_type", &length);
+-		if (phyType != NULL && strcmp(phyType, "ulpi") == 0)
+-			return 0.0f;
+-
+ 		TRACE_MODULE("EHCI device tree controller found!\n");
+ 		return 0.8f;
+ 	}

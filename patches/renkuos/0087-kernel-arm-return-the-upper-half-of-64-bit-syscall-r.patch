@@ -1,0 +1,91 @@
+From 1217610bb76554b751fc8e96051ece405747527f Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 14:01:55 +0200
+Subject: [PATCH 087/203] kernel/arm: return the upper half of 64 bit syscall
+ results in r1
+
+Syscalls return a 64 bit value, which the ARM EABI passes in r0:r1, but
+only r0 was set: system_time() in userland (a syscall on ARM), seek()
+and others got whatever r1 held as their upper half. With a time far in
+the future, the input server's mouse threads, which wait with
+snooze_until(), never woke up again, and the time of day was wrong.
+
+Also keep r1 when a syscall is restarted, as it may hold an argument,
+both directly and across a signal handler.
+---
+ headers/private/kernel/arch/arm/arch_thread_types.h |  1 +
+ src/system/kernel/arch/arm/arch_int.cpp             |  6 +++++-
+ src/system/kernel/arch/arm/arch_thread.cpp          | 10 +++++++---
+ 3 files changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/headers/private/kernel/arch/arm/arch_thread_types.h b/headers/private/kernel/arch/arm/arch_thread_types.h
+index 0924f3edd8..23edd176b6 100644
+--- a/headers/private/kernel/arch/arm/arch_thread_types.h
++++ b/headers/private/kernel/arch/arm/arch_thread_types.h
+@@ -53,6 +53,7 @@ struct arch_thread {
+ 
+ 	struct iframe*	userFrame;
+ 	uint32	oldR0;
++	uint32	oldR1;
+ 
+ 	// bring-up aid: where the thread last was in userland
+ 	uint32	lastUserPC;
+diff --git a/src/system/kernel/arch/arm/arch_int.cpp b/src/system/kernel/arch/arm/arch_int.cpp
+index 862970bfb5..574aa2c6c5 100644
+--- a/src/system/kernel/arch/arm/arch_int.cpp
++++ b/src/system/kernel/arch/arm/arch_int.cpp
+@@ -312,6 +312,7 @@ arch_arm_syscall(struct iframe *iframe)
+ 
+ 	thread_get_current_thread()->arch_info.userFrame = iframe;
+ 	thread_get_current_thread()->arch_info.oldR0 = iframe->r0;
++	thread_get_current_thread()->arch_info.oldR1 = iframe->r1;
+ 	thread_get_current_thread()->arch_info.lastSyscall = syscall;
+ 	thread_get_current_thread()->arch_info.lastUserPC = iframe->pc;
+ 	thread_get_current_thread()->arch_info.lastUserLR = iframe->usr_lr;
+@@ -343,7 +344,9 @@ arch_arm_syscall(struct iframe *iframe)
+ 	syscall_dispatcher(syscall, (void*)args, &returnValue);
+ 
+ 	TRACE("returning %" B_PRId64 "\n", returnValue);
+-	iframe->r0 = returnValue;
++	// 64 bit results (system_time(), seek(), ...) come back in r0:r1
++	iframe->r0 = (uint32)returnValue;
++	iframe->r1 = (uint32)(returnValue >> 32);
+ 
+ 	disable_interrupts();
+ 	atomic_and(&thread_get_current_thread()->flags, ~THREAD_FLAGS_SYSCALL_RESTARTED);
+@@ -358,6 +361,7 @@ arch_arm_syscall(struct iframe *iframe)
+ 		atomic_and(&thread_get_current_thread()->flags, ~THREAD_FLAGS_RESTART_SYSCALL);
+ 		atomic_or(&thread_get_current_thread()->flags, THREAD_FLAGS_SYSCALL_RESTARTED);
+ 		iframe->r0 = thread_get_current_thread()->arch_info.oldR0;
++		iframe->r1 = thread_get_current_thread()->arch_info.oldR1;
+ 		iframe->pc -= 4;
+ 	}
+ 
+diff --git a/src/system/kernel/arch/arm/arch_thread.cpp b/src/system/kernel/arch/arm/arch_thread.cpp
+index 9b3046ffdc..ab6963796f 100644
+--- a/src/system/kernel/arch/arm/arch_thread.cpp
++++ b/src/system/kernel/arch/arm/arch_thread.cpp
+@@ -301,8 +301,10 @@ arch_setup_signal_frame(Thread *thread, struct sigaction *sa,
+ 	// Fill in signalFrameData->context.uc_stack
+ 	signal_get_user_stack(frame->usr_sp, &signalFrameData->context.uc_stack);
+ 
+-	// store oldR0 in syscall_restart_return_value
+-	signalFrameData->syscall_restart_return_value = thread->arch_info.oldR0;
++	// store oldR0 and oldR1 (the syscall's first arguments, needed to
++	// restart it) in syscall_restart_return_value
++	signalFrameData->syscall_restart_return_value
++		= ((uint64)thread->arch_info.oldR1 << 32) | thread->arch_info.oldR0;
+ 
+ 	// get the stack to use -- that's either the current one or a special signal stack
+ 	uint8* userStack = get_signal_stack(thread, frame, sa,
+@@ -343,7 +345,9 @@ arch_restore_signal_frame(struct signal_frame_data* signalFrameData)
+ 	}
+ 
+ 	thread_get_current_thread()->arch_info.oldR0
+-		= signalFrameData->syscall_restart_return_value;
++		= (uint32)signalFrameData->syscall_restart_return_value;
++	thread_get_current_thread()->arch_info.oldR1
++		= (uint32)(signalFrameData->syscall_restart_return_value >> 32);
+ 
+ 	frame->r0     = signalFrameData->context.uc_mcontext.r0;
+ 	frame->r1     = signalFrameData->context.uc_mcontext.r1;

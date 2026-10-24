@@ -1,0 +1,58 @@
+From 940de5a2b57c00091406f80ad909f1583fd6418c Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Thu, 22 Oct 2026 07:30:36 +0200
+Subject: [PATCH 179/203] build: libpng from an external directory; PNG
+ translator in the ARM image
+
+Like FFmpeg, HAIKU_EXTERNAL_LIBPNG_DIR points to a libpng extracted from
+a package built for the target, when the repositories have none.
+---
+ build/jam/BuildFeatures              | 10 +++++++++-
+ build/jam/images/definitions/minimum |  6 ++++--
+ 2 files changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/build/jam/BuildFeatures b/build/jam/BuildFeatures
+index 2327c944ba..7fc77e1d02 100644
+--- a/build/jam/BuildFeatures
++++ b/build/jam/BuildFeatures
+@@ -348,7 +348,15 @@ if [ IsPackageAvailable haikuwebkit_devel ] {
+ 
+ 
+ # libpng
+-if [ IsPackageAvailable libpng16_devel ] {
++if $(HAIKU_EXTERNAL_LIBPNG_DIR) && ! [ IsPackageAvailable libpng16_devel ] {
++	# A libpng built elsewhere for the target (extracted package), when the
++	# repositories have none for it.
++	SetBuildFeatureAttribute libpng : headers
++		: [ FDirName $(HAIKU_EXTERNAL_LIBPNG_DIR) develop headers ] ;
++	SetBuildFeatureAttribute libpng : library
++		: [ FDirName $(HAIKU_EXTERNAL_LIBPNG_DIR) lib libpng16.so ] ;
++	EnableBuildFeatures libpng ;
++} else if [ IsPackageAvailable libpng16_devel ] {
+ 	ExtractBuildFeatureArchives libpng :
+ 		file: base libpng16
+ 			runtime: lib
+diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
+index 0a08b2f9dc..1f3c5e5a54 100644
+--- a/build/jam/images/definitions/minimum
++++ b/build/jam/images/definitions/minimum
+@@ -476,8 +476,9 @@ for repository in $(HAIKU_REPOSITORIES) {
+ 
+ 
+ # The Toshiba AC100 (ARM) gets the applications of the regular image that can
+-# be built for it: nothing needing OpenGL or ffmpeg, and the image translators
+-# need libraries that are not available for ARM (PNG, JPEG, ...).
++# be built for it: nothing needing OpenGL or ffmpeg, and of the image
++# translators needing a library only those whose library is available for ARM
++# (PNG, through HAIKU_EXTERNAL_LIBPNG_DIR).
+ if arm in $(HAIKU_PACKAGING_ARCHS) {
+ 	SYSTEM_BIN += [ FFilterByBuildFeatures
+ 		cddb_lookup
+@@ -572,6 +573,7 @@ if arm in $(HAIKU_PACKAGING_ARCHS) {
+ 		HVIFTranslator
+ 		ICOTranslator
+ 		PCXTranslator
++		PNGTranslator@libpng
+ 		PPMTranslator
+ 		PSDTranslator
+ 		RAWTranslator

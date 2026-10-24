@@ -1,0 +1,28 @@
+From db9055442a0687363c995bbac1a9d5ebb2e835e8 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 22:35:40 +0200
+Subject: [PATCH 054/203] ehci: order descriptor writes before register writes
+ on ARM
+
+Make sure the descriptors written to (non-cacheable, normal) memory have
+reached it before the controller is told about them through a register
+write, as there is no ordering between normal and device memory.
+---
+ src/add-ons/kernel/busses/usb/ehci.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/add-ons/kernel/busses/usb/ehci.cpp b/src/add-ons/kernel/busses/usb/ehci.cpp
+index 038dd2ea7b..b1f82b382b 100644
+--- a/src/add-ons/kernel/busses/usb/ehci.cpp
++++ b/src/add-ons/kernel/busses/usb/ehci.cpp
+@@ -3792,6 +3792,10 @@ EHCI::UnlockIsochronous()
+ inline void
+ EHCI::WriteOpReg(uint32 reg, uint32 value)
+ {
++#ifdef __ARM__
++	// make the descriptors written before visible to the controller
++	asm volatile ("dsb" : : : "memory");
++#endif
+ 	*(volatile uint32 *)(fOperationalRegisters + reg) = value;
+ }
+ 

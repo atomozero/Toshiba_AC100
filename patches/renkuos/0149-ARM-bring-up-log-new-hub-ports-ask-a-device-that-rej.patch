@@ -1,0 +1,62 @@
+From 9da1066c0d7ee71f38d0fe8d7b6bae86fe5e9a67 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 19 Oct 2026 23:13:38 +0200
+Subject: [PATCH 149/203] ARM bring-up: log new hub ports; ask a device that
+ rejects its address for its descriptor first, like Linux (not for merging)
+
+---
+ .../kernel/bus_managers/usb/BusManager.cpp    | 26 +++++++++++++++++++
+ src/add-ons/kernel/bus_managers/usb/Hub.cpp   |  3 +++
+ 2 files changed, 29 insertions(+)
+
+diff --git a/src/add-ons/kernel/bus_managers/usb/BusManager.cpp b/src/add-ons/kernel/bus_managers/usb/BusManager.cpp
+index 2424cc4a98..f83d9aa277 100644
+--- a/src/add-ons/kernel/bus_managers/usb/BusManager.cpp
++++ b/src/add-ons/kernel/bus_managers/usb/BusManager.cpp
+@@ -155,6 +155,32 @@ BusManager::AllocateDevice(Hub *parent, int8 hubAddress, uint8 hubPort,
+ 		snooze(USB_DELAY_SET_ADDRESS_RETRY);
+ 	}
+ 
++	if (result < B_OK) {
++		// Like Linux: some devices only accept their address after they
++		// were asked for their device descriptor at address 0.
++		usb_device_descriptor descriptor;
++		size_t length = 0;
++		status_t status = defaultPipe->SendRequest(
++			USB_REQTYPE_DEVICE_IN | USB_REQTYPE_STANDARD,
++			USB_REQUEST_GET_DESCRIPTOR, USB_DESCRIPTOR_DEVICE << 8, 0, 8,
++			&descriptor, 8, &length);
++		dprintf("AC100: usb device at address 0 (speed %d, hub %d port %d): "
++			"descriptor %s, %" B_PRIuSIZE " bytes", speed, hubAddress, hubPort,
++			strerror(status), length);
++		if (status == B_OK && length == 8) {
++			dprintf(", USB %#x, class %#x, max packet %u\n",
++				descriptor.usb_version, descriptor.device_class,
++				descriptor.max_packet_size_0);
++			snooze(USB_DELAY_SET_ADDRESS_RETRY);
++			result = defaultPipe->SendRequest(
++				USB_REQTYPE_STANDARD | USB_REQTYPE_DEVICE_OUT,
++				USB_REQUEST_SET_ADDRESS, deviceAddress, 0, 0, NULL, 0, NULL);
++			dprintf("AC100: usb set address after the descriptor: %s\n",
++				strerror(result));
++		} else
++			dprintf("\n");
++	}
++
+ 	if (result < B_OK) {
+ 		TRACE_ERROR("error while setting device address\n");
+ 		dprintf("AC100: usb set address failed: speed %d, behind hub %d port "
+diff --git a/src/add-ons/kernel/bus_managers/usb/Hub.cpp b/src/add-ons/kernel/bus_managers/usb/Hub.cpp
+index b7eaef1ec3..c450c0fe9e 100644
+--- a/src/add-ons/kernel/bus_managers/usb/Hub.cpp
++++ b/src/add-ons/kernel/bus_managers/usb/Hub.cpp
+@@ -468,6 +468,9 @@ Hub::Explore(change_item **changeList)
+ 					}
+ 					if (speed > Speed())
+ 						speed = Speed();
++					dprintf("AC100: usb hub %d port %" B_PRId32 ": status %#x, "
++						"change %#x, speed %d\n", DeviceAddress(), i + 1,
++						fPortStatus[i].status, fPortStatus[i].change, speed);
+ 
+ 					// either let the device inherit our addresses (if we are
+ 					// already potentially using a transaction translator) or

@@ -1,0 +1,42 @@
+From 159165b9aa670a3c44731009c3aa6cc7cccf33d0 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 20 Oct 2026 21:03:20 +0200
+Subject: [PATCH 173/203] tegra_audio: drive the speaker through the class AB
+ amplifier, as Android on the AC100 does
+
+The Android port of the AC100 (zombah/android_device_toshiba_paz00-common,
+tiny_hw.xml) routes the speaker from the headphone mixers, with the
+RP/+R negative output and the class AB amplifier.
+---
+ .../kernel/drivers/audio/tegra/tegra_audio.cpp      | 13 ++++++-------
+ 1 file changed, 6 insertions(+), 7 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp b/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
+index 47799109a2..08f4bc05a9 100644
+--- a/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
++++ b/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
+@@ -302,18 +302,17 @@ codec_init(tegra_audio* audio)
+ 	// DACs into the speaker mixer and the headphone mixers (the switches mute
+ 	// when set)
+ 	codec_update(audio, ALC5632_MIC_ROUTING_CTRL, 0x000e, 0);
+-	// speaker: N output LN/-R, class D amplifier, from the speaker mixer;
+-	// headphones from their mixers
+-	codec_write(audio, ALC5632_OUTPUT_MIXER_CTRL, 0xab08);
++	// speaker: N output RP/+R, class AB amplifier, from the headphone
++	// mixers, as the Android port of the AC100 routes it; headphones from
++	// their mixers
++	codec_write(audio, ALC5632_OUTPUT_MIXER_CTRL, 0x4708);
+ 
+ 	// power: DAC channels, I2S, speaker amplifier; DAC clocks, mixers;
+ 	// speaker and headphone outputs
+ 	codec_update(audio, ALC5632_PWR_MANAG_ADD1, 0xcc00, 0xcc00);
+ 	codec_update(audio, ALC5632_PWR_MANAG_ADD2, 0x0338, 0x0338);
+-	// the class D amplifier: its generators (private register 0x46) first
+-	codec_write(audio, ALC5632_HID_CTRL_INDEX, 0x46);
+-	codec_write(audio, ALC5632_HID_CTRL_DATA, 0xffff);
+-	codec_update(audio, ALC5632_PWR_MANAG_ADD2, 1U << 14, 1U << 14);
++	// the class AB amplifier
++	codec_update(audio, ALC5632_PWR_MANAG_ADD2, 3U << 14, 1U << 15);
+ 	codec_update(audio, ALC5632_PWR_MANAG_ADD3, 0x3c00, 0x3c00);
+ 
+ 	// volumes (0 is the loudest, steps of 1.5 dB) and unmute

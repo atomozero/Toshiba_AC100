@@ -1,0 +1,76 @@
+From aa7bca372e7d49e8d080fc76c19a10867ed2285c Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Fri, 23 Oct 2026 19:18:57 +0200
+Subject: [PATCH 185/203] ARM bring-up: stop walking the user frame pointers on
+ every syscall (not for merging)
+
+User code built without frame pointers (FFmpeg, for one) keeps data in
+r11, so the walk read arbitrary user addresses: harmless, but every such
+read logged a kernel page fault, and it cost up to four user_memcpy()
+calls on every syscall.
+---
+ .../kernel/arch/arm/arch_thread_types.h       |  1 -
+ src/system/kernel/arch/arm/arch_int.cpp       | 20 -------------------
+ src/system/kernel/fs/vfs_boot.cpp             |  6 ------
+ 3 files changed, 27 deletions(-)
+
+diff --git a/headers/private/kernel/arch/arm/arch_thread_types.h b/headers/private/kernel/arch/arm/arch_thread_types.h
+index dc3ee91073..1d7762412a 100644
+--- a/headers/private/kernel/arch/arm/arch_thread_types.h
++++ b/headers/private/kernel/arch/arm/arch_thread_types.h
+@@ -62,7 +62,6 @@ struct arch_thread {
+ 	uint32	lastUserPC;
+ 	uint32	lastUserLR;
+ 	uint32	lastSyscall;
+-	uint32	lastCallers[4];
+ 	uint32	lastFaultStatus;
+ };
+ 
+diff --git a/src/system/kernel/arch/arm/arch_int.cpp b/src/system/kernel/arch/arm/arch_int.cpp
+index e8ffb0aece..a3e981a7d2 100644
+--- a/src/system/kernel/arch/arm/arch_int.cpp
++++ b/src/system/kernel/arch/arm/arch_int.cpp
+@@ -367,26 +367,6 @@ arch_arm_syscall(struct iframe *iframe)
+ 
+ 	enable_interrupts();
+ 
+-	{
+-		// bring-up aid: the user callers, following the frame pointers (the
+-		// frame pointer points at the saved return address, the previous
+-		// frame pointer is right below it)
+-		uint32* callers = thread_get_current_thread()->arch_info.lastCallers;
+-		uint32 fp = iframe->r11;
+-		for (int32 i = 0; i < 4; i++) {
+-			uint32 frame[2];
+-			if (fp < 8 || !IS_USER_ADDRESS(fp - 4)
+-				|| user_memcpy(frame, (void*)(addr_t)(fp - 4), sizeof(frame))
+-					!= B_OK) {
+-				callers[i] = 0;
+-				fp = 0;
+-				continue;
+-			}
+-			callers[i] = frame[1];
+-			fp = frame[0];
+-		}
+-	}
+-
+ 	// The arguments past the fourth are on the user stack: copy them with
+ 	// interrupts enabled, since its page may need to be faulted in (after a
+ 	// fork(), or to set the access flag).
+diff --git a/src/system/kernel/fs/vfs_boot.cpp b/src/system/kernel/fs/vfs_boot.cpp
+index 03c454c632..79a5a4fc07 100644
+--- a/src/system/kernel/fs/vfs_boot.cpp
++++ b/src/system/kernel/fs/vfs_boot.cpp
+@@ -366,12 +366,6 @@ dump_userland_threads(bool allImages)
+ 				trace[length] = '\0';
+ 				dprintf("AC100:     kernel stack%s\n", trace);
+ 			}
+-			const uint32* callers = thread->arch_info.lastCallers;
+-			if (thread->state != B_THREAD_WAITING) {
+-				dprintf("AC100:     callers %#" B_PRIx32 " %#" B_PRIx32 " %#"
+-					B_PRIx32 " %#" B_PRIx32 "\n", callers[0], callers[1],
+-					callers[2], callers[3]);
+-			}
+ 			if (thread->state != B_THREAD_WAITING)
+ 				busy = true;
+ 		}

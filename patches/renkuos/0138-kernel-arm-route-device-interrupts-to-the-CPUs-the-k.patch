@@ -1,0 +1,118 @@
+From cd122700f42e79e4b1d6a5259416c50d34f03d36 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 19 Oct 2026 20:50:53 +0200
+Subject: [PATCH 138/203] kernel/arm: route device interrupts to the CPUs the
+ kernel assigns them to
+
+All shared peripheral interrupts went to the boot CPU, so its load included
+every device interrupt and the scheduler could not move any of them.
+"arm_spread_interrupts false" in the kernel settings keeps them on the boot
+CPU.
+---
+ src/system/kernel/arch/arm/arch_int.cpp       | 18 ++++++++++++++++--
+ src/system/kernel/arch/arm/arch_int_gicv2.cpp | 14 ++++++++++++++
+ src/system/kernel/arch/arm/arch_int_gicv2.h   |  1 +
+ src/system/kernel/arch/arm/soc.h              |  5 +++++
+ 4 files changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/src/system/kernel/arch/arm/arch_int.cpp b/src/system/kernel/arch/arm/arch_int.cpp
+index 9058a4a790..3f94cd5261 100644
+--- a/src/system/kernel/arch/arm/arch_int.cpp
++++ b/src/system/kernel/arch/arm/arch_int.cpp
+@@ -19,6 +19,7 @@
+ #include <arch/smp.h>
+ #include <boot/kernel_args.h>
+ #include <device_manager.h>
++#include <driver_settings.h>
+ #include <kimage.h>
+ #include <kscheduler.h>
+ #include <interrupt_controller.h>
+@@ -91,13 +92,21 @@ arch_int_disable_io_interrupt(int32 irq)
+ }
+ 
+ 
++// "arm_spread_interrupts false" in the kernel settings keeps all device
++// interrupts on the boot CPU
++static bool sSpreadInterrupts = true;
++
++
+ /* arch_int_*_interrupts() and friends are in arch_asm.S */
+ 
+ int32
+ arch_int_assign_to_cpu(int32 irq, int32 cpu)
+ {
+-	// Not yet supported.
+-	return 0;
++	InterruptController *ic = InterruptController::Get();
++	if (ic == NULL || !sSpreadInterrupts)
++		return 0;
++
++	return ic->AssignToCpu(irq, cpu);
+ }
+ 
+ 
+@@ -208,6 +217,11 @@ arch_int_init_post_vm(kernel_args *args)
+ 		panic("No interrupt controllers found!\n");
+ 	}
+ 
++	void* settings = load_driver_settings("kernel");
++	sSpreadInterrupts = get_driver_boolean_parameter(settings,
++		"arm_spread_interrupts", true, true);
++	unload_driver_settings(settings);
++
+ 	return B_OK;
+ }
+ 
+diff --git a/src/system/kernel/arch/arm/arch_int_gicv2.cpp b/src/system/kernel/arch/arm/arch_int_gicv2.cpp
+index 8bd0ae8b81..99120c12c9 100644
+--- a/src/system/kernel/arch/arm/arch_int_gicv2.cpp
++++ b/src/system/kernel/arch/arm/arch_int_gicv2.cpp
+@@ -121,6 +121,20 @@ GICv2InterruptController::DisableInterrupt(int32 irq)
+ }
+ 
+ 
++int32
++GICv2InterruptController::AssignToCpu(int32 irq, int32 cpu)
++{
++	// SGIs and PPIs belong to each CPU, only SPIs can be routed
++	if (irq < 32 || cpu < 0 || cpu >= 8)
++		return 0;
++
++	// the target registers are byte accessible, one byte per interrupt
++	volatile uint8* targets = (volatile uint8*)&fGicdRegs[GICD_REG_ITARGETSR];
++	targets[irq] = 1 << cpu;
++	return cpu;
++}
++
++
+ void GICv2InterruptController::HandleInterrupt()
+ {
+ 	uint32_t iar = fGiccRegs[GICC_REG_IAR];
+diff --git a/src/system/kernel/arch/arm/arch_int_gicv2.h b/src/system/kernel/arch/arm/arch_int_gicv2.h
+index 40e2c3bce1..7ce6c1c53d 100644
+--- a/src/system/kernel/arch/arm/arch_int_gicv2.h
++++ b/src/system/kernel/arch/arm/arch_int_gicv2.h
+@@ -18,6 +18,7 @@ public:
+ 	void SendMulticastIci(CPUSet& cpuSet);
+ 	void SendBroadcastIci();
+ 	status_t PerCpuInit();
++	int32 AssignToCpu(int32 irq, int32 cpu);
+ private:
+ 	volatile uint32_t *fGicdRegs;
+ 	volatile uint32_t *fGiccRegs;
+diff --git a/src/system/kernel/arch/arm/soc.h b/src/system/kernel/arch/arm/soc.h
+index 43c4d6b27d..fa5bfdd8f8 100644
+--- a/src/system/kernel/arch/arm/soc.h
++++ b/src/system/kernel/arch/arm/soc.h
+@@ -34,6 +34,11 @@ public:
+ 		return B_OK;
+ 	}
+ 
++	// Routes an interrupt to a CPU, returns the CPU it now goes to.
++	virtual int32 AssignToCpu(int32 irq, int32 cpu) {
++		return 0;
++	}
++
+ 	static InterruptController* Get() {
+ 		return sInstance;
+ 	}

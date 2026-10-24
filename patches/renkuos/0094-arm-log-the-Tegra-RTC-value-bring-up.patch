@@ -1,0 +1,22 @@
+From c17ca9706d8345065a31609182053a0a89d56d15 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 14:29:35 +0200
+Subject: [PATCH 094/203] arm: log the Tegra RTC value (bring-up)
+
+---
+ src/system/kernel/arch/arm/arch_real_time_clock.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/system/kernel/arch/arm/arch_real_time_clock.cpp b/src/system/kernel/arch/arm/arch_real_time_clock.cpp
+index 737bd2dc5b..c7e7cb74f6 100644
+--- a/src/system/kernel/arch/arm/arch_real_time_clock.cpp
++++ b/src/system/kernel/arch/arm/arch_real_time_clock.cpp
+@@ -45,6 +45,8 @@ arch_rtc_init(kernel_args *args, struct real_time_data *data)
+ 		if (area >= B_OK) {
+ 			sTegraRTC = (volatile uint32*)((addr_t)address
+ 				+ (args->arch_args.rtc.start & (B_PAGE_SIZE - 1)));
++			dprintf("AC100: Tegra RTC at %" B_PRIu64 " seconds\n",
++				arch_rtc_get_hw_time());
+ 		}
+ 	}
+ 

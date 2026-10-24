@@ -1,0 +1,49 @@
+From bb639dd47d3f548996dee6f4078fc59989dfbff0 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 22:59:11 +0200
+Subject: [PATCH 122/203] ARM bring-up: count the private timer interrupts per
+ CPU
+
+With two CPUs a busy thread on the AC100 runs three times slower than with
+one; log every 100000 private timer interrupts of a CPU, to see whether
+they are behind it (not for merging).
+---
+ src/system/kernel/arch/arm/soc_tegra.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/system/kernel/arch/arm/soc_tegra.cpp b/src/system/kernel/arch/arm/soc_tegra.cpp
+index 4f9a904797..7aaf0bbbf4 100644
+--- a/src/system/kernel/arch/arm/soc_tegra.cpp
++++ b/src/system/kernel/arch/arm/soc_tegra.cpp
+@@ -7,6 +7,7 @@
+ #include "soc_tegra.h"
+ 
+ #include <KernelExport.h>
++#include <smp.h>
+ #include <timer.h>
+ #include <vm/vm.h>
+ 
+@@ -198,12 +199,23 @@ TegraTimer::_HandleEventInterrupt(void* data)
+ }
+ 
+ 
++// bring-up aid: timer interrupts per CPU
++static uint32 sTWDInterrupts[SMP_MAX_CPUS];
++
++
+ int32
+ TegraTimer::_HandleTWDInterrupt(void* data)
+ {
+ 	TegraTimer* timer = (TegraTimer*)data;
+ 
+ 	write_reg(timer->fTWD, TWD_INTERRUPT_STATUS, 1);
++
++	int32 cpu = smp_get_current_cpu();
++	if (++sTWDInterrupts[cpu] % 100000 == 0) {
++		dprintf("Tegra: CPU %" B_PRId32 ": %" B_PRIu32 " timer interrupts at %"
++			B_PRId64 " ms\n", cpu, sTWDInterrupts[cpu],
++			timer->Time() / 1000);
++	}
+ 	return timer_interrupt();
+ }
+ 

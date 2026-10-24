@@ -1,0 +1,102 @@
+From e305b40dd5182b60edea6335576918b491e9afdd Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 19 Oct 2026 22:07:31 +0200
+Subject: [PATCH 142/203] kernel/arm: give debuggers the userland registers of
+ a thread
+
+arch_get_debug_cpu_state() and arch_get_thread_debug_cpu_state() did not
+fill anything in: they now take the registers from the frame the thread
+entered the kernel with from userland.
+---
+ .../kernel/arch/arm/arch_user_debugger.cpp    | 58 ++++++++++++++++++-
+ 1 file changed, 57 insertions(+), 1 deletion(-)
+
+diff --git a/src/system/kernel/arch/arm/arch_user_debugger.cpp b/src/system/kernel/arch/arm/arch_user_debugger.cpp
+index 8721605a06..c6468c7931 100644
+--- a/src/system/kernel/arch/arm/arch_user_debugger.cpp
++++ b/src/system/kernel/arch/arm/arch_user_debugger.cpp
+@@ -12,6 +12,10 @@
+ #include <thread.h>
+ #include <arch/user_debugger.h>
+ 
++#include <string.h>
++
++#include <arch_cpu_defs.h>
++
+ 
+ #warning ARM: WRITEME
+ 
+@@ -48,6 +52,48 @@ arch_update_thread_single_step()
+ }
+ 
+ 
++/*!	Returns the frame the thread entered the kernel with from userland: the
++	innermost frame on its stack of exception frames whose saved mode is user
++	mode, or the frame of its last syscall.
++*/
++static struct iframe*
++get_user_iframe(Thread* thread)
++{
++	struct iframe_stack& frames = thread->arch_info.iframes;
++	for (int32 i = frames.index - 1; i >= 0; i--) {
++		struct iframe* frame = frames.frames[i];
++		if (frame != NULL && (frame->spsr & CPSR_MODE_MASK) == CPSR_MODE_USR)
++			return frame;
++	}
++
++	return thread->arch_info.userFrame;
++}
++
++
++static void
++get_cpu_state(const struct iframe* frame, debug_cpu_state* cpuState)
++{
++	memset(cpuState, 0, sizeof(*cpuState));
++	cpuState->r0 = frame->r0;
++	cpuState->r1 = frame->r1;
++	cpuState->r2 = frame->r2;
++	cpuState->r3 = frame->r3;
++	cpuState->r4 = frame->r4;
++	cpuState->r5 = frame->r5;
++	cpuState->r6 = frame->r6;
++	cpuState->r7 = frame->r7;
++	cpuState->r8 = frame->r8;
++	cpuState->r9 = frame->r9;
++	cpuState->r10 = frame->r10;
++	cpuState->r11 = frame->r11;
++	cpuState->r12 = frame->r12;
++	cpuState->r13 = frame->usr_sp;
++	cpuState->r14 = frame->usr_lr;
++	cpuState->r15 = frame->pc;
++	cpuState->cpsr = frame->spsr;
++}
++
++
+ void
+ arch_set_debug_cpu_state(const debug_cpu_state *cpuState)
+ {
+@@ -57,13 +103,23 @@ arch_set_debug_cpu_state(const debug_cpu_state *cpuState)
+ void
+ arch_get_debug_cpu_state(debug_cpu_state *cpuState)
+ {
++	struct iframe* frame = get_user_iframe(thread_get_current_thread());
++	if (frame != NULL)
++		get_cpu_state(frame, cpuState);
++	else
++		memset(cpuState, 0, sizeof(*cpuState));
+ }
+ 
+ 
+ status_t
+ arch_get_thread_debug_cpu_state(Thread *thread, debug_cpu_state *cpuState)
+ {
+-	return B_ERROR;
++	struct iframe* frame = get_user_iframe(thread);
++	if (frame == NULL)
++		return B_BAD_VALUE;
++
++	get_cpu_state(frame, cpuState);
++	return B_OK;
+ }
+ 
+ 

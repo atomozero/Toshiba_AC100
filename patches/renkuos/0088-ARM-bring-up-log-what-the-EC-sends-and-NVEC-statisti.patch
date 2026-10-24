@@ -1,0 +1,90 @@
+From 4f3211a5694392c6eaf11a8e74da0b976fc22805 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 14:01:55 +0200
+Subject: [PATCH 088/203] ARM bring-up: log what the EC sends and NVEC
+ statistics (not for merging)
+
+---
+ src/add-ons/kernel/busses/i2c/nvec/nvec.cpp | 27 +++++++++++++++++----
+ 1 file changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+index f39f16c7b1..a7f2c8ff94 100644
+--- a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
++++ b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+@@ -177,6 +177,9 @@ struct nvec_device {
+ 	uint32				txTail;		// next free one
+ 	nvec_msg			txNoOp;
+ 	uint32				protocolErrors;
++	uint32				interrupts;		// bring-up statistics
++	uint32				messages;
++	uint32				events;
+ 
+ 	sem_id				rxSem;		// a message came in
+ 	sem_id				txSem;		// a message was queued
+@@ -438,6 +441,9 @@ rx_completed(nvec_device* device)
+ 
+ 	message->size = message->pos;
+ 	device->rxHead++;
++	device->messages++;
++	if (is_event(message))
++		device->events++;
+ 	if (!is_event(message))
+ 		release_sem_etc(device->transferSem, 1, B_DO_NOT_RESCHEDULE);
+ 	release_sem_etc(device->rxSem, 1, B_DO_NOT_RESCHEDULE);
+@@ -451,6 +457,7 @@ nvec_interrupt(void* data)
+ 	InterruptsSpinLocker locker(device->lock);
+ 
+ 	uint32 status = read_reg(device, I2C_SL_STATUS);
++	device->interrupts++;
+ 	const uint32 irqMask = I2C_SL_IRQ | END_TRANS | RCVD | RNW;
+ 	if ((status & irqMask) == 0 && (status & ~irqMask) != 0) {
+ 		protocol_error(device, status, false);
+@@ -840,6 +847,15 @@ poll_thread(void* data)
+ 
+ 		for (int32 i = 0; i < 50 && !device->stopping; i++)
+ 			snooze(100000);
++
++		// bring-up aid: is the EC still talking to us?
++		if (next % 6 == 0 && next <= 60) {
++			TRACE_ALWAYS("%" B_PRIu32 " interrupts, %" B_PRIu32 " messages (%"
++				B_PRIu32 " events), %" B_PRIu32 " protocol errors, state %"
++				B_PRId32 ", status %#" B_PRIx32 "\n", device->interrupts,
++				device->messages, device->events, device->protocolErrors,
++				device->state, read_reg(device, I2C_SL_STATUS));
++		}
+ 	}
+ 	return B_OK;
+ }
+@@ -878,6 +894,12 @@ rx_thread(void* data)
+ 			device->rxTail++;
+ 		}
+ 
++		// bring-up aid: show what the EC sends
++		if (reported < 100) {
++			reported++;
++			dump_message(is_event(&message) ? "event" : "reply", &message);
++		}
++
+ 		switch (message.data[0] & 0x8f) {
+ 			case NVEC_KB_EVT:
+ 				handle_key_event(device, &message);
+@@ -899,8 +921,6 @@ rx_thread(void* data)
+ 					device->acOnline = message_uint16(&message) != 0;
+ 					break;
+ 				}
+-				if (reported++ < 64)
+-					dump_message("message", &message);
+ 				break;
+ 
+ 			case NVEC_CNTL:
+@@ -913,9 +933,6 @@ rx_thread(void* data)
+ 				// fall through
+ 
+ 			default:
+-				// bring-up aid: show what else the EC tells us
+-				if (reported++ < 64)
+-					dump_message("message", &message);
+ 				break;
+ 		}
+ 	}

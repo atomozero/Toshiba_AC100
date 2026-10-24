@@ -1,0 +1,140 @@
+From aba3c0266cb255b8fa4a65b5d4f315dcb5b16666 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 09:49:18 +0200
+Subject: [PATCH 073/203] ARM bring-up: report the log writer state every 15
+ seconds, map MMC buses to controllers (not for merging)
+
+---
+ src/system/kernel/fs/vfs_boot.cpp | 54 +++++++++++++++++++++----------
+ 1 file changed, 37 insertions(+), 17 deletions(-)
+
+diff --git a/src/system/kernel/fs/vfs_boot.cpp b/src/system/kernel/fs/vfs_boot.cpp
+index 7022000fb3..a0f7511740 100644
+--- a/src/system/kernel/fs/vfs_boot.cpp
++++ b/src/system/kernel/fs/vfs_boot.cpp
+@@ -49,6 +49,7 @@ extern size_t debug_copy_syslog(char* buffer, size_t size, uint32* _lines);
+ static char sEspPath[B_PATH_NAME_LENGTH];
+ 
+ static const size_t kEspSectorSize = 512;
++static const char* sEspStep = "";
+ static const int32 kEspMaxClusters = 1024;
+ 
+ 
+@@ -106,6 +107,7 @@ static status_t
+ esp_find_log_file(esp_log_file* file)
+ {
+ 	uint8 sector[kEspSectorSize];
++	sEspStep = "boot sector";
+ 	if (!esp_read(file->fd, 0, sector, sizeof(sector)))
+ 		return B_IO_ERROR;
+ 
+@@ -144,6 +146,7 @@ esp_find_log_file(esp_log_file* file)
+ 	size_t rootSize = (size_t)rootSectors * bytesPerSector;
+ 
+ 	uint32 firstCluster = 0;
++	sEspStep = "root directory";
+ 	for (int32 i = 0; firstCluster == 0 && i < 64; i++) {
+ 		if (fat32) {
+ 			if (rootCluster < 2 || rootCluster >= 0x0ffffff8)
+@@ -186,6 +189,7 @@ esp_find_log_file(esp_log_file* file)
+ 		return B_ENTRY_NOT_FOUND;
+ 
+ 	// follow the cluster chain
++	sEspStep = "FAT";
+ 	file->clusterCount = 0;
+ 	uint32 cluster = firstCluster;
+ 	while (cluster >= 2 && cluster < clusters + 2
+@@ -216,6 +220,7 @@ esp_write_log(esp_log_file* file, char* buffer, size_t size)
+ 	size_t written = (size + kEspSectorSize - 1) & ~(kEspSectorSize - 1);
+ 	memset(buffer + size, ' ', written - size);
+ 
++	sEspStep = "data write";
+ 	for (size_t offset = 0; offset < written; offset += file->clusterSize) {
+ 		size_t length = min_c(file->clusterSize, written - offset);
+ 		if (_kern_write(file->fd, file->clusterOffsets[offset
+@@ -225,6 +230,7 @@ esp_write_log(esp_log_file* file, char* buffer, size_t size)
+ 	}
+ 
+ 	// let the file end where the log does
++	sEspStep = "directory update";
+ 	uint8 sector[kEspSectorSize];
+ 	off_t sectorOffset = file->entryOffset & ~(off_t)(kEspSectorSize - 1);
+ 	if (!esp_read(file->fd, sectorOffset, sector, sizeof(sector)))
+@@ -251,26 +257,45 @@ syslog_to_esp_thread(void*)
+ 	if (buffer == NULL)
+ 		return B_NO_MEMORY;
+ 
+-	file.fd = _kern_open(-1, sEspPath, O_RDWR, 0);
++	// the disk may still be scanned, e.g. when it is not the boot disk
++	sEspStep = "open";
++	for (int32 i = 0; i < 30; i++) {
++		file.fd = _kern_open(-1, sEspPath, O_RDWR, 0);
++		if (file.fd >= 0)
++			break;
++		snooze(1000000);
++	}
+ 	status_t status = file.fd < 0 ? file.fd : esp_find_log_file(&file);
+ 	dprintf("AC100: syslog to %s, AC100LOG.TXT (%" B_PRId32 " KB): %s\n",
+ 		sEspPath, status == B_OK
+ 			? (int32)(file.clusterCount * file.clusterSize / 1024) : 0,
+ 		strerror(status));
+-	if (status != B_OK) {
+-		if (file.fd >= 0)
+-			_kern_close(file.fd);
+-		free(buffer);
+-		return status;
+-	}
+ 
+ 	// write after every 10 new lines, and at least every 2 seconds while
+-	// there is anything new
++	// there is anything new; tell how it goes every 15 seconds, so that it
++	// can be read off the screen however fast it scrolls
+ 	uint32 writtenLines = 0;
++	uint32 writes = 0;
+ 	bigtime_t lastWrite = 0;
++	bigtime_t lastReport = system_time();
+ 	while (true) {
+ 		snooze(250000);
+ 
++		if (system_time() - lastReport > 15000000) {
++			if (status == B_OK) {
++				dprintf("AC100: AC100LOG.TXT ok, %" B_PRIu32 " writes, %"
++					B_PRIu32 " lines\n", writes, writtenLines);
++			} else {
++				dprintf("AC100: AC100LOG.TXT NOT written: %s at step \"%s\" "
++					"(%s)\n", strerror(status), sEspStep, sEspPath);
++			}
++			lastReport = system_time();
++		}
++		if (status != B_OK) {
++			// leave the disk alone, the boot needs it more than the log
++			continue;
++		}
++
+ 		uint32 lines;
+ 		debug_copy_syslog(NULL, 0, &lines);
+ 		if (lines == writtenLines || (lines - writtenLines < 10
+@@ -279,19 +304,14 @@ syslog_to_esp_thread(void*)
+ 
+ 		size_t size = debug_copy_syslog(buffer, kSize, &lines);
+ 		status = esp_write_log(&file, buffer, size);
+-		if (status != B_OK) {
+-			// leave the disk alone, the boot needs it more than the log
+-			dprintf("AC100: writing AC100LOG.TXT failed: %s, giving up\n",
+-				strerror(status));
+-			break;
+-		}
++		if (status != B_OK)
++			continue;
++		writes++;
+ 		writtenLines = lines;
+ 		lastWrite = system_time();
+ 	}
+ 
+-	_kern_close(file.fd);
+-	free(buffer);
+-	return status;
++	return B_OK;
+ }
+ 
+ 

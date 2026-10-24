@@ -1,0 +1,127 @@
+From d33316cab86e5114f6c9cb0cc79f8dbba4adf0d9 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 18:41:33 +0200
+Subject: [PATCH 034/203] ARM bring-up: draw a tick for every exception from
+ the vectors (not for merging)
+
+---
+ src/system/kernel/arch/arm/arch_cpu.cpp      | 13 ++++++++
+ src/system/kernel/arch/arm/arch_exceptions.S | 35 ++++++++++++++++++++
+ 2 files changed, 48 insertions(+)
+
+diff --git a/src/system/kernel/arch/arm/arch_cpu.cpp b/src/system/kernel/arch/arm/arch_cpu.cpp
+index c891e6bda4..9ebc2fa1ed 100644
+--- a/src/system/kernel/arch/arm/arch_cpu.cpp
++++ b/src/system/kernel/arch/arm/arch_cpu.cpp
+@@ -32,6 +32,14 @@ extern "C" struct {
+ } gArmTextCheck = { 0x7e57c0de, 0, 0, { 0 } };
+ 
+ 
++// used by the exception vectors to draw a tick per exception
++extern "C" {
++	uint32 gArmTickFrameBuffer;
++	uint32 gArmTickBytesPerRow;
++	uint32 gArmTickCount;
++}
++
++
+ static uint8* sBootMarkerFrameBuffer;
+ static uint32 sBootMarkerBytesPerRow;
+ static uint32 sBootMarkerDepth;
+@@ -201,6 +209,11 @@ arch_cpu_preboot_init_percpu(kernel_args *args, int curr_cpu)
+ 				= (uint8*)(addr_t)args->arch_args.bootMarkerFrameBuffer;
+ 			sBootMarkerBytesPerRow = args->frame_buffer.bytes_per_row;
+ 			sBootMarkerDepth = args->frame_buffer.depth;
++			if (sBootMarkerDepth == 16 && args->frame_buffer.height > 20) {
++				gArmTickBytesPerRow = sBootMarkerBytesPerRow;
++				gArmTickFrameBuffer = (uint32)(addr_t)sBootMarkerFrameBuffer
++					+ (args->frame_buffer.height - 12) * sBootMarkerBytesPerRow;
++			}
+ 		}
+ 		arm_boot_marker(6);
+ 		arm_boot_check_text(103);
+diff --git a/src/system/kernel/arch/arm/arch_exceptions.S b/src/system/kernel/arch/arm/arch_exceptions.S
+index f120a1b575..09210ce38f 100644
+--- a/src/system/kernel/arch/arm/arch_exceptions.S
++++ b/src/system/kernel/arch/arm/arch_exceptions.S
+@@ -77,6 +77,34 @@
+ 	movs	pc, lr						/* Return to user mode */
+ .endm
+ 
++/* bring-up aid: every exception draws a tick in a bar at the bottom of the
++   screen, from the exception mode's own stack, before touching the kernel
++   stack. \color is RGB565. */
++.macro EXCEPTION_TICK color
++	stmdb	sp!, {r0-r3}
++	ldr		r0, =gArmTickFrameBuffer
++	ldr		r0, [r0]
++	cmp		r0, #0
++	beq		1f
++	ldr		r1, =gArmTickCount
++	ldr		r2, [r1]
++	add		r2, r2, #1
++	str		r2, [r1]
++	and		r2, r2, #0xff
++	add		r0, r0, r2, lsl #3		/* 4 pixels per tick */
++	ldr		r1, =gArmTickBytesPerRow
++	ldr		r1, [r1]
++	movw	r2, #\color
++	mov		r3, #6					/* 6 lines high */
++2:	strh	r2, [r0]
++	strh	r2, [r0, #2]
++	strh	r2, [r0, #4]
++	add		r0, r0, r1
++	subs	r3, r3, #1
++	bne		2b
++1:	ldmia	sp!, {r0-r3}
++.endm
++
+ .text
+ 
+ .globl _vectors_start
+@@ -159,6 +187,7 @@ und_stack:
+ .text
+ 
+ FUNCTION(arm_undefined):
++	EXCEPTION_TICK 0xf81f
+ 	PUSH_FRAME_IN_SVC
+ 
+ 	mov		r0, sp		/* iframe */
+@@ -187,6 +216,7 @@ FUNCTION(arm_prefetch_abort):
+ 	nop					/* Make absolutely sure any pending */
+ 	nop					/* imprecise aborts have occurred. */
+ #endif
++	EXCEPTION_TICK 0xffe0
+ 	sub		lr, lr, #4	/* Adjust LR */
+ 	PUSH_FRAME_IN_SVC
+ 
+@@ -204,6 +234,7 @@ FUNCTION(arm_data_abort):
+ 	nop					/* Make absolutely sure any pending */
+ 	nop					/* imprecise aborts have occurred. */
+ #endif
++	EXCEPTION_TICK 0xf800
+ 	sub		lr, lr, #8	/* Adjust LR */
+ 	PUSH_FRAME_IN_SVC
+ 
+@@ -222,6 +253,7 @@ FUNCTION_END(arm_reserved)
+ 
+ 
+ FUNCTION(arm_irq):
++	EXCEPTION_TICK 0x07e0
+ 	sub		lr, lr, #4	/* Adjust LR */
+ 	PUSH_FRAME_IN_SVC
+ 
+@@ -235,6 +267,7 @@ FUNCTION_END(arm_irq)
+ 
+ 
+ FUNCTION(arm_fiq):
++	EXCEPTION_TICK 0x07ff
+ 	sub		lr, lr, #4	/* Adjust LR */
+ 	PUSH_FRAME_IN_SVC
+ 
+@@ -284,3 +317,5 @@ FUNCTION(arm_vector_init):
+ 
+ 	bx	lr
+ FUNCTION_END(arm_vector_init)
++
++.ltorg

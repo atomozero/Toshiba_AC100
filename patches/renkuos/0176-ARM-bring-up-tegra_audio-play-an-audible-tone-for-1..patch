@@ -1,0 +1,38 @@
+From 98542c070fafda826ee06d13d792052365e9648c Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 20 Oct 2026 21:56:17 +0200
+Subject: [PATCH 176/203] ARM bring-up: tegra_audio: play an audible tone for
+ 1.5 s at boot (not for merging)
+
+---
+ .../kernel/drivers/audio/tegra/tegra_audio.cpp  | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp b/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
+index e87b1c6373..1fcd2cbbac 100644
+--- a/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
++++ b/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
+@@ -782,6 +782,23 @@ self_test(tegra_audio* audio)
+ 		write32(audio->car, CAR_CLK_SOURCE_I2S1, source);
+ 	}
+ 
++	// Bring-up: an audible check of the codec and the amplifiers, without
++	// the media kit: 1.5 s of the same tone, louder
++	for (uint32 i = 0; i < DEFAULT_BUFFER_FRAMES * BUFFER_COUNT; i++) {
++		int16 value = (i & 32) != 0 ? 8000 : -8000;
++		samples[i * 2] = value;
++		samples[i * 2 + 1] = value;
++	}
++	audio->interrupts = 0;
++	start_playback(audio);
++	snooze(1500000);
++	uint16 codecStatus = 0;
++	codec_read(audio, ALC5632_PWR_DOWN_CTRL_STATUS, &codecStatus);
++	stop_playback(audio);
++	TRACE_ALWAYS("tone: %" B_PRIu32 " DMA interrupts in 1.5 s (expected "
++		"about 64), codec power status %#06x\n", audio->interrupts,
++		codecStatus);
++
+ 	memset(audio->buffers, 0, DEFAULT_BUFFER_FRAMES * BUFFER_COUNT
+ 		* FRAME_SIZE);
+ 	audio->interrupts = 0;

@@ -1,0 +1,357 @@
+From 9c62cd9e8da06776c2d211106b3596febdd6ddaa Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 20 Oct 2026 00:23:52 +0200
+Subject: [PATCH 153/203] sdhci: controller quirks
+
+Some controllers deviate from the SD Host Controller specification in ways
+the driver cannot detect, for example the NVIDIA Tegra ones (see the
+"nvidia,tegra20-sdhci" quirks of Linux' sdhci-tegra.c): no base clock in
+the capabilities, an unreliable version register, a timeout counter value
+that cannot be computed, card detection through a GPIO, a command register
+that has to be written together with the transfer mode, and no high speed
+enable bit. The code attaching a controller can now describe them; nothing
+changes for the controllers attached through PCI or ACPI.
+---
+ src/add-ons/kernel/busses/mmc/sdhci.cpp | 117 ++++++++++++++++++------
+ src/add-ons/kernel/busses/mmc/sdhci.h   |  40 +++++++-
+ 2 files changed, 129 insertions(+), 28 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/mmc/sdhci.cpp b/src/add-ons/kernel/busses/mmc/sdhci.cpp
+index e2b6cecefa..076f93cf50 100644
+--- a/src/add-ons/kernel/busses/mmc/sdhci.cpp
++++ b/src/add-ons/kernel/busses/mmc/sdhci.cpp
+@@ -57,7 +57,8 @@ sdhci_generic_interrupt(void* data)
+ }
+ 
+ 
+-SdhciBus::SdhciBus(struct registers* registers, uint8_t irq, bool poll)
++SdhciBus::SdhciBus(struct registers* registers, uint8_t irq, bool poll,
++	const SdhciQuirks* quirks)
+ 	:
+ 	fRegisters(registers),
+ 	fIrq(irq),
+@@ -76,6 +77,11 @@ SdhciBus::SdhciBus(struct registers* registers, uint8_t irq, bool poll)
+ 	fDataTransferMode(0),
+ 	fSelectedRca(0)
+ {
++	if (quirks != NULL)
++		fQuirks = *quirks;
++	else
++		memset(&fQuirks, 0, sizeof(fQuirks));
++
+ 	const bool haveIrq = irq != 0 && irq != 0xff;
+ 	if (!haveIrq) {
+ 		// The interrupt routing gave this controller no interrupt line. Seen
+@@ -133,6 +139,9 @@ SdhciBus::SdhciBus(struct registers* registers, uint8_t irq, bool poll)
+ 	// way is to reset everything.
+ 	Reset();
+ 
++	if (fQuirks.forceCardPresent)
++		fRegisters->host_control.ForceCardInserted();
++
+ 	TRACE("Controller spec version: %d, vendor version: %#02x\n",
+ 		fRegisters->host_controller_version.specVersion,
+ 		fRegisters->host_controller_version.vendorVersion);
+@@ -171,7 +180,7 @@ SdhciBus::SdhciBus(struct registers* registers, uint8_t irq, bool poll)
+ 	TRACE("Initial host control: %x\n", fRegisters->host_control.Bits());
+ 	TRACE("Initial host control 2: %x\n", fRegisters->host_control_2);
+ 
+-	if (fRegisters->host_controller_version.specVersion > 3) {
++	if (_SpecVersion() > 3) {
+ 		// TODO proper class for manipulating host_control_2
+ 		fRegisters->host_control_2 &= ~(1<<12);
+ 		TRACE("Host control 2 after disabling v4 DMA mode: %x\n", fRegisters->host_control_2);
+@@ -184,10 +193,17 @@ SdhciBus::SdhciBus(struct registers* registers, uint8_t irq, bool poll)
+ 		SetClock(400, false);
+ 	}
+ 
+-	fRegisters->timeout_control.SetDivider(fRegisters->capabilities.TimeoutClockFrequency(), 500);
++	if (fQuirks.brokenTimeoutValue)
++		fRegisters->timeout_control.SetMaximum();
++	else {
++		fRegisters->timeout_control.SetDivider(
++			fRegisters->capabilities.TimeoutClockFrequency(), 500);
++	}
+ 
+-	// Finally, configure some useful interrupts
+-	EnableInterrupts(SDHCI_INT_CMD_CMP | SDHCI_INT_CARD_REM
++	// Finally, configure some useful interrupts. Card removal means nothing
++	// when the card is taken as always present.
++	EnableInterrupts(SDHCI_INT_CMD_CMP
++		| (_IsEmbeddedSlot() ? 0 : SDHCI_INT_CARD_REM)
+ 		| SDHCI_INT_TRANS_CMP | SDHCI_INT_DATA_TIMEOUT | SDHCI_INT_COMMAND_TIMEOUT);
+ 
+ 	// We want to see the other bits in the status register, but not have an
+@@ -400,10 +416,8 @@ SdhciBus::ExecuteCommand(uint8_t command, uint32_t argument, uint32_t* response)
+ 
+ 	fRegisters->argument = argument;
+ 
+-	if (replyType == Command::kR1bType || dataCommand)
+-		fRegisters->transfer_mode = transferMode;
+-
+-	fRegisters->command.SendCommand(command, replyType);
++	_WriteCommand(command, replyType, transferMode,
++		replyType == Command::kR1bType || dataCommand);
+ 
+ 	// Wait for command response to be available ("command complete" interrupt)
+ 	TRACE("Wait for command complete...");
+@@ -534,6 +548,47 @@ SdhciBus::InitCheck()
+ }
+ 
+ 
++uint8_t
++SdhciBus::_SpecVersion()
++{
++	// 1 is the encoding of version 2.00
++	if (fQuirks.forceSpec200)
++		return 1;
++	return fRegisters->host_controller_version.specVersion;
++}
++
++
++uint32_t
++SdhciBus::_BaseClockKHz()
++{
++	if (fQuirks.baseClockKHz != 0)
++		return fQuirks.baseClockKHz;
++	return fRegisters->capabilities.BaseClockFrequency() * 1000;
++}
++
++
++/*!	Starts a command. The transfer mode register is written too if
++	\a writeTransferMode is set.
++*/
++void
++SdhciBus::_WriteCommand(uint8_t command, uint8_t replyType,
++	uint16 transferMode, bool writeTransferMode)
++{
++	if (fQuirks.combinedCommandWrite) {
++		// A 16 bit write of either register is not reliable here: write both
++		// in one go. The transfer mode is the low half of the 32 bit word.
++		*(volatile uint32_t*)&fRegisters->transfer_mode
++			= ((uint32_t)((command << 8) | replyType) << 16)
++				| (writeTransferMode ? transferMode : 0);
++		return;
++	}
++
++	if (writeTransferMode)
++		fRegisters->transfer_mode = transferMode;
++	fRegisters->command.SendCommand(command, replyType);
++}
++
++
+ void
+ SdhciBus::Reset()
+ {
+@@ -548,7 +603,7 @@ SdhciBus::SetClock(int kilohertz, bool allowAuto)
+ 	// Preset values only choose the divider: the clock must already be
+ 	// running. It is not when the slot was empty at startup and a card was
+ 	// inserted later, so set it explicitly then.
+-	if (allowAuto && (fRegisters->host_controller_version.specVersion > 2)
++	if (allowAuto && _SpecVersion() > 2
+ 		&& fRegisters->clock_control.SDEnabled()) {
+ 		TRACE("Ignoring set_clock, controller support presets\n");
+ 		fRegisters->host_control_2 |= (1<<15);
+@@ -556,17 +611,17 @@ SdhciBus::SetClock(int kilohertz, bool allowAuto)
+ 		return;
+ 	}
+ 
+-	int base_clock = fRegisters->capabilities.BaseClockFrequency();
++	int baseClockKHz = _BaseClockKHz();
+ 	// Try to get as close to the requested frequency as possible, but not
+ 	// faster: round the divider up. (It used to be rounded down, which went
+ 	// unnoticed for 400kHz and 25MHz, which divide the usual base clocks
+ 	// exactly, but made a 52MHz request run at 100MHz on a 200MHz base.)
+-	int divider = (base_clock * 1000 + kilohertz - 1) / kilohertz;
++	int divider = (baseClockKHz + kilohertz - 1) / kilohertz;
+ 
+ 	// The clock to the card must be stopped while the divider changes
+ 	fRegisters->clock_control.DisableSD();
+ 
+-	if (fRegisters->host_controller_version.specVersion <= 1) {
++	if (_SpecVersion() <= 1) {
+ 		// Old controller only support power of two dividers up to 256,
+ 		// round to next power of two up to 256
+ 		if (divider > 256)
+@@ -583,8 +638,8 @@ SdhciBus::SetClock(int kilohertz, bool allowAuto)
+ 
+ 	// Log the value after possible rounding by SetDivider (only even values
+ 	// are allowed).
+-	TRACE("SDCLK frequency: requested %dkHz, effective %dMHz / %d = %dkHz\n", kilohertz,
+-		base_clock, divider, base_clock * 1000 / divider);
++	TRACE("SDCLK frequency: requested %dkHz, effective %dkHz / %d = %dkHz\n", kilohertz,
++		baseClockKHz, divider, baseClockKHz / divider);
+ 
+ 	// We have set the divider, now we can enable the internal clock.
+ 	fRegisters->clock_control.EnableInternal();
+@@ -623,12 +678,16 @@ static const char* const kStopModeNames[] = { "cmd23", "auto_cmd12", "single" };
+ 
+ 
+ /*!	Slot type 1 in the capabilities: a device soldered to the board, such as
+-	an eMMC. It is always there, card detection means nothing for it.
++	an eMMC. It is always there, card detection means nothing for it. The same
++	goes for a slot whose card is taken as always present (quirk).
+ */
+ bool
+ SdhciBus::_IsEmbeddedSlot()
+ {
+-	return fRegisters->capabilities.SlotType() == 1;
++	// A controller whose card detection is not used (it is done through a
++	// GPIO instead, or the device is soldered) is handled the same way
++	return fQuirks.forceCardPresent
++		|| fRegisters->capabilities.SlotType() == 1;
+ }
+ 
+ 
+@@ -1106,13 +1165,13 @@ SdhciBus::_SelectTransferMode()
+ 	TRACE_ALWAYS("controller: spec %d, SDMA %s, ADMA2 %s, high speed %s, DDR50 %s, "
+ 		"SDR104/HS200 %s, HS400 (Intel bit 63) %s, base clock %u MHz; card "
+ 		"type %d (%s addressing), RCA %u\n",
+-		fRegisters->host_controller_version.specVersion,
++		_SpecVersion(),
+ 		canSdma ? "yes" : "no", canAdma ? "yes" : "no",
+ 		fRegisters->capabilities.HighSpeed() ? "yes" : "no",
+ 		fRegisters->capabilities.DDR50Support() ? "yes" : "no",
+ 		fRegisters->capabilities.SDR104Support() ? "yes" : "no",
+ 		fRegisters->capabilities.IntelHS400Support() ? "yes" : "no",
+-		fRegisters->capabilities.BaseClockFrequency(), fCardType,
++		_BaseClockKHz() / 1000, fCardType,
+ 		step == 1 ? "sector" : "byte", fSelectedRca);
+ 
+ 	// Order of preference. CMD23 is the normal way for eMMC, auto CMD12 for SD
+@@ -1298,7 +1357,6 @@ SdhciBus::_ExecuteTuning()
+ 		fRegisters->block_size.ConfigureTransfer(blockSize, 0);
+ 		fRegisters->block_count = 1;
+ 		fRegisters->argument = 0;
+-		fRegisters->transfer_mode = (uint16)TransferMode::kRead;
+ 
+ 		// While tuning, the controller does not report "command complete":
+ 		// the buffer read ready status is the only sign that the device
+@@ -1306,8 +1364,9 @@ SdhciBus::_ExecuteTuning()
+ 		// ExecuteCommand(), which waits for command complete (that is what
+ 		// made the first version of this give up after 5s, although the
+ 		// tuning block had arrived).
+-		fRegisters->command.SendCommand(MMC_SEND_TUNING_BLOCK,
+-			Command::kR1Type | Command::kDataPresent);
++		_WriteCommand(MMC_SEND_TUNING_BLOCK,
++			Command::kR1Type | Command::kDataPresent,
++			(uint16)TransferMode::kRead, true);
+ 
+ 		// Wait for the tuning block (buffer read ready), 50ms at most
+ 		bigtime_t deadline = system_time() + 50000;
+@@ -1441,18 +1500,22 @@ SdhciBus::SetTiming(int timing, uint32 flags)
+ 	hostControl2 |= uhsMode;
+ 	if ((flags & MMC_TIMING_SIGNALING_1V8) != 0)
+ 		hostControl2 |= 1 << 3;
+-	fRegisters->host_control_2 = hostControl2;
++	// Host Control 2 only exists from version 3.00 of the specification on:
++	// leave it alone on a controller known to implement an older one
++	if (!fQuirks.forceSpec200)
++		fRegisters->host_control_2 = hostControl2;
+ 
+-	fRegisters->host_control.SetHighSpeed(highSpeed);
++	if (!fQuirks.noHighSpeedBit)
++		fRegisters->host_control.SetHighSpeed(highSpeed);
+ 
+ 	// Also starts the clock to the card again
+ 	SetClock(kilohertz, false);
+ 
+ 	const bool signaling18 = (flags & MMC_TIMING_SIGNALING_1V8) != 0;
+ #ifdef TRACE_SDHCI
+-	const int baseClock = fRegisters->capabilities.BaseClockFrequency();
+-	const int divider = (baseClock * 1000 + kilohertz - 1) / kilohertz;
+-	const int effective = baseClock * 1000
++	const int baseClockKHz = _BaseClockKHz();
++	const int divider = (baseClockKHz + kilohertz - 1) / kilohertz;
++	const int effective = baseClockKHz
+ 		/ (divider <= 1 ? 1 : (divider + 1) / 2 * 2);
+ 	TRACE("timing %s%s: clock about %d kHz, host control %02x, host "
+ 		"control 2 %04x\n", name, signaling18 ? " (1.8V signaling)" : "",
+diff --git a/src/add-ons/kernel/busses/mmc/sdhci.h b/src/add-ons/kernel/busses/mmc/sdhci.h
+index f0c757c0c0..1c95e2ded6 100644
+--- a/src/add-ons/kernel/busses/mmc/sdhci.h
++++ b/src/add-ons/kernel/busses/mmc/sdhci.h
+@@ -59,9 +59,30 @@ enum sdhci_stop_mode {
+ };
+ 
+ 
++// Deviations of a controller from the SD Host Controller specification, set
++// by the code that attaches it (see sdhci_fdt.cpp)
++struct SdhciQuirks {
++	// SDCLK base clock in kHz, when the capabilities register doesn't have it
++	uint32	baseClockKHz;
++	// the host controller version register is unreliable, assume 2.00
++	bool	forceSpec200;
++	// the data timeout counter value can't be computed, use the maximum
++	bool	brokenTimeoutValue;
++	// the controller's card detect line is not used (card detect through a
++	// GPIO, or non removable device): take the card as always present
++	bool	forceCardPresent;
++	// the transfer mode and command registers must be written together, in
++	// one 32 bit access
++	bool	combinedCommandWrite;
++	// there is no high speed enable bit in the host control register
++	bool	noHighSpeedBit;
++};
++
++
+ class SdhciBus {
+ 	public:
+-								SdhciBus(struct registers* registers, uint8_t irq, bool poll);
++								SdhciBus(struct registers* registers, uint8_t irq, bool poll,
++									const SdhciQuirks* quirks = NULL);
+ 								~SdhciBus();
+ 
+ 			void				EnableInterrupts(uint32_t mask);
+@@ -90,6 +111,11 @@ class SdhciBus {
+ 
+ 			bool				_IsMMC() const
+ 									{ return is_mmc_card_type(fCardType); }
++			uint8_t				_SpecVersion();
++			uint32_t			_BaseClockKHz();
++			void				_WriteCommand(uint8_t command,
++									uint8_t replyType, uint16 transferMode,
++									bool writeTransferMode);
+ 			bool				_IsEmbeddedSlot();
+ 			bool				_IsCardPresent();
+ 			bool				_UsesSectorAddressing() const;
+@@ -126,6 +152,7 @@ class SdhciBus {
+ 			status_t			fStatus;
+ 			thread_id			fWorkerThread;
+ 			card_type			fCardType;
++			SdhciQuirks			fQuirks;
+ 
+ 			// Page 0 holds the ADMA2 descriptor table, page 1 is a bounce
+ 			// buffer for the self test and for ReadData(). Both are
+@@ -320,6 +347,8 @@ class TimeoutControl {
+ 
+ 			fBits = i - 13;
+ 		}
++
++		void SetMaximum() { fBits = 14; }
+ 	private:
+ 		volatile  uint8_t fBits;
+ } __attribute__((packed));
+@@ -474,6 +503,12 @@ class HostControl {
+ 				value &= ~kHighSpeed;
+ 		}
+ 
++		// Take the card detect state from the test level, set to "inserted"
++		void ForceCardInserted()
++		{
++			value |= kCardDetectSignalSelection | kCardDetectTestLevel;
++		}
++
+ 		// TODO add other bits for LED control, etc.
+ 
+ 		uint8 Bits() { return value; }
+@@ -493,6 +528,9 @@ class HostControl {
+ 
+ 		static const uint8_t kDataTransferWidthMask
+ 			= kDataTransfer4Bit | kDataTransfer8Bit;
++
++		static const uint8_t kCardDetectTestLevel = 1 << 6;
++		static const uint8_t kCardDetectSignalSelection = 1 << 7;
+ 	private:
+ 		volatile uint8_t value;
+ } __attribute__((packed));

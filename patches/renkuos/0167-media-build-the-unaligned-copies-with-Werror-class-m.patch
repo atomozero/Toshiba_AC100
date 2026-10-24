@@ -1,0 +1,58 @@
+From 73a9105f0986a81f134646396fb2878a951ed8b3 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 20 Oct 2026 18:39:03 +0200
+Subject: [PATCH 167/203] media: build the unaligned copies with
+ -Werror=class-memaccess
+
+x86_64 builds the media kit and server with warnings as errors, and gcc
+refuses a memcpy() into a class that is not trivially copyable unless the
+destination is cast to void*, as the other copies already do.
+---
+ src/kits/media/MediaAddOn.cpp             | 2 +-
+ src/servers/media/NotificationManager.cpp | 6 +++---
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/kits/media/MediaAddOn.cpp b/src/kits/media/MediaAddOn.cpp
+index b716f93632..33a681162e 100644
+--- a/src/kits/media/MediaAddOn.cpp
++++ b/src/kits/media/MediaAddOn.cpp
+@@ -51,7 +51,7 @@ static inline Type
+ read_flat(const char* buffer)
+ {
+ 	Type value;
+-	memcpy(&value, buffer, sizeof(Type));
++	memcpy((void*)&value, buffer, sizeof(Type));
+ 	return value;
+ }
+ 
+diff --git a/src/servers/media/NotificationManager.cpp b/src/servers/media/NotificationManager.cpp
+index e651989385..28e3051f7a 100644
+--- a/src/servers/media/NotificationManager.cpp
++++ b/src/servers/media/NotificationManager.cpp
+@@ -93,7 +93,7 @@ NotificationManager::RequestNotifications(BMessage *msg)
+ 	msg->FindData("node", B_RAW_TYPE, &nodeData, &nodeSize);
+ 	ASSERT(nodeSize == sizeof(media_node));
+ 	// the data in the message is not aligned
+-	memcpy(&nodeCopy, nodeData, sizeof(nodeCopy));
++	memcpy((void*)&nodeCopy, nodeData, sizeof(nodeCopy));
+ 	node = &nodeCopy;
+ 
+ 	Notification n;
+@@ -133,7 +133,7 @@ NotificationManager::CancelNotifications(BMessage *msg)
+ 	msg->FindData("node", B_RAW_TYPE, &nodeData, &nodeSize);
+ 	ASSERT(nodeSize == sizeof(media_node));
+ 	// the data in the message is not aligned
+-	memcpy(&nodeCopy, nodeData, sizeof(nodeCopy));
++	memcpy((void*)&nodeCopy, nodeData, sizeof(nodeCopy));
+ 	node = &nodeCopy;
+ 
+ 	TRACE("NotificationManager::CancelNotifications node %ld, team %ld, what "
+@@ -224,7 +224,7 @@ NotificationManager::SendNotifications(BMessage *msg)
+ 				if (msg->FindData("node", B_RAW_TYPE, &data, &size) != B_OK
+ 					|| size != sizeof(media_node))
+ 					continue;
+-				memcpy(&nodeCopy, data, sizeof(nodeCopy));
++				memcpy((void*)&nodeCopy, data, sizeof(nodeCopy));
+ 				if (n->node != nodeCopy)
+ 					continue;
+ 			}

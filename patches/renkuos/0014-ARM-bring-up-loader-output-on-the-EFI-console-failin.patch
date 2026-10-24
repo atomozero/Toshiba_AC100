@@ -1,0 +1,129 @@
+From 9b25f8a70bfe909ca88b465f5ae4168e49bc4832 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 15:51:05 +0200
+Subject: [PATCH 014/203] ARM bring-up: loader output on the EFI console,
+ failing addresses as markers (not for merging)
+
+---
+ .../private/kernel/arch/arm/arm_boot_marker.h | 32 +++++++++++++++++++
+ src/system/boot/platform/efi/serial.cpp       |  8 +++++
+ src/system/kernel/arch/arm/arch_cpu.cpp       |  8 +++++
+ src/system/kernel/vm/vm.cpp                   |  8 +++++
+ 4 files changed, 56 insertions(+)
+
+diff --git a/headers/private/kernel/arch/arm/arm_boot_marker.h b/headers/private/kernel/arch/arm/arm_boot_marker.h
+index 994096d9f0..183580c769 100644
+--- a/headers/private/kernel/arch/arm/arm_boot_marker.h
++++ b/headers/private/kernel/arch/arm/arm_boot_marker.h
+@@ -49,8 +49,40 @@ arm_boot_marker_draw(uint8* frameBuffer, uint32 bytesPerRow, uint32 depth,
+ }
+ 
+ 
++/*!	Draws \a value as 32 squares (most significant bit first) in row \a row
++	below the stage markers: white for 1, gray for 0, a gap every 8 bits.
++*/
++static inline void
++arm_boot_marker_draw_value(uint8* frameBuffer, uint32 bytesPerRow,
++	uint32 depth, int row, uint32 value)
++{
++	const int kSize = 10;
++
++	if (frameBuffer == NULL)
++		return;
++
++	for (int bit = 0; bit < 32; bit++) {
++		bool set = (value & (1U << (31 - bit))) != 0;
++		uint32 color32 = set ? 0xffffff : 0x505050;
++		uint16 color16 = set ? 0xffff : 0x528a;
++		int left = 8 + bit * (kSize + 4) + (bit / 8) * 10;
++		int top = 36 + row * (kSize + 8);
++		for (int y = 0; y < kSize; y++) {
++			uint8* line = frameBuffer + (top + y) * bytesPerRow;
++			for (int x = left; x < left + kSize; x++) {
++				if (depth == 32)
++					((volatile uint32*)line)[x] = color32;
++				else if (depth == 16)
++					((volatile uint16*)line)[x] = color16;
++			}
++		}
++	}
++}
++
++
+ #ifdef _KERNEL_MODE
+ void arm_boot_marker(int index);
++void arm_boot_marker_value(int row, uint32 value);
+ #endif
+ 
+ 
+diff --git a/src/system/boot/platform/efi/serial.cpp b/src/system/boot/platform/efi/serial.cpp
+index fc78e602df..0c30c2f4db 100644
+--- a/src/system/boot/platform/efi/serial.cpp
++++ b/src/system/boot/platform/efi/serial.cpp
+@@ -56,6 +56,14 @@ serial_putc(char ch)
+ 	}
+ #endif
+ 
++	// bring-up aid: also show the output on the EFI console (screen)
++	if (sEFIAvailable) {
++		char16_t ucsBuffer[2];
++		ucsBuffer[0] = ch;
++		ucsBuffer[1] = 0;
++		kSystemTable->ConOut->OutputString(kSystemTable->ConOut, ucsBuffer);
++	}
++
+ 	// If EFI services are unavailable... try any UART
+ 	// this can happen when serial_io is unavailable, or EFI
+ 	// is exiting
+diff --git a/src/system/kernel/arch/arm/arch_cpu.cpp b/src/system/kernel/arch/arm/arch_cpu.cpp
+index fe1d1920a5..d3ae5f9347 100644
+--- a/src/system/kernel/arch/arm/arch_cpu.cpp
++++ b/src/system/kernel/arch/arm/arch_cpu.cpp
+@@ -33,6 +33,14 @@ arm_boot_marker(int index)
+ }
+ 
+ 
++void
++arm_boot_marker_value(int row, uint32 value)
++{
++	arm_boot_marker_draw_value(sBootMarkerFrameBuffer, sBootMarkerBytesPerRow,
++		sBootMarkerDepth, row, value);
++}
++
++
+ status_t
+ arch_cpu_preboot_init_percpu(kernel_args *args, int curr_cpu)
+ {
+diff --git a/src/system/kernel/vm/vm.cpp b/src/system/kernel/vm/vm.cpp
+index ff10ef1c53..23b55f4fe5 100644
+--- a/src/system/kernel/vm/vm.cpp
++++ b/src/system/kernel/vm/vm.cpp
+@@ -13,8 +13,10 @@
+ #ifdef __ARM__
+ #	include <arch/arm/arm_boot_marker.h>
+ #	define VM_MARKER(x) arm_boot_marker(x)
++#	define VM_VALUE(row, x) arm_boot_marker_value(row, (uint32)(x))
+ #else
+ #	define VM_MARKER(x)
++#	define VM_VALUE(row, x)
+ #endif
+ 
+ #include <ctype.h>
+@@ -1842,11 +1844,17 @@ vm_create_anonymous_area(team_id team, const char *name, addr_t size,
+ 				uint32 flags;
+ 				status = map->Query(virtualAddress, &physicalAddress, &flags);
+ 				if (status < B_OK) {
++					VM_MARKER(31);
++					VM_VALUE(0, virtualAddress);
+ 					panic("looking up mapping failed for va 0x%lx\n",
+ 						virtualAddress);
+ 				}
+ 				page = vm_lookup_page(physicalAddress / B_PAGE_SIZE);
+ 				if (page == NULL) {
++					VM_MARKER(32);
++					VM_VALUE(0, virtualAddress);
++					VM_VALUE(1, physicalAddress);
++					VM_VALUE(2, flags);
+ 					panic("looking up page failed for pa %#" B_PRIxPHYSADDR
+ 						"\n", physicalAddress);
+ 				}

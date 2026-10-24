@@ -1,0 +1,71 @@
+From bbb019390e96fb88112c9539976b46fbcc6223a1 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 23:12:41 +0200
+Subject: [PATCH 123/203] nvec: stream the touchpad only once it is set up,
+ stop it at power off
+
+The EC keeps the touchpad's state while the machine is off. Asking it to
+stream the touchpad's bytes before resetting and enabling it left the
+touchpad silent after a warm boot: cancel the streaming first, reset, set
+up and enable the touchpad, then start streaming. At power off disable it
+and stop the streaming, as Linux does.
+---
+ src/add-ons/kernel/busses/i2c/nvec/nvec.cpp | 21 +++++++++++++++++----
+ 1 file changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+index d7857a4270..322749ef71 100644
+--- a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
++++ b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+@@ -127,6 +127,7 @@ enum {
+ #define KBD_ENABLE					0xf4
+ #define PS2_SEND_COMMAND			1	// NVEC_PS2
+ #define PS2_AUTO_RECEIVE_N			3
++#define PS2_CANCEL_AUTO_RECEIVE		4
+ #define GET_SYSTEM_STATUS			0	// NVEC_SYS
+ #define LID_SWITCH					(1 << 1)
+ #define PWR_BUTTON					(1 << 15)
+@@ -1171,9 +1172,12 @@ start_ec(nvec_device* device)
+ 	static const uint8 kKeyboardWakeKeys[] = { NVEC_KBD,
+ 		KBD_CNFG_WAKE_KEY_REPORTING, 1 };
+ 	static const uint8 kKeyboardLEDs[] = { NVEC_KBD, KBD_SET_LEDS, 0 };
+-	// touchpad: stream its bytes to us, reset it (it keeps its state while
+-	// the machine is off, and may not send anything otherwise: answers
+-	// fa aa 00), then set the default (3 byte packet) mode and enable it
++	// touchpad: the EC keeps its state while the machine is off. Stop it
++	// streaming, reset it (answers fa aa 00), set the default (3 byte packet)
++	// mode and enable it, then have the EC stream its bytes to us: streaming
++	// first left it silent after a warm boot.
++	static const uint8 kMouseStopStream[] = { NVEC_PS2,
++		PS2_CANCEL_AUTO_RECEIVE };
+ 	static const uint8 kMouseStream[] = { NVEC_PS2, PS2_AUTO_RECEIVE_N, 6 };
+ 	static const uint8 kMouseReset[] = { NVEC_PS2, PS2_SEND_COMMAND, 0xff,
+ 		3 };
+@@ -1194,10 +1198,11 @@ start_ec(nvec_device* device)
+ 	nvec_write(device, kKeyboardWakeKeys, sizeof(kKeyboardWakeKeys));
+ 	nvec_write(device, kKeyboardLEDs, sizeof(kKeyboardLEDs));
+ 
+-	nvec_write(device, kMouseStream, sizeof(kMouseStream));
++	nvec_write(device, kMouseStopStream, sizeof(kMouseStopStream));
+ 	nvec_write(device, kMouseReset, sizeof(kMouseReset));
+ 	nvec_write(device, kMouseDefaults, sizeof(kMouseDefaults));
+ 	nvec_write(device, kMouseEnable, sizeof(kMouseEnable));
++	nvec_write(device, kMouseStream, sizeof(kMouseStream));
+ }
+ 
+ 
+@@ -1211,6 +1216,14 @@ nvec_power_off()
+ 
+ 	static const uint8 kNoEvents[] = { NVEC_SLEEP, GLOBAL_EVENTS, 0 };
+ 	static const uint8 kPowerDown[] = { NVEC_SLEEP, AP_PWR_DOWN };
++	// as Linux does: the EC keeps the touchpad's state while the machine is
++	// off
++	static const uint8 kMouseDisable[] = { NVEC_PS2, PS2_SEND_COMMAND, 0xf5,
++		1 };
++	static const uint8 kMouseStopStream[] = { NVEC_PS2,
++		PS2_CANCEL_AUTO_RECEIVE };
++	nvec_write(device, kMouseDisable, sizeof(kMouseDisable));
++	nvec_write(device, kMouseStopStream, sizeof(kMouseStopStream));
+ 	nvec_write(device, kNoEvents, sizeof(kNoEvents));
+ 	nvec_write(device, kPowerDown, sizeof(kPowerDown));
+ 

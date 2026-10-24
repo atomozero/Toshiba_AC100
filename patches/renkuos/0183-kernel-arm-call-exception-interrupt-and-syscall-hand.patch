@@ -1,0 +1,68 @@
+From a05cb578a2118245daf491ca45032c7aaaa11796 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Fri, 23 Oct 2026 19:00:40 +0200
+Subject: [PATCH 183/203] kernel/arm: call exception, interrupt and syscall
+ handlers with an 8 byte aligned stack
+
+The AAPCS requires the stack to be 8 byte aligned at public interfaces.
+The exception entry pushes a 76 byte iframe on whatever stack it finds,
+and the syscall entry one on the kernel stack, and both called C with
+the result, so handlers could run with the stack 4 bytes off. Variadic
+functions then read 64 bit arguments from the wrong place: a dprintf()
+in the private timer interrupt printed its millisecond value in the
+upper half of a 64 bit number.
+
+Align the stack down before calling C. The VFP save area below the
+iframe moves with it, and arm_exception_fpu_context() finds it the same
+way.
+---
+ src/system/kernel/arch/arm/arch_exceptions.S | 7 ++++++-
+ src/system/kernel/arch/arm/arch_int.cpp      | 2 +-
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/system/kernel/arch/arm/arch_exceptions.S b/src/system/kernel/arch/arm/arch_exceptions.S
+index 8f34c5e1d9..5a9474f648 100644
+--- a/src/system/kernel/arch/arm/arch_exceptions.S
++++ b/src/system/kernel/arch/arm/arch_exceptions.S
+@@ -21,12 +21,14 @@
+ /* Calls \handler with the iframe, around it saves and restores the VFP
+    registers: the kernel uses them too (the compiler does for 64 bit
+    copies), and an exception may interrupt code using them at any point.
+-   The saved registers are right below the iframe, see
++   The saved registers are right below the iframe, aligned down to 8 bytes
++   like the stack the handler is called with, see
+    arm_exception_fpu_context(). */
+ #define EXCEPTION_FPU_AREA_SIZE	264		/* sizeof(arch_fpu_context) */
+ .macro CALL_HANDLER_SAVING_VFP handler
+ 	mov		r4, sp						/* iframe */
+ 	sub		sp, sp, #EXCEPTION_FPU_AREA_SIZE
++	bic		sp, sp, #7					/* the AAPCS wants 8 byte alignment */
+ 	mov		r0, sp
+ 	bl		arm_save_fpu
+ 	mov		r0, r4
+@@ -166,9 +168,12 @@ FUNCTION(arm_syscall):
+ 
+ 	mov		r0, sp		/* iframe */
+ 	mov		fp, r0
++	mov		r4, sp
++	bic		sp, sp, #7	/* the AAPCS wants 8 byte alignment */
+ 	bl		arch_arm_syscall
+ 
+ 	DISABLE_INTERRUPTS
++	mov		sp, r4
+ 	PULL_FRAME_AND_EXIT
+ FUNCTION_END(arm_syscall)
+ 
+diff --git a/src/system/kernel/arch/arm/arch_int.cpp b/src/system/kernel/arch/arm/arch_int.cpp
+index d53a217bdd..e8ffb0aece 100644
+--- a/src/system/kernel/arch/arm/arch_int.cpp
++++ b/src/system/kernel/arch/arm/arch_int.cpp
+@@ -285,7 +285,7 @@ static struct arm_exception_record* arm_log_exception(uint32 type,
+ static inline arch_fpu_context*
+ arm_exception_fpu_context(struct iframe* iframe)
+ {
+-	return (arch_fpu_context*)((addr_t)iframe - 264);
++	return (arch_fpu_context*)(((addr_t)iframe - 264) & ~(addr_t)7);
+ }
+ 
+ static_assert(sizeof(arch_fpu_context) == 264,

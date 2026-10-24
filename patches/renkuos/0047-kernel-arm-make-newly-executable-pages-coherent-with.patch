@@ -1,0 +1,120 @@
+From 56f2e9725e0dc97ecf9b38bfc2cef0cd87206cbc Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 21:55:46 +0200
+Subject: [PATCH 047/203] kernel/arm: make newly executable pages coherent with
+ the instruction cache
+
+arch_cpu_sync_icache() only invalidated the instruction cache, without
+first writing the data cache back to the point of unification, and the
+32 bit ARM paging code never called it when a page became executable.
+Code written through the data cache, like a kernel add-on just loaded
+by the ELF loader, was thus fetched from stale memory, or the
+instruction cache still held what an unloaded add-on left at the same
+place. On the Toshiba AC100 probing drivers ended up executing data.
+
+Clean the level 1 data cache to the point of unification, then
+invalidate the instruction cache and the branch predictor, whenever a
+page is mapped executable or made executable, as the ARM64 code does.
+---
+ headers/private/kernel/arch/arm/arch_cpu.h    |  1 +
+ src/system/kernel/arch/arm/arch_cpu.cpp       | 42 +++++++++++++++++--
+ .../paging/32bit/ARMVMTranslationMap32Bit.cpp | 11 +++++
+ 3 files changed, 51 insertions(+), 3 deletions(-)
+
+diff --git a/headers/private/kernel/arch/arm/arch_cpu.h b/headers/private/kernel/arch/arm/arch_cpu.h
+index 38fa676618..c68b57915c 100644
+--- a/headers/private/kernel/arch/arm/arch_cpu.h
++++ b/headers/private/kernel/arch/arm/arch_cpu.h
+@@ -146,6 +146,7 @@ arm_clean_dcache_range(const void* address, size_t size)
+ 
+ 
+ void arch_cpu_invalidate_TLB_page(addr_t page);
++void arm_sync_icache_all(void);
+ 
+ static inline void
+ arch_cpu_pause(void)
+diff --git a/src/system/kernel/arch/arm/arch_cpu.cpp b/src/system/kernel/arch/arm/arch_cpu.cpp
+index 9ebc2fa1ed..1d06bd2623 100644
+--- a/src/system/kernel/arch/arm/arch_cpu.cpp
++++ b/src/system/kernel/arch/arm/arch_cpu.cpp
+@@ -290,12 +290,48 @@ arch_cpu_shutdown(bool reboot)
+ }
+ 
+ 
++/*!	Makes code written through the data cache visible to instruction fetches:
++	cleans the whole level 1 data cache to the point of unification (which is
++	level 1 on the supported CPUs), then invalidates the instruction cache and
++	the branch predictor. This only affects the current CPU.
++*/
++void
++arm_sync_icache_all(void)
++{
++	// select the level 1 data cache and read its geometry
++	asm volatile ("mcr p15, 2, %0, c0, c0, 0" : : "r" (0));
++	asm volatile ("isb");
++	uint32 ccsidr;
++	asm volatile ("mrc p15, 1, %0, c0, c0, 0" : "=r" (ccsidr));
++
++	uint32 lineShift = (ccsidr & 7) + 4;
++	uint32 ways = ((ccsidr >> 3) & 0x3ff) + 1;
++	uint32 sets = ((ccsidr >> 13) & 0x7fff) + 1;
++	uint32 wayShift = ways > 1 ? __builtin_clz(ways - 1) : 0;
++
++	dsb();
++	for (uint32 way = 0; way < ways; way++) {
++		for (uint32 set = 0; set < sets; set++) {
++			// DCCSW: clean by set/way
++			uint32 value = (way << wayShift) | (set << lineShift);
++			asm volatile ("mcr p15, 0, %0, c7, c10, 2" : : "r" (value)
++				: "memory");
++		}
++	}
++	dsb();
++
++	// ICIALLU and BPIALL
++	asm volatile ("mcr p15, 0, %0, c7, c5, 0" : : "r" (0) : "memory");
++	asm volatile ("mcr p15, 0, %0, c7, c5, 6" : : "r" (0) : "memory");
++	dsb();
++	isb();
++}
++
++
+ void
+ arch_cpu_sync_icache(void *address, size_t len)
+ {
+-	uint32 Rd = 0;
+-	asm volatile ("mcr p15, 0, %[c7format], c7, c5, 0"
+-		: : [c7format] "r" (Rd) );
++	arm_sync_icache_all();
+ }
+ 
+ 
+diff --git a/src/system/kernel/arch/arm/paging/32bit/ARMVMTranslationMap32Bit.cpp b/src/system/kernel/arch/arm/paging/32bit/ARMVMTranslationMap32Bit.cpp
+index ef18e822ea..2a55fd6d33 100644
+--- a/src/system/kernel/arch/arm/paging/32bit/ARMVMTranslationMap32Bit.cpp
++++ b/src/system/kernel/arch/arm/paging/32bit/ARMVMTranslationMap32Bit.cpp
+@@ -230,6 +230,12 @@ ARMVMTranslationMap32Bit::Map(addr_t va, phys_addr_t pa, uint32 attributes,
+ 
+ 	fMapCount++;
+ 
++	// The page may have been written through the data cache, and the
++	// instruction cache may still hold what was at this physical address
++	// before
++	if ((attributes & (B_EXECUTE_AREA | B_KERNEL_EXECUTE_AREA)) != 0)
++		arm_sync_icache_all();
++
+ 	return 0;
+ }
+ 
+@@ -581,6 +587,11 @@ ARMVMTranslationMap32Bit::Protect(addr_t start, addr_t end, uint32 attributes,
+ 		}
+ 	} while (start != 0 && start < end);
+ 
++	// Code may just have been written to the pages that become executable,
++	// e.g. by the kernel add-on loader
++	if ((attributes & (B_EXECUTE_AREA | B_KERNEL_EXECUTE_AREA)) != 0)
++		arm_sync_icache_all();
++
+ 	return B_OK;
+ }
+ 

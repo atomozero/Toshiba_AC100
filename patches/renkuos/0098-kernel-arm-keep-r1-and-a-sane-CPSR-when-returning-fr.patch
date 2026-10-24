@@ -1,0 +1,76 @@
+From ca9e15b0724f4b82b6ea2e274e3963a67f495bc8 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 15:38:54 +0200
+Subject: [PATCH 098/203] kernel/arm: keep r1 and a sane CPSR when returning
+ from a signal handler
+
+arch_restore_signal_frame() only returned r0, and the syscall exit writes
+the 64 bit result to r0 and r1: r1 was lost whenever a signal had
+interrupted userland code, now that signals are also delivered there (bash
+crashed in its SIGCHLD handling). Return both, like x86 does with eax/edx.
+
+Also start the handler wrapper in ARM state when Thumb code was interrupted,
+and only take the user modifiable bits of the CPSR from the signal frame,
+which is user memory.
+---
+ headers/private/system/arch/arm/arch_cpu_defs.h |  7 +++++++
+ src/system/kernel/arch/arm/arch_thread.cpp      | 11 +++++++++--
+ 2 files changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/headers/private/system/arch/arm/arch_cpu_defs.h b/headers/private/system/arch/arm/arch_cpu_defs.h
+index f5e50dbf0c..9b879d7ce6 100644
+--- a/headers/private/system/arch/arm/arch_cpu_defs.h
++++ b/headers/private/system/arch/arm/arch_cpu_defs.h
+@@ -23,6 +23,13 @@
+ #define CPSR_T				0x20
+ #define CPSR_F				0x40
+ #define CPSR_I				0x80
++#define CPSR_E				0x200
++#define CPSR_IT_MASK		0x0600fc00	// Thumb If-Then state
++#define CPSR_GE_MASK		0x000f0000
++#define CPSR_FLAGS_MASK		0xf8000000	// N, Z, C, V, Q
++// the bits userland may set when returning from a signal handler
++#define CPSR_USER_MASK		(CPSR_FLAGS_MASK | CPSR_GE_MASK | CPSR_IT_MASK \
++	| CPSR_E | CPSR_T)
+ 
+ #define SCTLR_HIGH_VECTORS	0x00002000
+ 
+diff --git a/src/system/kernel/arch/arm/arch_thread.cpp b/src/system/kernel/arch/arm/arch_thread.cpp
+index 4a6c12632d..c842cf15f6 100644
+--- a/src/system/kernel/arch/arm/arch_thread.cpp
++++ b/src/system/kernel/arch/arm/arch_thread.cpp
+@@ -16,6 +16,7 @@
+ #include <arch_thread.h>
+ 
+ #include <arch_cpu.h>
++#include <arch_cpu_defs.h>
+ #include <arch/thread.h>
+ #include <boot/stage2.h>
+ #include <commpage.h>
+@@ -336,6 +337,8 @@ arch_setup_signal_frame(Thread *thread, struct sigaction *sa,
+ 	frame->usr_sp = (addr_t)userStack;
+ 	frame->pc = signalHandlerAddr;
+ 	frame->r0 = frame->usr_sp;
++	// the handler wrapper is ARM code, even if a signal interrupted Thumb code
++	frame->spsr &= ~(CPSR_T | CPSR_IT_MASK);
+ 
+ 	return B_OK;
+ }
+@@ -371,11 +374,15 @@ arch_restore_signal_frame(struct signal_frame_data* signalFrameData)
+ 	frame->usr_sp = signalFrameData->context.uc_mcontext.r13;
+ 	frame->usr_lr = signalFrameData->context.uc_mcontext.r14;
+ 	frame->pc     = signalFrameData->context.uc_mcontext.r15;
+-	frame->spsr   = signalFrameData->context.uc_mcontext.cpsr;
++	// the CPSR comes from the user stack: only take what userland may change
++	frame->spsr   = (signalFrameData->context.uc_mcontext.cpsr
++		& CPSR_USER_MASK) | CPSR_MODE_USR;
+ 
+ 	arm_restore_fpu((arch_fpu_context*)&signalFrameData->context.uc_mcontext.d[0]);
+ 
+-	return frame->r0;
++	// The syscall returns r0 and r1 (for 64 bit results): give both back, a
++	// signal may have interrupted userland code using r1.
++	return ((uint64)frame->r1 << 32) | frame->r0;
+ }
+ 
+ 

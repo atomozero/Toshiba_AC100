@@ -1,0 +1,147 @@
+From b75cb036fa1ad31f9767dc8e8c8162a0269fe5f7 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 18:14:57 +0200
+Subject: [PATCH 030/203] ARM bring-up: show the CPU and L2 state left by the
+ firmware, keep the first panic (not for merging)
+
+---
+ .../kernel/arch/arm/arch_kernel_args.h        |  1 +
+ .../boot/platform/efi/arch/arm/arch_dtb.cpp   | 24 +++++++++++++++++++
+ src/system/kernel/arch/arm/arch_cpu.cpp       | 17 +++++++++++++
+ src/system/kernel/arch/arm/arch_int.cpp       | 14 -----------
+ src/system/kernel/debug/debug.cpp             |  7 ++++++
+ 5 files changed, 49 insertions(+), 14 deletions(-)
+
+diff --git a/headers/private/kernel/arch/arm/arch_kernel_args.h b/headers/private/kernel/arch/arm/arch_kernel_args.h
+index c693cb2702..3dcefdcc03 100644
+--- a/headers/private/kernel/arch/arm/arch_kernel_args.h
++++ b/headers/private/kernel/arch/arm/arch_kernel_args.h
+@@ -42,6 +42,7 @@ typedef struct {
+ 	boot_timer_info		timer;
+ 	uint32				timerFrequency;	// in Hz, if the timer needs it
+ 	uint32				bootMarkerFrameBuffer;	// kernel address, bring-up aid
++	uint32				bootDebug[8];	// loader's view of the CPU, bring-up aid
+ } _PACKED arch_kernel_args;
+ 
+ #endif	/* KERNEL_ARCH_ARM_KERNEL_ARGS_H */
+diff --git a/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp b/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp
+index bfe8a9687a..aa4e4afcbe 100644
+--- a/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp
++++ b/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp
+@@ -50,6 +50,9 @@ static addr_range sTWDRegs;
+ static uint32 sTWDInterrupt;
+ static bool sHasTWD = false;
+ 
++// bring-up aid: the outer cache controller, if any
++static addr_range sL2Regs;
++
+ 
+ /*!	The TWD runs at PERIPHCLK, whose rate the device tree usually doesn't
+ 	describe, so measure it against the firmware's Stall().
+@@ -123,6 +126,11 @@ arch_handle_fdt(const void* fdt, int node)
+ 		sHasTWD = true;
+ 	}
+ 
++	if (sL2Regs.start == 0 && dtb_has_fdt_string(compatible, compatibleLen,
++			"arm,pl310-cache")) {
++		dtb_get_reg(fdt, node, 0, sL2Regs);
++	}
++
+ 	boot_timer_info &timer = gKernelArgs.arch_args.timer;
+ 	if (timer.kind[0] == 0) {
+ 		for (uint32 i = 0; i < B_COUNT_OF(kSupportedTimers); i++) {
+@@ -143,6 +151,22 @@ arch_handle_fdt(const void* fdt, int node)
+ void
+ arch_dtb_set_kernel_args(void)
+ {
++	// bring-up aid: record the state the firmware left the CPU in
++	uint32* debug = gKernelArgs.arch_args.bootDebug;
++	asm volatile ("mrc p15, 0, %0, c0, c0, 0" : "=r" (debug[0]));	// MIDR
++	asm volatile ("mrc p15, 0, %0, c1, c0, 1" : "=r" (debug[1]));	// ACTLR
++	asm volatile ("mrc p15, 0, %0, c1, c0, 0" : "=r" (debug[2]));	// SCTLR
++	asm volatile ("mrs %0, cpsr" : "=r" (debug[3]));
++	debug[4] = debug[5] = 0xffffffff;
++	if (sL2Regs.start != 0) {
++		debug[4] = *(volatile uint32*)(addr_t)(sL2Regs.start + 0x100);
++		debug[5] = *(volatile uint32*)(addr_t)(sL2Regs.start + 0x104);
++	}
++	dprintf("CPU: MIDR %#" B_PRIx32 ", ACTLR %#" B_PRIx32 ", SCTLR %#" B_PRIx32
++		", CPSR %#" B_PRIx32 "\n", debug[0], debug[1], debug[2], debug[3]);
++	dprintf("L2 (PL310 @ %#" B_PRIx64 "): control %#" B_PRIx32 ", aux %#"
++		B_PRIx32 "\n", sL2Regs.start, debug[4], debug[5]);
++
+ 	intc_info &interrupt_controller = gKernelArgs.arch_args.interrupt_controller;
+ 	dprintf("Chosen interrupt controller:\n");
+ 	if (interrupt_controller.kind[0] == 0) {
+diff --git a/src/system/kernel/arch/arm/arch_cpu.cpp b/src/system/kernel/arch/arm/arch_cpu.cpp
+index cc113966d2..f4f4165817 100644
+--- a/src/system/kernel/arch/arm/arch_cpu.cpp
++++ b/src/system/kernel/arch/arm/arch_cpu.cpp
+@@ -172,6 +172,23 @@ arch_cpu_preboot_init_percpu(kernel_args *args, int curr_cpu)
+ 		arm_boot_marker(6);
+ 		arm_boot_check_text(103);
+ 
++		// the state the loader found, and where the frame buffer and the
++		// boot stack really are
++		const uint32* debug = args->arch_args.bootDebug;
++		arm_boot_marker_value(110, debug[0]);	// MIDR
++		arm_boot_marker_value(111, debug[1]);	// ACTLR before the kernel
++		arm_boot_marker_value(112, debug[2]);	// SCTLR
++		arm_boot_marker_value(113, debug[3]);	// CPSR
++		arm_boot_marker_value(210, debug[4]);	// PL310 control
++		arm_boot_marker_value(211, debug[5]);	// PL310 aux control
++		arm_boot_marker_value(212,
++			(uint32)args->frame_buffer.physical_buffer.start);
++		arm_boot_marker_value(213,
++			arm_virtual_to_physical(args->cpu_kstack[0].start));
++		uint32 actlr;
++		asm volatile ("mrc p15, 0, %0, c1, c0, 1" : "=r" (actlr));
++		arm_boot_marker_value(313, actlr);
++
+ 		// MVFR0[3:0]: 1 = 16 double registers (e.g. Tegra 2), 2 = 32
+ 		gARMHasVFPD32 = (arm_get_mvfr0() & 0xf) == 2;
+ 	}
+diff --git a/src/system/kernel/arch/arm/arch_int.cpp b/src/system/kernel/arch/arm/arch_int.cpp
+index 314982c49f..b688bed9cf 100644
+--- a/src/system/kernel/arch/arm/arch_int.cpp
++++ b/src/system/kernel/arch/arm/arch_int.cpp
+@@ -406,20 +406,6 @@ arm_boot_show_exceptions(int row)
+ 	}
+ 	arm_boot_marker_value(row + 9, sExceptionCount);
+ 
+-	// for the two exceptions before the panic: frame address, r11 on entry,
+-	// r11 when the handler returned, and r11 in the frame memory now
+-	for (uint32 i = 0; i < 2; i++) {
+-		if (sExceptionCount < i + 2)
+-			break;
+-		const arm_exception_record& record
+-			= sExceptionLog[(sExceptionCount - 2 - i) % 4];
+-		int extraRow = (row % 100) + 7 + (i == 0 ? 200 : 100);
+-		arm_boot_marker_value(extraRow, record.frame);
+-		arm_boot_marker_value(extraRow + 1, record.r11In);
+-		arm_boot_marker_value(extraRow + 2, record.r11Out);
+-		arm_boot_marker_value(extraRow + 3,
+-			((struct iframe*)(addr_t)record.frame)->r11);
+-	}
+ }
+ 
+ 
+diff --git a/src/system/kernel/debug/debug.cpp b/src/system/kernel/debug/debug.cpp
+index 43c77dc73d..79a37f7c0f 100644
+--- a/src/system/kernel/debug/debug.cpp
++++ b/src/system/kernel/debug/debug.cpp
+@@ -2136,7 +2136,14 @@ panic(const char* format, ...)
+ 		// bring-up aid: show the first panic on screen and stop there, as
+ 		// the kernel debugger may not survive this early
+ 		static bool sPanicShown = false;
++		if (sPanicShown) {
++			// keep the first panic on screen
++			asm volatile ("cpsid aif");
++			while (true)
++				;
++		}
+ 		if (!sPanicShown) {
++			asm volatile ("cpsid aif");
+ 			sPanicShown = true;
+ 			arm_boot_marker(34);
+ 			arm_boot_check_text(203);

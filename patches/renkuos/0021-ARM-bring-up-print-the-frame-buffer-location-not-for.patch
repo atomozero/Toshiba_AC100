@@ -1,0 +1,27 @@
+From d83ada926c6fcb554598ffd7f2f4a9c8e8dbf293 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 16:51:07 +0200
+Subject: [PATCH 021/203] ARM bring-up: print the frame buffer location (not
+ for merging)
+
+---
+ src/system/boot/platform/efi/arch/arm/arch_start.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/system/boot/platform/efi/arch/arm/arch_start.cpp b/src/system/boot/platform/efi/arch/arm/arch_start.cpp
+index 94e97f907c..881dd69795 100644
+--- a/src/system/boot/platform/efi/arch/arm/arch_start.cpp
++++ b/src/system/boot/platform/efi/arch/arm/arch_start.cpp
+@@ -196,6 +196,12 @@ arch_start_kernel(addr_t kernelEntry)
+ 	// entry.
+ 
+ 	loader_marker(1);
++	dprintf("frame buffer: phys %#" B_PRIx64 ", size %#" B_PRIx64 ", %" B_PRIu32
++		"x%" B_PRIu32 "x%" B_PRIu32 "\n",
++		(uint64)gKernelArgs.frame_buffer.physical_buffer.start,
++		(uint64)gKernelArgs.frame_buffer.physical_buffer.size,
++		gKernelArgs.frame_buffer.width, gKernelArgs.frame_buffer.height,
++		gKernelArgs.frame_buffer.depth);
+ 	dprintf("Calling ExitBootServices. So long, EFI!\n");
+ 	serial_disable();
+ 

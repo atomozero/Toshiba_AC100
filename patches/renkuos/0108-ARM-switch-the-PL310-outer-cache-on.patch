@@ -1,0 +1,324 @@
+From cff3634826e96835650040a358c019fc62d1495a Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 19:17:33 +0200
+Subject: [PATCH 108/203] ARM: switch the PL310 outer cache on
+
+The firmware of the Toshiba AC100 leaves the 1 MB L2 cache of the Tegra 2
+off, and nothing switched it on. Do so at boot, with the latencies of the
+device tree, the shared attribute override (all memory is shareable now,
+which older revisions would not cache otherwise) and prefetching, as Linux
+does on Tegra 2. "arm_l2_cache false" in the kernel settings leaves it off.
+
+The CP15 maintenance operations stop at the outer cache: clean and
+invalidate it by physical address too for the SDMA buffers of sdhci and when
+memory becomes uncached. Table walks are now outer cacheable after a
+context switch as well, like with the boot loader's page tables, so that
+they see the page table updates in the L2 cache.
+---
+ headers/private/kernel/arch/arm/arch_cpu.h    |   7 +
+ .../kernel/arch/arm/arch_kernel_args.h        |   3 +
+ .../boot/platform/efi/arch/arm/arch_dtb.cpp   |  21 +++
+ src/system/kernel/arch/arm/Jamfile            |   1 +
+ src/system/kernel/arch/arm/arch_cpu.cpp       |   3 +
+ src/system/kernel/arch/arm/arch_l2_cache.cpp  | 162 ++++++++++++++++++
+ src/system/kernel/arch/arm/arch_thread.cpp    |   5 +-
+ src/system/kernel/arch/arm/arch_vm.cpp        |   4 +-
+ 8 files changed, 204 insertions(+), 2 deletions(-)
+ create mode 100644 src/system/kernel/arch/arm/arch_l2_cache.cpp
+
+diff --git a/headers/private/kernel/arch/arm/arch_cpu.h b/headers/private/kernel/arch/arm/arch_cpu.h
+index f44e7ade16..402865c764 100644
+--- a/headers/private/kernel/arch/arm/arch_cpu.h
++++ b/headers/private/kernel/arch/arm/arch_cpu.h
+@@ -149,6 +149,13 @@ void arch_cpu_invalidate_TLB_page(addr_t page);
+ void arm_sync_icache_all(void);
+ void arm_clean_invalidate_dcache_all(void);
+ 
++// The outer (level 2) cache is not reached by the CP15 cache maintenance
++// operations: memory shared with a DMA engine must also be cleaned or
++// invalidated there, by physical address. No-ops without an outer cache.
++void arm_outer_cache_clean_range(phys_addr_t address, size_t size);
++void arm_outer_cache_flush_range(phys_addr_t address, size_t size);
++	// clean and invalidate
++
+ static inline void
+ arch_cpu_pause(void)
+ {
+diff --git a/headers/private/kernel/arch/arm/arch_kernel_args.h b/headers/private/kernel/arch/arm/arch_kernel_args.h
+index d6289357da..fce76b9e39 100644
+--- a/headers/private/kernel/arch/arm/arch_kernel_args.h
++++ b/headers/private/kernel/arch/arm/arch_kernel_args.h
+@@ -48,6 +48,9 @@ typedef struct {
+ 	addr_range			twd;	// Cortex-A9 private timer, when another one is
+ 								// chosen (per CPU events of a multiprocessor)
+ 	uint32				twdInterrupt;
++	addr_range			l2Cache;	// PL310 outer cache controller
++	uint32				l2TagLatency;	// as in its latency registers, 0 if
++	uint32				l2DataLatency;	// the device tree does not say
+ } _PACKED arch_kernel_args;
+ 
+ #endif	/* KERNEL_ARCH_ARM_KERNEL_ARGS_H */
+diff --git a/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp b/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp
+index e3c99fa409..936b1a7589 100644
+--- a/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp
++++ b/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp
+@@ -211,6 +211,27 @@ arch_handle_fdt(const void* fdt, int node)
+ 	if (sL2Regs.start == 0 && dtb_has_fdt_string(compatible, compatibleLen,
+ 			"arm,pl310-cache")) {
+ 		dtb_get_reg(fdt, node, 0, sL2Regs);
++		gKernelArgs.arch_args.l2Cache = sL2Regs;
++
++		// <read write setup> cycles, as the latency registers want them
++		static const char* const kLatencies[] = { "arm,tag-latency",
++			"arm,data-latency" };
++		uint32* registers[] = { &gKernelArgs.arch_args.l2TagLatency,
++			&gKernelArgs.arch_args.l2DataLatency };
++		for (uint32 i = 0; i < 2; i++) {
++			int length;
++			const uint32* cells = (const uint32*)fdt_getprop(fdt, node,
++				kLatencies[i], &length);
++			if (cells == NULL || length < 12)
++				continue;
++			uint32 read = fdt32_to_cpu(cells[0]);
++			uint32 write = fdt32_to_cpu(cells[1]);
++			uint32 setup = fdt32_to_cpu(cells[2]);
++			if (read == 0 || write == 0 || setup == 0)
++				continue;
++			*registers[i] = ((setup - 1) & 7) | (((read - 1) & 7) << 4)
++				| (((write - 1) & 7) << 8);
++		}
+ 	}
+ 
+ 	boot_timer_info &timer = gKernelArgs.arch_args.timer;
+diff --git a/src/system/kernel/arch/arm/Jamfile b/src/system/kernel/arch/arm/Jamfile
+index 7ba755f16b..a0ccc589ee 100644
+--- a/src/system/kernel/arch/arm/Jamfile
++++ b/src/system/kernel/arch/arm/Jamfile
+@@ -12,6 +12,7 @@ KernelMergeObject kernel_arch_arm.o :
+ 	acpi_irq_routing_table.cpp
+ 	arch_commpage.cpp
+ 	arch_cpu.cpp
++	arch_l2_cache.cpp
+ 	arch_debug_console.cpp
+ 	arch_debug.cpp
+ 	arch_elf.cpp
+diff --git a/src/system/kernel/arch/arm/arch_cpu.cpp b/src/system/kernel/arch/arm/arch_cpu.cpp
+index 0a8fc848f3..1c503361ef 100644
+--- a/src/system/kernel/arch/arm/arch_cpu.cpp
++++ b/src/system/kernel/arch/arm/arch_cpu.cpp
+@@ -23,6 +23,7 @@ bool gARMHasVFPD32 = true;
+ static uint32 sFirmwareContextID;
+ 
+ void arch_int_init_secondary_cpu(int32 cpu);
++status_t arm_l2_cache_init(kernel_args* args);
+ 
+ 
+ status_t
+@@ -91,6 +92,8 @@ arch_cpu_init_post_vm(kernel_args *args)
+ 	dprintf("AC100: CONTEXTIDR left by the firmware: %#" B_PRIx32 "\n",
+ 		sFirmwareContextID);
+ 
++	arm_l2_cache_init(args);
++
+ 	if (args->arch_args.pmc.start != 0) {
+ 		void* address;
+ 		area_id area = map_physical_memory("tegra pmc",
+diff --git a/src/system/kernel/arch/arm/arch_l2_cache.cpp b/src/system/kernel/arch/arm/arch_l2_cache.cpp
+new file mode 100644
+index 0000000000..e34dc76fa4
+--- /dev/null
++++ b/src/system/kernel/arch/arm/arch_l2_cache.cpp
+@@ -0,0 +1,162 @@
++/*
++ * Copyright 2026, Haiku, Inc. All rights reserved.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++/*!	The PL310 (L2C-310) outer cache of Cortex-A9 systems, e.g. 1 MB on the
++	NVIDIA Tegra 2. Firmwares may leave it off; it is switched on here, unless
++	the kernel settings say "arm_l2_cache false".
++
++	The CP15 cache maintenance operations stop at the outer cache: memory
++	shared with a DMA engine must also be handled here, by physical address.
++	Table walks are outer cacheable (TTBR), so page table updates only need
++	to reach it.
++*/
++
++
++#include <KernelExport.h>
++
++#include <arch/cpu.h>
++#include <boot/kernel_args.h>
++#include <driver_settings.h>
++#include <smp.h>
++#include <util/AutoLock.h>
++#include <vm/vm.h>
++
++
++#define L2X0_CTRL				0x100
++#define L2X0_CTRL_ENABLE		(1U << 0)
++#define L2X0_AUX_CTRL			0x104
++#define L2X0_AUX_ASSOCIATIVITY	(1U << 16)	// 16 ways instead of 8
++#define L2X0_AUX_SHARED_OVERRIDE	(1U << 22)
++#define L2X0_AUX_INSTRUCTION_PREFETCH	(1U << 29)
++#define L2X0_AUX_DATA_PREFETCH	(1U << 28)
++#define L2X0_TAG_LATENCY		0x108
++#define L2X0_DATA_LATENCY		0x10c
++#define L2X0_CACHE_SYNC			0x730
++#define L2X0_INV_WAY			0x77c
++#define L2X0_CLEAN_LINE_PA		0x7b0
++#define L2X0_INV_LINE_PA		0x770
++#define L2X0_LINE_SIZE			32
++
++
++static volatile uint8* sL2;		// only set while the cache is on
++static spinlock sL2Lock = B_SPINLOCK_INITIALIZER;
++
++
++static inline uint32
++read_reg(volatile uint8* base, uint32 offset)
++{
++	return *(volatile uint32*)(base + offset);
++}
++
++
++static inline void
++write_reg(volatile uint8* base, uint32 offset, uint32 value)
++{
++	*(volatile uint32*)(base + offset) = value;
++}
++
++
++status_t
++arm_l2_cache_init(kernel_args* args)
++{
++	if (args->arch_args.l2Cache.start == 0)
++		return B_OK;
++
++	void* settings = load_driver_settings("kernel");
++	bool enable = get_driver_boolean_parameter(settings, "arm_l2_cache", true,
++		true);
++	unload_driver_settings(settings);
++
++	void* address;
++	area_id area = map_physical_memory("pl310 l2 cache",
++		args->arch_args.l2Cache.start, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++	if (area < B_OK)
++		return area;
++	volatile uint8* l2 = (volatile uint8*)address;
++
++	if ((read_reg(l2, L2X0_CTRL) & L2X0_CTRL_ENABLE) != 0) {
++		dprintf("L2 cache: on already\n");
++		sL2 = l2;
++		return B_OK;
++	}
++	if (!enable) {
++		dprintf("L2 cache: left off by the kernel settings\n");
++		delete_area(area);
++		return B_OK;
++	}
++
++	// the latencies and the auxiliary control may only be set while it is off;
++	// all memory is shareable (for SMP), which older revisions would not cache
++	// without the override; prefetching as Linux does on Tegra 2
++	write_reg(l2, L2X0_AUX_CTRL, read_reg(l2, L2X0_AUX_CTRL)
++		| L2X0_AUX_SHARED_OVERRIDE | L2X0_AUX_INSTRUCTION_PREFETCH
++		| L2X0_AUX_DATA_PREFETCH);
++	if (args->arch_args.l2TagLatency != 0)
++		write_reg(l2, L2X0_TAG_LATENCY, args->arch_args.l2TagLatency);
++	if (args->arch_args.l2DataLatency != 0)
++		write_reg(l2, L2X0_DATA_LATENCY, args->arch_args.l2DataLatency);
++
++	// it was off, so memory is up to date: just invalidate it
++	uint32 ways = (read_reg(l2, L2X0_AUX_CTRL) & L2X0_AUX_ASSOCIATIVITY) != 0
++		? 16 : 8;
++	uint32 wayMask = (1U << ways) - 1;
++	write_reg(l2, L2X0_INV_WAY, wayMask);
++	for (int32 i = 0; i < 1000000
++			&& (read_reg(l2, L2X0_INV_WAY) & wayMask) != 0; i++) {
++	}
++	write_reg(l2, L2X0_CACHE_SYNC, 0);
++
++	write_reg(l2, L2X0_CTRL, L2X0_CTRL_ENABLE);
++	asm volatile("dsb" : : : "memory");
++	sL2 = l2;
++
++	dprintf("L2 cache: on, %" B_PRIu32 " ways, aux %#" B_PRIx32 ", latencies "
++		"%#" B_PRIx32 "/%#" B_PRIx32 "\n", ways, read_reg(l2, L2X0_AUX_CTRL),
++		read_reg(l2, L2X0_TAG_LATENCY), read_reg(l2, L2X0_DATA_LATENCY));
++	return B_OK;
++}
++
++
++/*!	Writes the lines of the range to the given register, one by one, then
++	waits for them. Clean and invalidate are done as two operations: the
++	combined one is broken on early PL310 revisions (erratum 588369).
++*/
++static void
++outer_cache_range(phys_addr_t address, size_t size, bool clean,
++	bool invalidate)
++{
++	if (sL2 == NULL || size == 0)
++		return;
++
++	phys_addr_t end = address + size;
++	address &= ~(phys_addr_t)(L2X0_LINE_SIZE - 1);
++
++	InterruptsSpinLocker locker(sL2Lock);
++	asm volatile("dsb" : : : "memory");
++	for (phys_addr_t line = address; line < end; line += L2X0_LINE_SIZE) {
++		if (clean)
++			write_reg(sL2, L2X0_CLEAN_LINE_PA, (uint32)line);
++		if (invalidate)
++			write_reg(sL2, L2X0_INV_LINE_PA, (uint32)line);
++	}
++	write_reg(sL2, L2X0_CACHE_SYNC, 0);
++	asm volatile("dsb" : : : "memory");
++}
++
++
++void
++arm_outer_cache_clean_range(phys_addr_t address, size_t size)
++{
++	outer_cache_range(address, size, true, false);
++}
++
++
++void
++arm_outer_cache_flush_range(phys_addr_t address, size_t size)
++{
++	outer_cache_range(address, size, true, true);
++}
+diff --git a/src/system/kernel/arch/arm/arch_thread.cpp b/src/system/kernel/arch/arm/arch_thread.cpp
+index c842cf15f6..48f4235966 100644
+--- a/src/system/kernel/arch/arm/arch_thread.cpp
++++ b/src/system/kernel/arch/arm/arch_thread.cpp
+@@ -134,7 +134,10 @@ static ARMPagingStructures* sActivePagingStructures[SMP_MAX_CPUS];
+ void
+ arm_swap_pgdir(uint32_t pageDirectoryAddress)
+ {
+-	arm_set_ttbr0(pageDirectoryAddress);
++	// table walks are inner and outer write-back cacheable and shareable, as
++	// set up by the boot loader: they see the page table updates in the
++	// caches, which only reach the outer cache
++	arm_set_ttbr0(pageDirectoryAddress | 0x5b);
+ 	isb();
+ 
+ 	arch_cpu_global_tlb_invalidate();
+diff --git a/src/system/kernel/arch/arm/arch_vm.cpp b/src/system/kernel/arch/arm/arch_vm.cpp
+index c338db4c9f..d93f1afad6 100644
+--- a/src/system/kernel/arch/arm/arch_vm.cpp
++++ b/src/system/kernel/arch/arm/arch_vm.cpp
+@@ -165,7 +165,9 @@ arch_vm_set_memory_type(VMArea *area, phys_addr_t physicalBase, uint32 type,
+ 	// data cache; write them back and discard them, or they could later be
+ 	// evicted over data written through the new, non-cacheable mapping (e.g.
+ 	// by a DMA engine).
+-	if (type == B_UNCACHED_MEMORY || type == B_WRITE_COMBINING_MEMORY)
++	if (type == B_UNCACHED_MEMORY || type == B_WRITE_COMBINING_MEMORY) {
+ 		arm_clean_invalidate_dcache_all();
++		arm_outer_cache_flush_range(physicalBase, area->Size());
++	}
+ 	return B_OK;
+ }

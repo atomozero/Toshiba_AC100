@@ -1,0 +1,79 @@
+From 24b84137db6b049d565b9f190c02878d34ec2fdc Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 12:54:15 +0200
+Subject: [PATCH 008/203] libroot/arm: get system_time() from the kernel
+
+The userland system_time() was a placeholder returning a counter that
+increased by one on every call, so timeouts, snooze() and every other
+time based operation in userland were broken.
+
+Not all ARMv7 cores have the generic timer (Cortex-A9 does not), so
+there is no counter userland could read directly. Use the
+_kern_system_time() syscall instead.
+---
+ src/system/libroot/os/arch/arm/system_time.c | 30 ++++----------------
+ src/system/libroot/os/arch/arm/time.c        |  2 --
+ 2 files changed, 5 insertions(+), 27 deletions(-)
+
+diff --git a/src/system/libroot/os/arch/arm/system_time.c b/src/system/libroot/os/arch/arm/system_time.c
+index bef6175a18..746c70119b 100644
+--- a/src/system/libroot/os/arch/arm/system_time.c
++++ b/src/system/libroot/os/arch/arm/system_time.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2012, Haiku, Inc.
++ * Copyright 2012-2026, Haiku, Inc.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -8,33 +8,13 @@
+ 
+ #include <OS.h>
+ 
+-#include <arch_cpu.h>
+-#include <libroot_private.h>
+-#include <real_time_data.h>
++#include <syscalls.h>
+ 
+-static vint32 *sConversionFactor;
+-
+-void
+-__arm_setup_system_time(vint32 *cvFactor)
+-{
+-	sConversionFactor = cvFactor;
+-}
+-
+-
+-//XXX: this is a hack
+-// remove me when platform code works
+-static int64
+-__arm_get_time_base(void)
+-{
+-	static uint64 time_dilation_field = 0;
+-	return time_dilation_field++;
+-}
+ 
+ bigtime_t
+ system_time(void)
+ {
+-	uint64 timeBase = __arm_get_time_base();
+-
+-	uint32 cv = sConversionFactor ? *sConversionFactor : 0;
+-	return (timeBase >> 32) * cv + (((timeBase & 0xffffffff) * cv) >> 32);
++	// Not every ARMv7 core has the generic timer (Cortex-A9 does not), so
++	// there is no counter userland could read directly; ask the kernel.
++	return _kern_system_time();
+ }
+diff --git a/src/system/libroot/os/arch/arm/time.c b/src/system/libroot/os/arch/arm/time.c
+index 9a16dedd15..1757da5dc1 100644
+--- a/src/system/libroot/os/arch/arm/time.c
++++ b/src/system/libroot/os/arch/arm/time.c
+@@ -22,8 +22,6 @@ __arch_init_time(struct real_time_data *data, bool setDefaults)
+ 		sRealTimeData->system_time_conversion_factor = 1000000000LL;
+ 		sRealTimeData->version = 0;
+ 	}
+-
+-	__arm_setup_system_time(&sRealTimeData->system_time_conversion_factor);
+ }
+ 
+ 

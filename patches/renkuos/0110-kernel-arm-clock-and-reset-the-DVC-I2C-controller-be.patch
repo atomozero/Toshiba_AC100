@@ -1,0 +1,137 @@
+From e306e8595a272b1b65291c3b4f2d004db6c9ae59 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 19:46:00 +0200
+Subject: [PATCH 110/203] kernel/arm: clock and reset the DVC I2C controller
+ before using it
+
+Reading the TPS6586x timed out on the AC100: set the controller up as for
+the other I2C controllers (clock from PLLP, reset, software programming,
+packet mode), and log where a transfer times out.
+---
+ .../kernel/arch/arm/arch_real_time_clock.cpp  | 63 +++++++++++++++++--
+ 1 file changed, 58 insertions(+), 5 deletions(-)
+
+diff --git a/src/system/kernel/arch/arm/arch_real_time_clock.cpp b/src/system/kernel/arch/arm/arch_real_time_clock.cpp
+index f7e4c0dc9e..0f5cebb7f0 100644
+--- a/src/system/kernel/arch/arm/arch_real_time_clock.cpp
++++ b/src/system/kernel/arch/arm/arch_real_time_clock.cpp
+@@ -56,6 +56,8 @@ static spinlock sTegraRTCLock = B_SPINLOCK_INITIALIZER;
+ #define I2C_HEADER_IE_ENABLE		(1 << 17)
+ #define I2C_HEADER_READ				(1 << 19)
+ 
++#define DVC_CTRL_REG1				0x000
++#define DVC_CTRL_REG1_INTR_EN		(1 << 1)
+ #define DVC_CTRL_REG3				0x008
+ #define DVC_CTRL_REG3_SW_PROG		(1 << 26)
+ #define DVC_STATUS					0x00c
+@@ -68,6 +70,15 @@ static spinlock sTegraRTCLock = B_SPINLOCK_INITIALIZER;
+ 	// reading starts at the register before it
+ #define TPS6586X_EPOCH				1230768000	// 2009-01-01 00:00:00 UTC
+ 
++// its clock, as for the other I2C controllers: 8 times the bus clock, from
++// PLLP (216 MHz)
++#define TEGRA20_CAR_BASE			0x60006000
++#define TEGRA20_CLK_DVC_I2C			47
++#define TEGRA_CAR_RST_DEVICES(bank)	(0x04 + (bank) * 4)
++#define TEGRA_CAR_CLK_OUT_ENB(bank)	(0x10 + (bank) * 4)
++#define TEGRA_CAR_CLK_SOURCE_DVC	0x128
++#define DVC_BUS_KHZ					100
++
+ static volatile uint8* sDVC;
+ static spinlock sDVCLock = B_SPINLOCK_INITIALIZER;
+ 
+@@ -81,6 +92,43 @@ dvc_i2c_register(uint32 offset)
+ }
+ 
+ 
++/*!	Clocks and resets the controller, then sets it up to be programmed by
++	software, in packet mode, as Linux does.
++*/
++static void
++dvc_setup_controller()
++{
++	void* address;
++	area_id area = map_physical_memory("tegra car", TEGRA20_CAR_BASE,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++	if (area >= B_OK) {
++		volatile uint8* car = (volatile uint8*)address;
++		uint32 bank = TEGRA20_CLK_DVC_I2C / 32;
++		uint32 bit = 1U << (TEGRA20_CLK_DVC_I2C % 32);
++		volatile uint32* reset
++			= (volatile uint32*)(car + TEGRA_CAR_RST_DEVICES(bank));
++		volatile uint32* enable
++			= (volatile uint32*)(car + TEGRA_CAR_CLK_OUT_ENB(bank));
++		volatile uint32* source
++			= (volatile uint32*)(car + TEGRA_CAR_CLK_SOURCE_DVC);
++		uint32 divider = (216000 + 8 * DVC_BUS_KHZ - 1) / (8 * DVC_BUS_KHZ) - 1;
++		*enable |= bit;
++		*source = (*source & ~((3U << 30) | 0xffff)) | divider;
++		*reset |= bit;
++		spin(2);
++		*reset &= ~bit;
++		spin(2);
++		delete_area(area);
++	}
++
++	*(volatile uint32*)(sDVC + DVC_CTRL_REG3) |= DVC_CTRL_REG3_SW_PROG;
++	*(volatile uint32*)(sDVC + DVC_CTRL_REG1) |= DVC_CTRL_REG1_INTR_EN;
++	*dvc_i2c_register(I2C_CNFG) = I2C_CNFG_NEW_MASTER_FSM
++		| I2C_CNFG_PACKET_MODE | (2 << 12);
++}
++
++
+ /*!	Polls until \a condition is true, at most about 20 ms. */
+ template<typename Condition>
+ static bool
+@@ -109,6 +157,7 @@ dvc_i2c_transfer(uint8 address, uint8* data, uint32 length, bool read,
+ 	if (!dvc_wait([] {
+ 			return (*dvc_i2c_register(I2C_FIFO_CONTROL) & I2C_FIFO_FLUSH)
+ 				== 0; })) {
++		dprintf("AC100: DVC I2C: FIFO flush timed out\n");
+ 		return B_TIMED_OUT;
+ 	}
+ 	*dvc_i2c_register(I2C_INT_STATUS) = 0xffffffff;
+@@ -133,6 +182,8 @@ dvc_i2c_transfer(uint8 address, uint8* data, uint32 length, bool read,
+ 		if (!dvc_wait([] {
+ 				return I2C_FIFO_STATUS_TX(*dvc_i2c_register(I2C_FIFO_STATUS))
+ 					> 0; })) {
++			dprintf("AC100: DVC I2C: TX FIFO full, status %#" B_PRIx32 "\n",
++				*dvc_i2c_register(I2C_FIFO_STATUS));
+ 			return B_TIMED_OUT;
+ 		}
+ 		*dvc_i2c_register(I2C_TX_FIFO) = words[i];
+@@ -143,6 +194,8 @@ dvc_i2c_transfer(uint8 address, uint8* data, uint32 length, bool read,
+ 			if (!dvc_wait([] {
+ 					return I2C_FIFO_STATUS_RX(
+ 						*dvc_i2c_register(I2C_FIFO_STATUS)) > 0; })) {
++				dprintf("AC100: DVC I2C: no data, interrupt status %#"
++					B_PRIx32 "\n", *dvc_i2c_register(I2C_INT_STATUS));
+ 				return B_TIMED_OUT;
+ 			}
+ 			uint32 word = *dvc_i2c_register(I2C_RX_FIFO);
+@@ -159,8 +212,11 @@ dvc_i2c_transfer(uint8 address, uint8* data, uint32 length, bool read,
+ 	*dvc_i2c_register(I2C_INT_STATUS) = status;
+ 	*(volatile uint32*)(sDVC + DVC_STATUS) = DVC_STATUS_I2C_DONE;
+ 
+-	if (!done)
++	if (!done) {
++		dprintf("AC100: DVC I2C: transfer not done, interrupt status %#"
++			B_PRIx32 "\n", status);
+ 		return B_TIMED_OUT;
++	}
+ 	if ((status & (I2C_INT_NO_ACK | I2C_INT_ARBITRATION_LOST)) != 0)
+ 		return B_IO_ERROR;
+ 	return B_OK;
+@@ -296,10 +352,7 @@ arch_rtc_init(kernel_args *args, struct real_time_data *data)
+ 			sDVC = (volatile uint8*)address
+ 				+ (args->arch_args.pmicI2C.start & (B_PAGE_SIZE - 1));
+ 
+-			// the controller is programmed by software, in packet mode
+-			*(volatile uint32*)(sDVC + DVC_CTRL_REG3) |= DVC_CTRL_REG3_SW_PROG;
+-			*dvc_i2c_register(I2C_CNFG)
+-				|= I2C_CNFG_PACKET_MODE | I2C_CNFG_NEW_MASTER_FSM;
++			dvc_setup_controller();
+ 
+ 			// the Tegra clock follows the battery backed one
+ 			uint64 seconds = tps6586x_get_time();

@@ -1,0 +1,36 @@
+From a9a6ebbb9a0f33c2924a88f27a54d27a66579318 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 09:43:43 +0200
+Subject: [PATCH 072/203] ARM bring-up: show how a stalled full/low speed
+ transfer was routed (not for merging)
+
+---
+ src/add-ons/kernel/busses/usb/ehci.cpp | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/src/add-ons/kernel/busses/usb/ehci.cpp b/src/add-ons/kernel/busses/usb/ehci.cpp
+index ad2f25e60d..b33d8f959d 100644
+--- a/src/add-ons/kernel/busses/usb/ehci.cpp
++++ b/src/add-ons/kernel/busses/usb/ehci.cpp
+@@ -2707,6 +2707,21 @@ EHCI::FinishTransfers()
+ 						// and there was no babble, then this halt was caused
+ 						// by a stall handshake
+ 						callbackStatus = B_DEV_STALLED;
++
++						// bring-up aid: how the transfer was routed
++						static int32 sReported = 0;
++						ehci_qh* qh = transfer->queue_head;
++						if ((qh->endpoint_chars & EHCI_QH_CHARS_EPS_HIGH) == 0
++							&& sReported++ < 4) {
++							dprintf("AC100: ehci stall, QH chars %#" B_PRIx32
++								" caps %#" B_PRIx32 " overlay token %#" B_PRIx32
++								", PORTSC %#" B_PRIx32 ", USBMODE %#" B_PRIx32
++								", TXFILLTUNING %#" B_PRIx32 "\n",
++								qh->endpoint_chars, qh->endpoint_caps,
++								qh->overlay.token, ReadOpReg(EHCI_PORTSC),
++								ReadOpReg(EHCI_USBMODE),
++								ReadOpReg(EHCI_TXFILLTUNING));
++						}
+ 					}
+ 
+ 					transferDone = true;

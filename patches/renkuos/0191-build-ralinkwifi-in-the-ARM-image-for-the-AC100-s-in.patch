@@ -1,0 +1,23 @@
+From ce4bfd9d4263dfd7a2b59b0db9e60b3b0174cffa Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Fri, 23 Oct 2026 22:58:31 +0200
+Subject: [PATCH 191/203] build: ralinkwifi in the ARM image, for the AC100's
+ internal RT3070
+
+---
+ build/jam/images/definitions/minimum | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
+index 1f3c5e5a54..85b25dcaaa 100644
+--- a/build/jam/images/definitions/minimum
++++ b/build/jam/images/definitions/minimum
+@@ -369,6 +369,8 @@ SYSTEM_ADD_ONS_DRIVERS_NET = [ FFilterByBuildFeatures
+ 	arm @{
+ 		asix88xxx
+ 		pegasus
++		# USB Wi-Fi (the Toshiba AC100 has an internal RT3070)
++		ralinkwifi
+ 	}@ # arm
+ ] ;
+ 

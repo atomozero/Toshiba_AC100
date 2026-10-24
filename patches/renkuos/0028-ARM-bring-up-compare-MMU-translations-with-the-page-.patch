@@ -1,0 +1,161 @@
+From a57f214e8c5bb080d16843bddb4d295610565c58 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 18:01:40 +0200
+Subject: [PATCH 028/203] ARM bring-up: compare MMU translations with the page
+ tables in InitSlab (not for merging)
+
+---
+ .../private/kernel/arch/arm/arm_boot_marker.h |  2 +
+ src/system/kernel/arch/arm/arch_cpu.cpp       |  2 +-
+ src/system/kernel/slab/ObjectCache.cpp        | 98 +++++++++++++------
+ 3 files changed, 69 insertions(+), 33 deletions(-)
+
+diff --git a/headers/private/kernel/arch/arm/arm_boot_marker.h b/headers/private/kernel/arch/arm/arm_boot_marker.h
+index dfec40db79..fb550af04a 100644
+--- a/headers/private/kernel/arch/arm/arm_boot_marker.h
++++ b/headers/private/kernel/arch/arm/arm_boot_marker.h
+@@ -129,6 +129,8 @@ void arm_boot_marker_value(int row, uint32 value);
+ void arm_boot_marker_text(const char* text);
+ void arm_boot_check_text(int row);
+ void arm_boot_show_exceptions(int row);
++/* hardware translation (ATS1CPR), 0xfa000000 | fault status if none */
++uint32 arm_virtual_to_physical(addr_t address);
+ #endif
+ 
+ 
+diff --git a/src/system/kernel/arch/arm/arch_cpu.cpp b/src/system/kernel/arch/arm/arch_cpu.cpp
+index 4bcb2c6675..cc113966d2 100644
+--- a/src/system/kernel/arch/arm/arch_cpu.cpp
++++ b/src/system/kernel/arch/arm/arch_cpu.cpp
+@@ -97,7 +97,7 @@ arm_boot_marker_text(const char* text)
+ }
+ 
+ 
+-static uint32
++uint32
+ arm_virtual_to_physical(addr_t address)
+ {
+ 	uint32 par;
+diff --git a/src/system/kernel/slab/ObjectCache.cpp b/src/system/kernel/slab/ObjectCache.cpp
+index 75cd3d4eee..a2064c6618 100644
+--- a/src/system/kernel/slab/ObjectCache.cpp
++++ b/src/system/kernel/slab/ObjectCache.cpp
+@@ -123,6 +123,68 @@ ObjectCache::Init(const char* name, size_t objectSize, size_t alignment,
+ }
+ 
+ 
++#ifdef __ARM__
++/*!	Bring-up aid: checks that the slab pages do not share a physical page with
++	the current stack, and that the MMU translates both like the page tables
++	say. \a stage is 0 before and 1 after the slab was initialized.
++*/
++static void __attribute__((noinline))
++arm_check_slab_mapping(void* pages, size_t byteCount, int stage)
++{
++	VMAddressSpace* kernelSpace = VMAddressSpace::Kernel();
++	if (!gKernelStartup || kernelSpace == NULL)
++		return;
++
++	VMTranslationMap* map = kernelSpace->TranslationMap();
++	addr_t stack = ROUNDDOWN((addr_t)__builtin_frame_address(0), B_PAGE_SIZE);
++	phys_addr_t stackPhysical = 0;
++	uint32 flags;
++	if (map->Query(stack, &stackPhysical, &flags) != B_OK
++		|| (flags & PAGE_PRESENT) == 0) {
++		return;
++	}
++	uint32 stackHardware = arm_virtual_to_physical(stack);
++
++	for (addr_t address = ROUNDDOWN((addr_t)pages, B_PAGE_SIZE);
++			address < (addr_t)pages + byteCount; address += B_PAGE_SIZE) {
++		phys_addr_t physical = 0;
++		if (map->Query(address, &physical, &flags) != B_OK
++			|| (flags & PAGE_PRESENT) == 0) {
++			continue;
++		}
++		uint32 hardware = arm_virtual_to_physical(address);
++		// an access flag fault (FS 0b00110) only means not accessed yet
++		bool notAccessed = (hardware & 0xff000000) == 0xfa000000
++			&& (hardware & 0x7e) == 0x0c;
++		if ((!notAccessed && hardware != (uint32)physical)
++			|| stackHardware != (uint32)stackPhysical) {
++			arm_boot_marker(41 + stage);
++			arm_boot_marker_value(110, (uint32)address);
++			arm_boot_marker_value(111, (uint32)physical);
++			arm_boot_marker_value(112, hardware);
++			arm_boot_marker_value(113, stackHardware);
++			panic("MMU/page table mismatch (%d): %p -> %#" B_PRIxPHYSADDR
++				" (MMU %#" B_PRIx32 "), stack %p -> %#" B_PRIxPHYSADDR
++				" (MMU %#" B_PRIx32 ")", stage, (void*)address, physical,
++				hardware, (void*)stack, stackPhysical, stackHardware);
++		}
++		if (physical == stackPhysical || address == stack) {
++			arm_boot_marker(40);
++			arm_boot_marker_value(7, (uint32)address);
++			arm_boot_marker_value(8, (uint32)physical);
++			arm_boot_marker_value(9, (uint32)stack);
++			arm_boot_marker_value(10, (uint32)stackPhysical);
++			panic("slab page %p (phys %#" B_PRIxPHYSADDR ") is also the stack "
++				"page %p", (void*)address, physical, (void*)stack);
++		}
++	}
++	arm_boot_marker_value(11 + stage, stage == 0 ? (uint32)stack : stackHardware);
++	if (stage == 0)
++		arm_boot_marker_value(12, (uint32)stackPhysical);
++}
++#endif
++
++
+ slab*
+ ObjectCache::InitSlab(slab* slab, void* pages, size_t byteCount, uint32 flags)
+ {
+@@ -130,38 +192,7 @@ ObjectCache::InitSlab(slab* slab, void* pages, size_t byteCount, uint32 flags)
+ 		((uint8*)pages) + byteCount, byteCount);
+ 
+ #ifdef __ARM__
+-	VMAddressSpace* kernelSpace = VMAddressSpace::Kernel();
+-	if (gKernelStartup && kernelSpace != NULL) {
+-		// bring-up aid: check that the slab pages do not share a physical page
+-		// with the current stack
+-		VMTranslationMap* map = kernelSpace->TranslationMap();
+-		addr_t stack = ROUNDDOWN((addr_t)__builtin_frame_address(0),
+-			B_PAGE_SIZE);
+-		phys_addr_t stackPhysical = 0;
+-		uint32 flags;
+-		bool stackMapped = map->Query(stack, &stackPhysical, &flags) == B_OK
+-			&& (flags & PAGE_PRESENT) != 0;
+-		for (addr_t address = ROUNDDOWN((addr_t)pages, B_PAGE_SIZE);
+-				stackMapped && address < (addr_t)pages + byteCount;
+-				address += B_PAGE_SIZE) {
+-			phys_addr_t physical = 0;
+-			if (map->Query(address, &physical, &flags) != B_OK
+-				|| (flags & PAGE_PRESENT) == 0) {
+-				continue;
+-			}
+-			if (physical == stackPhysical || address == stack) {
+-				arm_boot_marker(40);
+-				arm_boot_marker_value(7, (uint32)address);
+-				arm_boot_marker_value(8, (uint32)physical);
+-				arm_boot_marker_value(9, (uint32)stack);
+-				arm_boot_marker_value(10, (uint32)stackPhysical);
+-				panic("slab page %p (phys %#" B_PRIxPHYSADDR ") is also the stack "
+-					"page %p", (void*)address, physical, (void*)stack);
+-			}
+-		}
+-		arm_boot_marker_value(11, (uint32)stack);
+-		arm_boot_marker_value(12, (uint32)stackPhysical);
+-	}
++	arm_check_slab_mapping(pages, byteCount, 0);
+ #endif
+ 
+ 	slab->pages = pages;
+@@ -209,6 +240,9 @@ ObjectCache::InitSlab(slab* slab, void* pages, size_t byteCount, uint32 flags)
+ 		data += object_size;
+ 	}
+ 
++#ifdef __ARM__
++	arm_check_slab_mapping(pages, byteCount, 1);
++#endif
+ 	return slab;
+ }
+ 

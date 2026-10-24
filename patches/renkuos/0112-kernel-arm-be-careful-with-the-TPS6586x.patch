@@ -1,0 +1,70 @@
+From e03e6c6c63a7202edd11e0f2737462d1eeb83787 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 20:09:50 +0200
+Subject: [PATCH 112/203] kernel/arm: be careful with the TPS6586x
+
+Its registers survive a power off: only write it after a successful read
+and never while booting, and let "tps6586x_clock false" in the kernel
+settings leave it alone.
+---
+ .../kernel/arch/arm/arch_real_time_clock.cpp  | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/src/system/kernel/arch/arm/arch_real_time_clock.cpp b/src/system/kernel/arch/arm/arch_real_time_clock.cpp
+index 0f5cebb7f0..d5069427e2 100644
+--- a/src/system/kernel/arch/arm/arch_real_time_clock.cpp
++++ b/src/system/kernel/arch/arm/arch_real_time_clock.cpp
+@@ -11,6 +11,8 @@
+ #include <arch/real_time_clock.h>
+ 
+ #include <KernelExport.h>
++#include <driver_settings.h>
++#include <kernel.h>
+ 
+ #include <boot/kernel_args.h>
+ #include <real_time_clock.h>
+@@ -80,6 +82,7 @@ static spinlock sTegraRTCLock = B_SPINLOCK_INITIALIZER;
+ #define DVC_BUS_KHZ					100
+ 
+ static volatile uint8* sDVC;
++static bool sTPS6586xRead;	// only write it after a successful read
+ static spinlock sDVCLock = B_SPINLOCK_INITIALIZER;
+ 
+ 
+@@ -270,6 +273,7 @@ tps6586x_get_time()
+ 		ticks = (ticks << 8) | count[i];
+ 	dprintf("AC100: TPS6586x clock: control %#x, %" B_PRIu64 " seconds since "
+ 		"2009\n", control, ticks >> 10);
++	sTPS6586xRead = true;
+ 	if ((control & TPS6586X_RTC_ENABLE) == 0)
+ 		return 0;
+ 	return (ticks >> 10) + TPS6586X_EPOCH;
+@@ -343,7 +347,14 @@ arch_rtc_init(kernel_args *args, struct real_time_data *data)
+ 		}
+ 	}
+ 
+-	if (sTegraRTC != NULL && args->arch_args.pmicI2C.start != 0) {
++	// "tps6586x_clock false" in the kernel settings leaves the power
++	// management IC alone
++	void* settings = load_driver_settings("kernel");
++	bool usePMIC = get_driver_boolean_parameter(settings, "tps6586x_clock",
++		true, true);
++	unload_driver_settings(settings);
++
++	if (sTegraRTC != NULL && args->arch_args.pmicI2C.start != 0 && usePMIC) {
+ 		void* address;
+ 		area_id area = map_physical_memory("tegra dvc i2c",
+ 			args->arch_args.pmicI2C.start, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+@@ -382,7 +393,11 @@ void
+ arch_rtc_set_hw_time(uint64 seconds)
+ {
+ 	tegra_rtc_set_time(seconds);
+-	if (sDVC != NULL)
++
++	// The power management IC keeps its registers with the machine off:
++	// never write it unless reading it worked, nor while booting (the
++	// kernel sets the clock to what it just read).
++	if (sDVC != NULL && sTPS6586xRead && !gKernelStartup)
+ 		tps6586x_set_time(seconds);
+ }
+ 

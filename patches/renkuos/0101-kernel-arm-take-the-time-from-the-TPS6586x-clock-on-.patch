@@ -1,0 +1,349 @@
+From 9d34b13919cb0b235bc0fda3d65968a5e2891343 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 16:27:21 +0200
+Subject: [PATCH 101/203] kernel/arm: take the time from the TPS6586x clock on
+ Tegra 2
+
+The Tegra real time clock starts again from 0 at every power on: the
+battery backed one is in the TPS6586x power management IC, behind the DVC
+I2C controller. The loader passes the controller; at boot the kernel reads
+the TPS6586x counter (1/1024 s since 2009) with polled packet mode I2C
+transfers and sets the Tegra clock from it, and setting the time writes
+both.
+---
+ .../kernel/arch/arm/arch_kernel_args.h        |   1 +
+ .../boot/platform/efi/arch/arm/arch_dtb.cpp   |   6 +
+ .../kernel/arch/arm/arch_real_time_clock.cpp  | 270 +++++++++++++++++-
+ 3 files changed, 268 insertions(+), 9 deletions(-)
+
+diff --git a/headers/private/kernel/arch/arm/arch_kernel_args.h b/headers/private/kernel/arch/arm/arch_kernel_args.h
+index 08f2b98dc0..0700547792 100644
+--- a/headers/private/kernel/arch/arm/arch_kernel_args.h
++++ b/headers/private/kernel/arch/arm/arch_kernel_args.h
+@@ -44,6 +44,7 @@ typedef struct {
+ 	uint32				bootDebug[8];	// loader's view of the CPU, bring-up aid
+ 	addr_range			pmc;	// NVIDIA Tegra power management controller
+ 	addr_range			rtc;	// NVIDIA Tegra real time clock
++	addr_range			pmicI2C;	// NVIDIA Tegra DVC I2C controller (PMIC)
+ } _PACKED arch_kernel_args;
+ 
+ #endif	/* KERNEL_ARCH_ARM_KERNEL_ARGS_H */
+diff --git a/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp b/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp
+index e915739bb3..ea316cad95 100644
+--- a/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp
++++ b/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp
+@@ -150,6 +150,12 @@ arch_handle_fdt(const void* fdt, int node)
+ 		&& dtb_has_fdt_string(compatible, compatibleLen, "nvidia,tegra20-rtc")) {
+ 		dtb_get_reg(fdt, node, 0, gKernelArgs.arch_args.rtc);
+ 	}
++	// the power management IC behind it has the battery backed clock
++	if (gKernelArgs.arch_args.pmicI2C.start == 0
++		&& dtb_has_fdt_string(compatible, compatibleLen,
++			"nvidia,tegra20-i2c-dvc")) {
++		dtb_get_reg(fdt, node, 0, gKernelArgs.arch_args.pmicI2C);
++	}
+ 
+ 	if (sL2Regs.start == 0 && dtb_has_fdt_string(compatible, compatibleLen,
+ 			"arm,pl310-cache")) {
+diff --git a/src/system/kernel/arch/arm/arch_real_time_clock.cpp b/src/system/kernel/arch/arm/arch_real_time_clock.cpp
+index c7e7cb74f6..f7e4c0dc9e 100644
+--- a/src/system/kernel/arch/arm/arch_real_time_clock.cpp
++++ b/src/system/kernel/arch/arm/arch_real_time_clock.cpp
+@@ -18,6 +18,8 @@
+ #include <smp.h>
+ #include <util/AutoLock.h>
+ 
++#include <string.h>
++
+ 
+ // NVIDIA Tegra real time clock: a seconds counter in the always on domain
+ #define TEGRA_RTC_BUSY				0x04
+@@ -29,6 +31,241 @@ static volatile uint32* sTegraRTC;
+ static spinlock sTegraRTCLock = B_SPINLOCK_INITIALIZER;
+ 
+ 
++// The TPS6586x power management IC has the battery backed clock: it counts
++// 1/1024 seconds since 2009, while the Tegra clock starts again from 0 at
++// every power on. It is behind the Tegra 2 DVC I2C controller, used here in
++// packet mode and polled, as at boot there is nothing else to wait for.
++#define I2C_CNFG					0x000
++#define I2C_CNFG_PACKET_MODE		(1 << 10)
++#define I2C_CNFG_NEW_MASTER_FSM		(1 << 11)
++#define I2C_TX_FIFO					0x050
++#define I2C_RX_FIFO					0x054
++#define I2C_FIFO_CONTROL			0x05c
++#define I2C_FIFO_FLUSH				0x03	// RX and TX
++#define I2C_FIFO_STATUS				0x060
++#define I2C_FIFO_STATUS_RX(x)		((x) & 0xf)
++#define I2C_FIFO_STATUS_TX(x)		(((x) >> 4) & 0xf)
++#define I2C_INT_STATUS				0x068
++#define I2C_INT_ARBITRATION_LOST	(1 << 2)
++#define I2C_INT_NO_ACK				(1 << 3)
++#define I2C_INT_PACKET_COMPLETE		(1 << 7)
++
++#define I2C_PACKET_PROTOCOL_I2C		(1 << 4)
++#define I2C_PACKET_ID(id)			((id) << 16)
++#define I2C_HEADER_REPEAT_START		(1 << 16)
++#define I2C_HEADER_IE_ENABLE		(1 << 17)
++#define I2C_HEADER_READ				(1 << 19)
++
++#define DVC_CTRL_REG3				0x008
++#define DVC_CTRL_REG3_SW_PROG		(1 << 26)
++#define DVC_STATUS					0x00c
++#define DVC_STATUS_I2C_DONE			(1 << 30)
++
++#define TPS6586X_ADDRESS			0x34
++#define TPS6586X_RTC_CTRL			0xc0
++#define TPS6586X_RTC_ENABLE			(1 << 5)
++#define TPS6586X_RTC_COUNT4			0xc6
++	// reading starts at the register before it
++#define TPS6586X_EPOCH				1230768000	// 2009-01-01 00:00:00 UTC
++
++static volatile uint8* sDVC;
++static spinlock sDVCLock = B_SPINLOCK_INITIALIZER;
++
++
++static inline volatile uint32*
++dvc_i2c_register(uint32 offset)
++{
++	// the I2C registers of the DVC controller are moved past its own
++	return (volatile uint32*)(sDVC + offset
++		+ (offset < I2C_TX_FIFO ? 0x40 : 0x10));
++}
++
++
++/*!	Polls until \a condition is true, at most about 20 ms. */
++template<typename Condition>
++static bool
++dvc_wait(Condition condition)
++{
++	for (int32 i = 0; i < 20000; i++) {
++		if (condition())
++			return true;
++		spin(1);
++	}
++	return false;
++}
++
++
++/*!	One I2C message: writes \a length bytes of \a data or reads them into
++	it. With \a repeatStart the bus is kept for the next message.
++*/
++static status_t
++dvc_i2c_transfer(uint8 address, uint8* data, uint32 length, bool read,
++	bool repeatStart)
++{
++	if (length == 0 || length > 32)
++		return B_BAD_VALUE;
++
++	*dvc_i2c_register(I2C_FIFO_CONTROL) |= I2C_FIFO_FLUSH;
++	if (!dvc_wait([] {
++			return (*dvc_i2c_register(I2C_FIFO_CONTROL) & I2C_FIFO_FLUSH)
++				== 0; })) {
++		return B_TIMED_OUT;
++	}
++	*dvc_i2c_register(I2C_INT_STATUS) = 0xffffffff;
++
++	uint32 words[3 + 8];
++	uint32 count = 0;
++	words[count++] = I2C_PACKET_PROTOCOL_I2C | I2C_PACKET_ID(1);
++	words[count++] = length - 1;
++	words[count++] = (address << 1) | I2C_HEADER_IE_ENABLE
++		| (read ? I2C_HEADER_READ : 0)
++		| (repeatStart ? I2C_HEADER_REPEAT_START : 0);
++	if (!read) {
++		for (uint32 i = 0; i < length; i += 4) {
++			uint32 word = 0;
++			for (uint32 j = 0; j < 4 && i + j < length; j++)
++				word |= (uint32)data[i + j] << (j * 8);
++			words[count++] = word;
++		}
++	}
++
++	for (uint32 i = 0; i < count; i++) {
++		if (!dvc_wait([] {
++				return I2C_FIFO_STATUS_TX(*dvc_i2c_register(I2C_FIFO_STATUS))
++					> 0; })) {
++			return B_TIMED_OUT;
++		}
++		*dvc_i2c_register(I2C_TX_FIFO) = words[i];
++	}
++
++	if (read) {
++		for (uint32 i = 0; i < length; i += 4) {
++			if (!dvc_wait([] {
++					return I2C_FIFO_STATUS_RX(
++						*dvc_i2c_register(I2C_FIFO_STATUS)) > 0; })) {
++				return B_TIMED_OUT;
++			}
++			uint32 word = *dvc_i2c_register(I2C_RX_FIFO);
++			for (uint32 j = 0; j < 4 && i + j < length; j++)
++				data[i + j] = word >> (j * 8);
++		}
++	}
++
++	uint32 status = 0;
++	bool done = dvc_wait([&status] {
++		status = *dvc_i2c_register(I2C_INT_STATUS);
++		return (status & (I2C_INT_PACKET_COMPLETE | I2C_INT_NO_ACK
++			| I2C_INT_ARBITRATION_LOST)) != 0; });
++	*dvc_i2c_register(I2C_INT_STATUS) = status;
++	*(volatile uint32*)(sDVC + DVC_STATUS) = DVC_STATUS_I2C_DONE;
++
++	if (!done)
++		return B_TIMED_OUT;
++	if ((status & (I2C_INT_NO_ACK | I2C_INT_ARBITRATION_LOST)) != 0)
++		return B_IO_ERROR;
++	return B_OK;
++}
++
++
++static status_t
++tps6586x_read(uint8 reg, uint8* data, uint32 length)
++{
++	status_t status = dvc_i2c_transfer(TPS6586X_ADDRESS, &reg, 1, false, true);
++	if (status == B_OK)
++		status = dvc_i2c_transfer(TPS6586X_ADDRESS, data, length, true, false);
++	return status;
++}
++
++
++static status_t
++tps6586x_write(uint8 reg, const uint8* data, uint32 length)
++{
++	uint8 buffer[8];
++	if (length + 1 > sizeof(buffer))
++		return B_BAD_VALUE;
++	buffer[0] = reg;
++	memcpy(buffer + 1, data, length);
++	return dvc_i2c_transfer(TPS6586X_ADDRESS, buffer, length + 1, false,
++		false);
++}
++
++
++/*!	Returns the seconds since 1970 of the TPS6586x clock, or 0 if it is not
++	available or not running.
++*/
++static uint64
++tps6586x_get_time()
++{
++	InterruptsSpinLocker locker(sDVCLock);
++	uint8 control;
++	uint8 count[6];
++	status_t status = tps6586x_read(TPS6586X_RTC_CTRL, &control, 1);
++	if (status == B_OK)
++		status = tps6586x_read(TPS6586X_RTC_COUNT4 - 1, count, sizeof(count));
++	locker.Unlock();
++
++	if (status != B_OK) {
++		dprintf("AC100: TPS6586x clock: read failed: %s\n", strerror(status));
++		return 0;
++	}
++
++	uint64 ticks = 0;
++	for (uint32 i = 1; i < sizeof(count); i++)
++		ticks = (ticks << 8) | count[i];
++	dprintf("AC100: TPS6586x clock: control %#x, %" B_PRIu64 " seconds since "
++		"2009\n", control, ticks >> 10);
++	if ((control & TPS6586X_RTC_ENABLE) == 0)
++		return 0;
++	return (ticks >> 10) + TPS6586X_EPOCH;
++}
++
++
++static void
++tps6586x_set_time(uint64 seconds)
++{
++	if (seconds < TPS6586X_EPOCH)
++		return;
++
++	uint64 ticks = (seconds - TPS6586X_EPOCH) << 10;
++	uint8 count[5];
++	for (int32 i = 0; i < 5; i++)
++		count[i] = ticks >> ((4 - i) * 8);
++
++	// the counter may only be written while it is stopped
++	InterruptsSpinLocker locker(sDVCLock);
++	uint8 control;
++	status_t status = tps6586x_read(TPS6586X_RTC_CTRL, &control, 1);
++	if (status == B_OK) {
++		control &= ~TPS6586X_RTC_ENABLE;
++		status = tps6586x_write(TPS6586X_RTC_CTRL, &control, 1);
++	}
++	if (status == B_OK)
++		status = tps6586x_write(TPS6586X_RTC_COUNT4, count, sizeof(count));
++	control |= TPS6586X_RTC_ENABLE;
++	if (tps6586x_write(TPS6586X_RTC_CTRL, &control, 1) != B_OK)
++		status = B_IO_ERROR;
++	locker.Unlock();
++
++	if (status != B_OK)
++		dprintf("AC100: TPS6586x clock: write failed: %s\n", strerror(status));
++}
++
++
++static void
++tegra_rtc_set_time(uint64 seconds)
++{
++	if (sTegraRTC == NULL)
++		return;
++
++	// the registers may only be written while the clock is not busy posting
++	// its new value, which takes up to about 500 us
++	InterruptsSpinLocker locker(sTegraRTCLock);
++	for (int32 i = 0; i < 500 && (sTegraRTC[TEGRA_RTC_BUSY / 4] & 1) != 0; i++)
++		spin(1);
++	sTegraRTC[TEGRA_RTC_SECONDS / 4] = (uint32)seconds;
++}
++
++
+ status_t
+ arch_rtc_init(kernel_args *args, struct real_time_data *data)
+ {
+@@ -50,6 +287,27 @@ arch_rtc_init(kernel_args *args, struct real_time_data *data)
+ 		}
+ 	}
+ 
++	if (sTegraRTC != NULL && args->arch_args.pmicI2C.start != 0) {
++		void* address;
++		area_id area = map_physical_memory("tegra dvc i2c",
++			args->arch_args.pmicI2C.start, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++		if (area >= B_OK) {
++			sDVC = (volatile uint8*)address
++				+ (args->arch_args.pmicI2C.start & (B_PAGE_SIZE - 1));
++
++			// the controller is programmed by software, in packet mode
++			*(volatile uint32*)(sDVC + DVC_CTRL_REG3) |= DVC_CTRL_REG3_SW_PROG;
++			*dvc_i2c_register(I2C_CNFG)
++				|= I2C_CNFG_PACKET_MODE | I2C_CNFG_NEW_MASTER_FSM;
++
++			// the Tegra clock follows the battery backed one
++			uint64 seconds = tps6586x_get_time();
++			if (seconds != 0)
++				tegra_rtc_set_time(seconds);
++		}
++	}
++
+ 	return B_OK;
+ }
+ 
+@@ -70,15 +328,9 @@ arch_rtc_get_hw_time(void)
+ void
+ arch_rtc_set_hw_time(uint64 seconds)
+ {
+-	if (sTegraRTC == NULL)
+-		return;
+-
+-	// the registers may only be written while the clock is not busy posting
+-	// its new value, which takes up to about 500 us
+-	InterruptsSpinLocker locker(sTegraRTCLock);
+-	for (int32 i = 0; i < 500 && (sTegraRTC[TEGRA_RTC_BUSY / 4] & 1) != 0; i++)
+-		spin(1);
+-	sTegraRTC[TEGRA_RTC_SECONDS / 4] = (uint32)seconds;
++	tegra_rtc_set_time(seconds);
++	if (sDVC != NULL)
++		tps6586x_set_time(seconds);
+ }
+ 
+ 

@@ -1,0 +1,43 @@
+From 524e48e186aeb61e70e28c307f25c87b281f1912 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 20:01:13 +0200
+Subject: [PATCH 043/203] ARM bring-up: keep the marker frame buffer free of
+ access/dirty faults (not for merging)
+
+---
+ src/system/kernel/arch/arm/arch_vm.cpp | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/src/system/kernel/arch/arm/arch_vm.cpp b/src/system/kernel/arch/arm/arch_vm.cpp
+index 791a6db787..266ecdeff2 100644
+--- a/src/system/kernel/arch/arm/arch_vm.cpp
++++ b/src/system/kernel/arch/arm/arch_vm.cpp
+@@ -17,6 +17,7 @@
+ 
+ #include <vm/vm.h>
+ #include <vm/VMAddressSpace.h>
++#include <vm/VMTranslationMap.h>
+ #include <vm/vm_types.h>
+ #include <arch/vm.h>
+ #include <arch/arm/arm_boot_marker.h>
+@@ -116,6 +117,20 @@ arch_vm_init_end(kernel_args *args)
+ 		}
+ 	}
+ 
++	// bring-up aid: the boot markers and the exception tick bar write to the
++	// frame buffer from the exception vectors, where an access flag or dirty
++	// bit fault on it would recurse; mark its pages accessed and modified
++	if (args->arch_args.bootMarkerFrameBuffer != 0) {
++		VMTranslationMap* map = VMAddressSpace::Kernel()->TranslationMap();
++		addr_t start = ROUNDDOWN(args->arch_args.bootMarkerFrameBuffer,
++			B_PAGE_SIZE);
++		addr_t end = args->arch_args.bootMarkerFrameBuffer
++			+ args->frame_buffer.physical_buffer.size;
++		for (addr_t address = start; address < end; address += B_PAGE_SIZE)
++			map->SetFlags(address, PAGE_ACCESSED | PAGE_MODIFIED);
++		dprintf("AC100: boot marker frame buffer marked accessed/modified\n");
++	}
++
+ 	// Throw away all mappings that are unused by the kernel
+ 	dprintf("AC100: vm_free_unused_boot_loader_range\n");
+ 	vm_free_unused_boot_loader_range(KERNEL_LOAD_BASE, KERNEL_SIZE);

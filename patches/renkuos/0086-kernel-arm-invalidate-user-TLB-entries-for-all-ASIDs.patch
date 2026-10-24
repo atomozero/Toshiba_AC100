@@ -1,0 +1,124 @@
+From 7ec525c5701fbebf5f9651bf0a4a33128e9f3e24 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 13:34:41 +0200
+Subject: [PATCH 086/203] kernel/arm: invalidate user TLB entries for all
+ ASIDs, retry spurious faults
+
+User mappings are not global, so their TLB entries are tagged with the
+ASID in CONTEXTIDR. Haiku does not use ASIDs and never set it, but the
+per page invalidations (TLBIMVA/TLBIMVAIS) only hit the ASID they are
+given, 0: with a firmware that left another ASID, changes like making a
+clean page writable were never seen. Clear CONTEXTIDR at boot (and log
+what the firmware left), and invalidate by address for all ASIDs
+(TLBIMVAA/TLBIMVAAIS).
+
+Also handle a fault on an entry that already has the access flag set,
+or is already writable and dirty, as a stale TLB entry: invalidate it
+and retry, instead of failing the fault. On the Toshiba AC100,
+app_server died on its first write to the frame buffer with such a
+fault (FSR 0x80f on a present, accessed, modified, writable page).
+---
+ src/system/kernel/arch/arm/arch_cpu.cpp | 20 ++++++++++++++++----
+ src/system/kernel/arch/arm/arch_int.cpp | 13 +++++++++++++
+ 2 files changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/src/system/kernel/arch/arm/arch_cpu.cpp b/src/system/kernel/arch/arm/arch_cpu.cpp
+index 0683297f26..3d3a2a871d 100644
+--- a/src/system/kernel/arch/arm/arch_cpu.cpp
++++ b/src/system/kernel/arch/arm/arch_cpu.cpp
+@@ -41,6 +41,7 @@ extern "C" {
+ 
+ 
+ static uint8* sBootMarkerFrameBuffer;
++static uint32 sFirmwareContextID;
+ static uint32 sBootMarkerBytesPerRow;
+ static uint32 sBootMarkerDepth;
+ 
+@@ -218,6 +219,13 @@ arch_cpu_preboot_init_percpu(kernel_args *args, int curr_cpu)
+ 					+ (args->frame_buffer.height - 12) * sBootMarkerBytesPerRow;
+ 			}
+ 		}
++		// Haiku does not use ASIDs: user mappings are not global and are
++		// tagged with CONTEXTIDR.ASID, which the firmware may have left
++		// non-zero
++		asm volatile ("mrc p15, 0, %0, c13, c0, 1" : "=r" (sFirmwareContextID));
++		asm volatile ("mcr p15, 0, %0, c13, c0, 1" : : "r" (0));
++		asm volatile ("isb");
++
+ 		arm_boot_marker(6);
+ 		arm_boot_check_text(103);
+ 
+@@ -284,6 +292,8 @@ status_t
+ arch_cpu_init_post_vm(kernel_args *args)
+ {
+ 	arm_boot_marker(16);
++	dprintf("AC100: CONTEXTIDR left by the firmware: %#" B_PRIx32 "\n",
++		sFirmwareContextID);
+ 
+ 	if (args->arch_args.pmc.start != 0) {
+ 		void* address;
+@@ -409,8 +419,8 @@ arch_cpu_invalidate_TLB_page(addr_t page)
+ 	// ensure visibility of the update to translation table walks
+ 	dsb();
+ 
+-	// TLBIMVAIS(page)
+-	asm volatile ("mcr p15, 0, %0, c8, c3, 1"
++	// TLBIMVAAIS(page): for all ASIDs, user mappings are not global
++	asm volatile ("mcr p15, 0, %0, c8, c3, 3"
+ 		: : "r" (page));
+ 
+ 	// ensure completion of TLB invalidation
+@@ -424,9 +434,10 @@ arch_cpu_invalidate_tlb_range(intptr_t, addr_t start, addr_t end)
+ 	// ensure visibility of the update to translation table walks
+ 	dsb();
+ 
++	// TLBIMVAA: by address for all ASIDs, user mappings are not global
+ 	int32 num_pages = end / B_PAGE_SIZE - start / B_PAGE_SIZE;
+ 	while (num_pages-- >= 0) {
+-		asm volatile ("mcr p15, 0, %[c8format], c8, c7, 1"
++		asm volatile ("mcr p15, 0, %[c8format], c8, c7, 3"
+ 			: : [c8format] "r" (start) );
+ 		start += B_PAGE_SIZE;
+ 	}
+@@ -443,8 +454,9 @@ arch_cpu_invalidate_tlb_list(intptr_t, addr_t pages[], int num_pages)
+ 	// ensure visibility of the update to translation table walks
+ 	dsb();
+ 
++	// TLBIMVAA: by address for all ASIDs, user mappings are not global
+ 	for (int i = 0; i < num_pages; i++) {
+-		asm volatile ("mcr p15, 0, %[c8format], c8, c7, 1":
++		asm volatile ("mcr p15, 0, %[c8format], c8, c7, 3":
+ 			: [c8format] "r" (pages[i]) );
+ 	}
+ 
+diff --git a/src/system/kernel/arch/arm/arch_int.cpp b/src/system/kernel/arch/arm/arch_int.cpp
+index 4575cf29e0..862970bfb5 100644
+--- a/src/system/kernel/arch/arm/arch_int.cpp
++++ b/src/system/kernel/arch/arm/arch_int.cpp
+@@ -422,6 +422,10 @@ arch_arm_handle_access_flag_fault(addr_t far, uint32 fsr, bool isWrite, bool isE
+ 			map->SetFlags(far, PAGE_ACCESSED);
+ 			return true;
+ 		}
++
++		// the entry was fixed already, the TLB held the old one
++		arch_cpu_invalidate_TLB_page(far & ~(B_PAGE_SIZE - 1));
++		return true;
+ 	}
+ 
+ 	if (isWrite && ((fsr & (FSR_FS_MASK | FSR_LPAE_MASK)) == FSR_FS_PERMISSION_FAULT_L2)) {
+@@ -437,6 +441,15 @@ arch_arm_handle_access_flag_fault(addr_t far, uint32 fsr, bool isWrite, bool isE
+ 			map->SetFlags(far, PAGE_MODIFIED);
+ 			return true;
+ 		}
++
++		// writable and dirty already: the TLB held the old, read only entry
++		bool userWritable = (pageFlags & B_WRITE_AREA) != 0;
++		if ((pageFlags & PAGE_MODIFIED) != 0
++			&& (pageFlags & B_KERNEL_WRITE_AREA) != 0
++			&& (userWritable || IS_KERNEL_ADDRESS(far))) {
++			arch_cpu_invalidate_TLB_page(far & ~(B_PAGE_SIZE - 1));
++			return true;
++		}
+ 	}
+ 
+ 	return false;

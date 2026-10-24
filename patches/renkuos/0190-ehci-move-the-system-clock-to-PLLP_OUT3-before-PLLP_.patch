@@ -1,0 +1,70 @@
+From 433bf9fccdfd4a7b3a6cff28c32c57bcf3de8bdf Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Fri, 23 Oct 2026 22:41:30 +0200
+Subject: [PATCH 190/203] ehci: move the system clock to PLLP_OUT3 before
+ PLLP_OUT4 becomes the ULPI clock
+
+---
+ src/add-ons/kernel/busses/usb/ehci.cpp | 37 ++++++++++++++++----------
+ 1 file changed, 23 insertions(+), 14 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/ehci.cpp b/src/add-ons/kernel/busses/usb/ehci.cpp
+index 4129463c87..5a37f092bc 100644
+--- a/src/add-ons/kernel/busses/usb/ehci.cpp
++++ b/src/add-ons/kernel/busses/usb/ehci.cpp
+@@ -126,6 +126,7 @@ typedef struct {
+ #define TEGRA_CAR_PLLP_OUTB				0x0a8
+ #define TEGRA_CAR_SCLK_BURST_POLICY		0x028
+ #define TEGRA_SCLK_SOURCE_PLLP_OUT4		2
++#define TEGRA_SCLK_SOURCE_PLLP_OUT3		3
+ #define TEGRA_CLOCK_CDEV2				(64 + 29)	// CLK_ENB_DEV2_OUT
+ #define TEGRA_TRISTATE_REG_A			0x014
+ #define TEGRA_TRISTATE_REG_B			0x018
+@@ -363,25 +364,33 @@ tegra20_ulpi_phy_init(fdt_device_module_info* fdt, fdt_device* fdtDevice,
+ 
+ 	// The link clock: PLLP_OUT4 at 24 MHz (216 / 9) out of the CDEV2 pad.
+ 	// The boot firmware may run the system clock from PLLP_OUT4 (108 MHz):
+-	// then it must stay as it is (Linux first moves the system clock away).
++	// move it to PLLP_OUT3 (72 MHz, left as it is) first, as Linux moves it
++	// away (to PLLC_OUT1) before setting PLLP_OUT4 to 24 MHz.
+ 	uint32 sclk = car[TEGRA_CAR_SCLK_BURST_POLICY / 4];
+-	bool sclkOnOut4 = false;
++	uint32 newSclk = sclk;
+ 	for (int shift = 0; shift < 16; shift += 4) {
+-		if (((sclk >> shift) & 0xf) == TEGRA_SCLK_SOURCE_PLLP_OUT4)
+-			sclkOnOut4 = true;
++		if (((sclk >> shift) & 0xf) == TEGRA_SCLK_SOURCE_PLLP_OUT4) {
++			newSclk = (newSclk & ~(0xfU << shift))
++				| (TEGRA_SCLK_SOURCE_PLLP_OUT3 << shift);
++		}
+ 	}
+ 	uint32 outb = car[TEGRA_CAR_PLLP_OUTB / 4];
+-	dprintf("AC100: ulpi: system clock policy %#" B_PRIx32 "%s\n", sclk,
+-		sclkOnOut4 ? ", runs from PLLP_OUT4" : "");
+-	if ((outb >> 24) != 16 && sclkOnOut4) {
+-		dprintf("AC100: ulpi: PLLP_OUT4 is the system clock, not changing it: "
+-			"no USB2\n");
+-		delete_area(carArea);
+-		delete_area(miscArea);
+-		delete_area(gpioArea);
+-		delete_area(usbArea);
+-		return B_NOT_SUPPORTED;
++	if (newSclk != sclk && (outb >> 24) != 16) {
++		if ((outb & 3) != 3) {
++			dprintf("AC100: ulpi: system clock policy %#" B_PRIx32 " uses "
++				"PLLP_OUT4 and PLLP_OUT3 is off (%#" B_PRIx32 "): no USB2\n",
++				sclk, outb);
++			delete_area(carArea);
++			delete_area(miscArea);
++			delete_area(gpioArea);
++			delete_area(usbArea);
++			return B_NOT_SUPPORTED;
++		}
++		car[TEGRA_CAR_SCLK_BURST_POLICY / 4] = newSclk;
++		spin(10);
+ 	}
++	dprintf("AC100: ulpi: system clock policy %#" B_PRIx32 " -> %#" B_PRIx32
++		"\n", sclk, car[TEGRA_CAR_SCLK_BURST_POLICY / 4]);
+ 	if ((outb >> 24) != 16 || (outb & (7 << 16)) != (7 << 16)) {
+ 		outb &= 0xffff;
+ 		car[TEGRA_CAR_PLLP_OUTB / 4] = outb | (16 << 24) | (1 << 18);

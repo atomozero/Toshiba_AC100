@@ -1,0 +1,440 @@
+From a59807038302fdb1234b5dc9dae27c42b9a7fb60 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 13:40:19 +0200
+Subject: [PATCH 010/203] ARM: add a timer driver for the Cortex-A9 private
+ timer (TWD)
+
+Cortex-A9 has no generic timer, so on boards without a supported SoC
+timer the kernel panicked with 'No hardware timer found!'.
+
+The TWD (arm,cortex-a9-twd-timer) exists on every Cortex-A9 MPCore. It
+has a single down counter, used both as clock source (the time is
+accumulated from the ticks consumed since the last load) and as event
+timer. Its rate (PERIPHCLK) is usually not in the device tree, so the
+EFI loader measures it against the firmware's Stall() and passes it in
+the new arch_args.timerFrequency.
+
+The loader only falls back to the TWD when no other supported timer was
+found, so e.g. Tegra 2 keeps using its own timer.
+
+Tested on QEMU vexpress-a9 (Cortex-A9, GICv1): the timer calibrates to
+about 100 MHz and the kernel boots until it looks for the boot volume.
+---
+ .../kernel/arch/arm/arch_kernel_args.h        |   1 +
+ headers/private/kernel/boot/timer.h           |   1 +
+ .../boot/platform/efi/arch/arm/arch_dtb.cpp   |  49 +++++
+ src/system/kernel/arch/arm/Jamfile            |   1 +
+ src/system/kernel/arch/arm/arch_timer.cpp     |   5 +
+ .../kernel/arch/arm/arch_timer_a9_twd.cpp     | 191 ++++++++++++++++++
+ .../kernel/arch/arm/arch_timer_a9_twd.h       |  58 ++++++
+ 7 files changed, 306 insertions(+)
+ create mode 100644 src/system/kernel/arch/arm/arch_timer_a9_twd.cpp
+ create mode 100644 src/system/kernel/arch/arm/arch_timer_a9_twd.h
+
+diff --git a/headers/private/kernel/arch/arm/arch_kernel_args.h b/headers/private/kernel/arch/arm/arch_kernel_args.h
+index 32297eb54d..cd434bd6de 100644
+--- a/headers/private/kernel/arch/arm/arch_kernel_args.h
++++ b/headers/private/kernel/arch/arm/arch_kernel_args.h
+@@ -40,6 +40,7 @@ typedef struct {
+ 	uart_info			uart;
+ 	intc_info			interrupt_controller;
+ 	boot_timer_info		timer;
++	uint32				timerFrequency;	// in Hz, if the timer needs it
+ } _PACKED arch_kernel_args;
+ 
+ #endif	/* KERNEL_ARCH_ARM_KERNEL_ARGS_H */
+diff --git a/headers/private/kernel/boot/timer.h b/headers/private/kernel/boot/timer.h
+index 4b8f9e6e83..97893c7d88 100644
+--- a/headers/private/kernel/boot/timer.h
++++ b/headers/private/kernel/boot/timer.h
+@@ -14,6 +14,7 @@
+ #define		TIMER_KIND_OMAP3	"omap3"
+ #define		TIMER_KIND_PXA		"pxa"
+ #define		TIMER_KIND_TEGRA	"tegra20"
++#define		TIMER_KIND_A9_TWD	"a9twd"
+ 
+ 
+ typedef struct {
+diff --git a/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp b/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp
+index 86e78e9673..bfe8a9687a 100644
+--- a/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp
++++ b/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp
+@@ -17,6 +17,7 @@ extern "C" {
+ }
+ 
+ #include "dtb.h"
++#include "efi_platform.h"
+ 
+ 
+ const struct supported_interrupt_controllers {
+@@ -43,6 +44,36 @@ const struct supported_timers {
+ };
+ 
+ 
++// The Cortex-A9 private timer (TWD) exists on every Cortex-A9 MPCore, but is
++// only used when the device tree offers no better (SoC specific) timer.
++static addr_range sTWDRegs;
++static uint32 sTWDInterrupt;
++static bool sHasTWD = false;
++
++
++/*!	The TWD runs at PERIPHCLK, whose rate the device tree usually doesn't
++	describe, so measure it against the firmware's Stall().
++*/
++static uint32
++calibrate_twd(addr_t base)
++{
++	enum { kLoad = 0, kCounter = 1, kControl = 2, kInterruptStatus = 3 };
++	volatile uint32* twd = (volatile uint32*)base;
++	const uint32 kCalibrationTime = 10000; // µs
++
++	twd[kControl] = 0;
++	twd[kLoad] = 0xffffffff;
++	twd[kControl] = 1; // enabled, single shot, no interrupt, prescaler 0
++	uint32 start = twd[kCounter];
++	kBootServices->Stall(kCalibrationTime);
++	uint32 end = twd[kCounter];
++	twd[kControl] = 0;
++	twd[kInterruptStatus] = 1;
++
++	return (uint32)((uint64)(start - end) * 1000000 / kCalibrationTime);
++}
++
++
+ void
+ arch_handle_fdt(const void* fdt, int node)
+ {
+@@ -85,6 +116,13 @@ arch_handle_fdt(const void* fdt, int node)
+ 		}
+ 	}
+ 
++	if (!sHasTWD && dtb_has_fdt_string(compatible, compatibleLen,
++			"arm,cortex-a9-twd-timer")) {
++		dtb_get_reg(fdt, node, 0, sTWDRegs);
++		sTWDInterrupt = dtb_get_interrupt(fdt, node);
++		sHasTWD = true;
++	}
++
+ 	boot_timer_info &timer = gKernelArgs.arch_args.timer;
+ 	if (timer.kind[0] == 0) {
+ 		for (uint32 i = 0; i < B_COUNT_OF(kSupportedTimers); i++) {
+@@ -120,6 +158,13 @@ arch_dtb_set_kernel_args(void)
+ 	}
+ 
+ 	boot_timer_info &timer = gKernelArgs.arch_args.timer;
++	if (timer.kind[0] == 0 && sHasTWD) {
++		strlcpy(timer.kind, TIMER_KIND_A9_TWD, sizeof(timer.kind));
++		timer.regs = sTWDRegs;
++		timer.interrupt = sTWDInterrupt;
++		gKernelArgs.arch_args.timerFrequency = calibrate_twd(sTWDRegs.start);
++	}
++
+ 	dprintf("Chosen timer:\n");
+ 	if (timer.kind[0] == 0) {
+ 		dprintf("kind: None!\n");
+@@ -129,5 +174,9 @@ arch_dtb_set_kernel_args(void)
+ 			timer.regs.start,
+ 			timer.regs.size);
+ 		dprintf("  irq: %" B_PRIu32 "\n", timer.interrupt);
++		if (gKernelArgs.arch_args.timerFrequency != 0) {
++			dprintf("  frequency: %" B_PRIu32 " Hz\n",
++				gKernelArgs.arch_args.timerFrequency);
++		}
+ 	}
+ }
+diff --git a/src/system/kernel/arch/arm/Jamfile b/src/system/kernel/arch/arm/Jamfile
+index 0266afe88a..7ba755f16b 100644
+--- a/src/system/kernel/arch/arm/Jamfile
++++ b/src/system/kernel/arch/arm/Jamfile
+@@ -41,6 +41,7 @@ KernelMergeObject kernel_arch_arm.o :
+ 
+ 	arch_int_gicv2.cpp
+ 	arch_timer_generic.cpp
++	arch_timer_a9_twd.cpp
+ 
+ 	# SoC minimal kernel-required support
+ 	# (timers, interrupts, rtc?)
+diff --git a/src/system/kernel/arch/arm/arch_timer.cpp b/src/system/kernel/arch/arm/arch_timer.cpp
+index c3755618b8..6bc5776643 100644
+--- a/src/system/kernel/arch/arm/arch_timer.cpp
++++ b/src/system/kernel/arch/arm/arch_timer.cpp
+@@ -26,6 +26,7 @@
+ #include "soc_pxa.h"
+ #include "soc_omap3.h"
+ #include "soc_tegra.h"
++#include "arch_timer_a9_twd.h"
+ 
+ //#define TRACE_ARCH_TIMER
+ #ifdef TRACE_ARCH_TIMER
+@@ -71,6 +72,10 @@ arch_init_timer(kernel_args *args)
+ 		sizeof(args->arch_args.timer.kind)) == 0) {
+ 		TegraTimer::Init(args->arch_args.timer.regs.start,
+ 			args->arch_args.timer.interrupt);
++	} else if (strncmp(args->arch_args.timer.kind, TIMER_KIND_A9_TWD,
++		sizeof(args->arch_args.timer.kind)) == 0) {
++		A9TWDTimer::Init(args->arch_args.timer.regs.start,
++			args->arch_args.timer.interrupt, args->arch_args.timerFrequency);
+ 	} else {
+ 		panic("No hardware timer found!\n");
+ 	}
+diff --git a/src/system/kernel/arch/arm/arch_timer_a9_twd.cpp b/src/system/kernel/arch/arm/arch_timer_a9_twd.cpp
+new file mode 100644
+index 0000000000..949a267107
+--- /dev/null
++++ b/src/system/kernel/arch/arm/arch_timer_a9_twd.cpp
+@@ -0,0 +1,191 @@
++/*
++ * Copyright 2026, Haiku, Inc. All rights reserved.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "arch_timer_a9_twd.h"
++
++#include <KernelExport.h>
++#include <timer.h>
++#include <vm/vm.h>
++
++
++// Register offsets, in bytes, from the private timer base
++#define TWD_LOAD				0x00
++#define TWD_COUNTER				0x04
++#define TWD_CONTROL				0x08
++#define TWD_INTERRUPT_STATUS	0x0c
++
++#define TWD_CONTROL_ENABLE		(1U << 0)
++#define TWD_CONTROL_IRQ_ENABLE	(1U << 2)
++
++#define TWD_MAX_LOAD			0xffffffffU
++
++
++static inline uint32
++read_reg(volatile uint32* regs, uint32 offset)
++{
++	return regs[offset / sizeof(uint32)];
++}
++
++
++static inline void
++write_reg(volatile uint32* regs, uint32 offset, uint32 value)
++{
++	regs[offset / sizeof(uint32)] = value;
++}
++
++
++A9TWDTimer::A9TWDTimer(phys_addr_t regBase, uint32 interrupt,
++	uint32 frequency)
++	:
++	fInterrupt(interrupt),
++	fFrequency(frequency),
++	fLock(B_SPINLOCK_INITIALIZER),
++	fBaseTicks(0),
++	fLoaded(0),
++	fEventArmed(false),
++	fEventTicks(0)
++{
++	if (fFrequency == 0)
++		panic("A9 TWD timer: unknown frequency!");
++
++	fRegArea = vm_map_physical_memory(B_SYSTEM_TEAM, "timer-a9-twd",
++		(void**)&fRegs, B_ANY_KERNEL_ADDRESS, B_PAGE_SIZE,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++		ROUNDDOWN(regBase, B_PAGE_SIZE), false);
++	if (fRegArea < 0)
++		panic("Cannot map A9 TWD timer registers!");
++	fRegs += (regBase % B_PAGE_SIZE) / sizeof(uint32);
++
++	dprintf("A9 TWD: timer @ %#" B_PRIxPHYSADDR ", IRQ %" B_PRId32 ", %" B_PRIu32
++		" Hz\n", regBase, fInterrupt, fFrequency);
++
++	write_reg(fRegs, TWD_CONTROL, 0);
++	write_reg(fRegs, TWD_INTERRUPT_STATUS, 1);
++	install_io_interrupt_handler(fInterrupt, &A9TWDTimer::_HandleInterrupt,
++		this, 0);
++
++	// start counting right away, the clock must run even without events
++	cpu_status state = disable_interrupts();
++	acquire_spinlock(&fLock);
++	_LoadLocked(TWD_MAX_LOAD);
++	write_reg(fRegs, TWD_CONTROL, TWD_CONTROL_ENABLE | TWD_CONTROL_IRQ_ENABLE);
++	release_spinlock(&fLock);
++	restore_interrupts(state);
++}
++
++
++void
++A9TWDTimer::SetTimeout(bigtime_t timeout)
++{
++	cpu_status state = disable_interrupts();
++	acquire_spinlock(&fLock);
++
++	uint64 ticks;
++	if (timeout >= _ToTime(TWD_MAX_LOAD))
++		ticks = TWD_MAX_LOAD;
++	else if (timeout <= 0)
++		ticks = 1;
++	else
++		ticks = max_c(_ToTicks(timeout), 1);
++
++	_LoadLocked((uint32)ticks);
++	fEventArmed = true;
++	fEventTicks = fBaseTicks + ticks;
++
++	release_spinlock(&fLock);
++	restore_interrupts(state);
++}
++
++
++bigtime_t
++A9TWDTimer::Time()
++{
++	cpu_status state = disable_interrupts();
++	acquire_spinlock(&fLock);
++
++	uint64 ticks = _TicksLocked();
++
++	release_spinlock(&fLock);
++	restore_interrupts(state);
++
++	return _ToTime(ticks);
++}
++
++
++void
++A9TWDTimer::Clear()
++{
++	cpu_status state = disable_interrupts();
++	acquire_spinlock(&fLock);
++
++	fEventArmed = false;
++	_LoadLocked(TWD_MAX_LOAD);
++
++	release_spinlock(&fLock);
++	restore_interrupts(state);
++}
++
++
++uint64
++A9TWDTimer::_TicksLocked()
++{
++	// In single shot mode the counter stops at 0 once the load has elapsed
++	return fBaseTicks + (fLoaded - read_reg(fRegs, TWD_COUNTER));
++}
++
++
++void
++A9TWDTimer::_LoadLocked(uint32 ticks)
++{
++	fBaseTicks = _TicksLocked();
++	fLoaded = ticks;
++	// writing the load register also reloads the counter
++	write_reg(fRegs, TWD_LOAD, ticks);
++}
++
++
++uint64
++A9TWDTimer::_ToTicks(bigtime_t time) const
++{
++	return (uint64)time / 1000000 * fFrequency
++		+ (uint64)time % 1000000 * fFrequency / 1000000;
++}
++
++
++bigtime_t
++A9TWDTimer::_ToTime(uint64 ticks) const
++{
++	return ticks / fFrequency * 1000000
++		+ ticks % fFrequency * 1000000 / fFrequency;
++}
++
++
++int32
++A9TWDTimer::_HandleInterrupt(void* data)
++{
++	A9TWDTimer* timer = (A9TWDTimer*)data;
++
++	acquire_spinlock(&timer->fLock);
++
++	write_reg(timer->fRegs, TWD_INTERRUPT_STATUS, 1);
++
++	// The interrupt may be stale if the counter was reloaded meanwhile; only
++	// act on an expired load.
++	bool expired = read_reg(timer->fRegs, TWD_COUNTER) == 0;
++	bool eventDue = timer->fEventArmed
++		&& timer->_TicksLocked() >= timer->fEventTicks;
++
++	if (eventDue)
++		timer->fEventArmed = false;
++	if (expired) {
++		// keep the clock running until the next SetTimeout()
++		timer->_LoadLocked(TWD_MAX_LOAD);
++	}
++
++	release_spinlock(&timer->fLock);
++
++	return eventDue ? timer_interrupt() : B_HANDLED_INTERRUPT;
++}
+diff --git a/src/system/kernel/arch/arm/arch_timer_a9_twd.h b/src/system/kernel/arch/arm/arch_timer_a9_twd.h
+new file mode 100644
+index 0000000000..ae1b8b6401
+--- /dev/null
++++ b/src/system/kernel/arch/arm/arch_timer_a9_twd.h
+@@ -0,0 +1,58 @@
++/*
++ * Copyright 2026, Haiku, Inc. All rights reserved.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef ARCH_ARM_TIMER_A9_TWD_H
++#define ARCH_ARM_TIMER_A9_TWD_H
++
++
++#include "soc.h"
++
++#include <new>
++
++
++// Private timer of the Cortex-A9 MPCore ("arm,cortex-a9-twd-timer"). It has a
++// single 32-bit down counter, so it serves both as clock source and as event
++// timer: the time is accumulated from the ticks consumed since the counter was
++// last loaded, and the counter is reloaded for every timeout.
++class A9TWDTimer : public HardwareTimer {
++public:
++	void SetTimeout(bigtime_t timeout);
++	bigtime_t Time();
++	void Clear();
++
++	static status_t Init(phys_addr_t regBase, uint32 interrupt,
++		uint32 frequency)
++	{
++		if (sInstance != NULL)
++			return B_OK;
++
++		A9TWDTimer* timer = new(std::nothrow) A9TWDTimer(regBase, interrupt,
++			frequency);
++		return timer != NULL ? B_OK : B_NO_MEMORY;
++	}
++
++private:
++	A9TWDTimer(phys_addr_t regBase, uint32 interrupt, uint32 frequency);
++
++	uint64 _TicksLocked();
++	void _LoadLocked(uint32 ticks);
++	uint64 _ToTicks(bigtime_t time) const;
++	bigtime_t _ToTime(uint64 ticks) const;
++
++	static int32 _HandleInterrupt(void* data);
++
++	area_id fRegArea;
++	volatile uint32* fRegs;
++	int32 fInterrupt;
++	uint32 fFrequency;
++
++	spinlock fLock;
++	uint64 fBaseTicks;		// ticks elapsed until the last load
++	uint32 fLoaded;			// value the counter was last loaded with
++	bool fEventArmed;
++	uint64 fEventTicks;		// when the armed event is due
++};
++
++
++#endif /* ARCH_ARM_TIMER_A9_TWD_H */

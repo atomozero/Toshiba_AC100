@@ -1,0 +1,28 @@
+From 0b09645d04e863b1e69d94dd4b6a5104e713117d Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 20 Oct 2026 19:10:38 +0200
+Subject: [PATCH 169/203] ARM bring-up: log the hub characteristics and retry
+ state of new hub ports (not for merging)
+
+---
+ src/add-ons/kernel/bus_managers/usb/Hub.cpp | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/add-ons/kernel/bus_managers/usb/Hub.cpp b/src/add-ons/kernel/bus_managers/usb/Hub.cpp
+index a84a613479..9acf06662a 100644
+--- a/src/add-ons/kernel/bus_managers/usb/Hub.cpp
++++ b/src/add-ons/kernel/bus_managers/usb/Hub.cpp
+@@ -471,8 +471,11 @@ Hub::Explore(change_item **changeList)
+ 					if (speed > Speed())
+ 						speed = Speed();
+ 					dprintf("AC100: usb hub %d port %" B_PRId32 ": status %#x, "
+-						"change %#x, speed %d\n", DeviceAddress(), i + 1,
+-						fPortStatus[i].status, fPortStatus[i].change, speed);
++						"change %#x, speed %d, hub characteristics %#x, "
++						"failed %u, power cycles %u\n", DeviceAddress(), i + 1,
++						fPortStatus[i].status, fPortStatus[i].change, speed,
++						fHubDescriptor.characteristics, fFailedAttempts[i],
++						fPowerCycleAttempts[i]);
+ 
+ 					// either let the device inherit our addresses (if we are
+ 					// already potentially using a transaction translator) or

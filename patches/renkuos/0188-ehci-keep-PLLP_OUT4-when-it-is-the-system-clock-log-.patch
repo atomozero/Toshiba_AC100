@@ -1,0 +1,83 @@
+From d9358ebb6c2d7c7f979057d4941ca108264b9248 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Fri, 23 Oct 2026 22:08:24 +0200
+Subject: [PATCH 188/203] ehci: keep PLLP_OUT4 when it is the system clock, log
+ the ULPI steps
+
+---
+ src/add-ons/kernel/busses/usb/ehci.cpp | 27 +++++++++++++++++++++++++-
+ 1 file changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/ehci.cpp b/src/add-ons/kernel/busses/usb/ehci.cpp
+index 8776a99356..4129463c87 100644
+--- a/src/add-ons/kernel/busses/usb/ehci.cpp
++++ b/src/add-ons/kernel/busses/usb/ehci.cpp
+@@ -124,6 +124,8 @@ typedef struct {
+ #define TEGRA20_APB_MISC_BASE			0x70000000
+ #define TEGRA20_GPIO_BASE				0x6000d000
+ #define TEGRA_CAR_PLLP_OUTB				0x0a8
++#define TEGRA_CAR_SCLK_BURST_POLICY		0x028
++#define TEGRA_SCLK_SOURCE_PLLP_OUT4		2
+ #define TEGRA_CLOCK_CDEV2				(64 + 29)	// CLK_ENB_DEV2_OUT
+ #define TEGRA_TRISTATE_REG_A			0x014
+ #define TEGRA_TRISTATE_REG_B			0x018
+@@ -359,14 +361,34 @@ tegra20_ulpi_phy_init(fdt_device_module_info* fdt, fdt_device* fdtDevice,
+ 		*MISC_REG(TEGRA_TRISTATE_REG_B), *MISC_REG(TEGRA_TRISTATE_REG_D),
+ 		resetGPIO, activeLow ? "low" : "high");
+ 
+-	// The link clock: PLLP_OUT4 at 24 MHz (216 / 9) out of the CDEV2 pad
++	// The link clock: PLLP_OUT4 at 24 MHz (216 / 9) out of the CDEV2 pad.
++	// The boot firmware may run the system clock from PLLP_OUT4 (108 MHz):
++	// then it must stay as it is (Linux first moves the system clock away).
++	uint32 sclk = car[TEGRA_CAR_SCLK_BURST_POLICY / 4];
++	bool sclkOnOut4 = false;
++	for (int shift = 0; shift < 16; shift += 4) {
++		if (((sclk >> shift) & 0xf) == TEGRA_SCLK_SOURCE_PLLP_OUT4)
++			sclkOnOut4 = true;
++	}
+ 	uint32 outb = car[TEGRA_CAR_PLLP_OUTB / 4];
++	dprintf("AC100: ulpi: system clock policy %#" B_PRIx32 "%s\n", sclk,
++		sclkOnOut4 ? ", runs from PLLP_OUT4" : "");
++	if ((outb >> 24) != 16 && sclkOnOut4) {
++		dprintf("AC100: ulpi: PLLP_OUT4 is the system clock, not changing it: "
++			"no USB2\n");
++		delete_area(carArea);
++		delete_area(miscArea);
++		delete_area(gpioArea);
++		delete_area(usbArea);
++		return B_NOT_SUPPORTED;
++	}
+ 	if ((outb >> 24) != 16 || (outb & (7 << 16)) != (7 << 16)) {
+ 		outb &= 0xffff;
+ 		car[TEGRA_CAR_PLLP_OUTB / 4] = outb | (16 << 24) | (1 << 18);
+ 		spin(2);
+ 		car[TEGRA_CAR_PLLP_OUTB / 4] = outb | (16 << 24) | (7 << 16);
+ 	}
++	dprintf("AC100: ulpi: link clock set\n");
+ 	tegra_set_bits(MISC_REG(TEGRA_PIN_MUX_CTL_C), 3 << 4, 3 << 4);
+ 	tegra_set_bits(MISC_REG(TEGRA_TRISTATE_REG_A), 1 << 5, 0);
+ 
+@@ -376,6 +398,7 @@ tegra20_ulpi_phy_init(fdt_device_module_info* fdt, fdt_device* fdtDevice,
+ 	tegra_set_bits(MISC_REG(TEGRA_TRISTATE_REG_B), (1 << 19) | (1 << 18), 0);
+ 	tegra_set_bits(MISC_REG(TEGRA_TRISTATE_REG_D), 1 << 13, 0);
+ 
++	dprintf("AC100: ulpi: pins set\n");
+ 	// Reset the controller, with its clock running
+ 	uint32 bank = clock / 32;
+ 	uint32 bit = 1U << (clock % 32);
+@@ -405,6 +428,7 @@ tegra20_ulpi_phy_init(fdt_device_module_info* fdt, fdt_device* fdtDevice,
+ 	}
+ 	snooze(2000);
+ 
++	dprintf("AC100: ulpi: controller and PHY out of reset\n");
+ 	// Select the ULPI link
+ 	*USB_REG(TEGRA_USB_SUSP_CTRL) |= UHSIC_RESET;
+ 	*USB_REG(TEGRA_ULPI_TIMING_CTRL_0)
+@@ -421,6 +445,7 @@ tegra20_ulpi_phy_init(fdt_device_module_info* fdt, fdt_device* fdtDevice,
+ 
+ 	// Talk to the PHY: its IDs, then the VBUS fix-up Linux applies (VBUS is
+ 	// floating: use the external VBUS indicator)
++	dprintf("AC100: ulpi: link enabled\n");
+ 	volatile uint32* view = USB_REG(TEGRA_USB_ULPI_VIEWPORT);
+ 	int32 id[4];
+ 	for (int i = 0; i < 4; i++)

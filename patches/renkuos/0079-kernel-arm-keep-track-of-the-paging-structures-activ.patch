@@ -1,0 +1,91 @@
+From fffe1c8d26e61202240f0feb0851bab805ed4aad Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 12:04:44 +0200
+Subject: [PATCH 079/203] kernel/arm: keep track of the paging structures
+ active on each CPU
+
+The translation maps only invalidate the TLB entries of user pages on
+the CPUs in the active_on_cpus set of their paging structures, but ARM
+never put any CPU into it. So changes to user mappings were not seen by
+the CPU running the team until it switched to another one: after
+fork(), the parent kept writing through its stale, writable TLB entries
+into the pages it now shared copy-on-write with the child, and the
+child came back from fork() with the parent's stack (returning the
+child's ID instead of 0, among others). Shells and launch_daemon failed
+in all sorts of ways because of this, and the desktop never started.
+
+Maintain the set on context switches as x86 does, keeping a reference
+to the paging structures a CPU uses, and only load TTBR0 when the page
+directory really changes.
+---
+ src/system/kernel/arch/arm/arch_thread.cpp | 50 +++++++++++++++-------
+ 1 file changed, 35 insertions(+), 15 deletions(-)
+
+diff --git a/src/system/kernel/arch/arm/arch_thread.cpp b/src/system/kernel/arch/arm/arch_thread.cpp
+index 63cd486db3..9b3046ffdc 100644
+--- a/src/system/kernel/arch/arm/arch_thread.cpp
++++ b/src/system/kernel/arch/arm/arch_thread.cpp
+@@ -122,6 +122,10 @@ arch_thread_init_tls(Thread *thread)
+ }
+ 
+ 
++// the paging structures each CPU currently uses, referenced
++static ARMPagingStructures* sActivePagingStructures[SMP_MAX_CPUS];
++
++
+ void
+ arm_swap_pgdir(uint32_t pageDirectoryAddress)
+ {
+@@ -140,21 +144,37 @@ arch_thread_context_switch(Thread *from, Thread *to)
+ {
+ 	arm_set_tpidruro(to->user_local_storage);
+ 
+-	VMAddressSpace *oldAddressSpace = from->team->address_space;
+-	VMTranslationMap *oldTranslationMap = oldAddressSpace->TranslationMap();
+-	phys_addr_t oldPageDirectoryAddress =
+-		((ARMVMTranslationMap *)oldTranslationMap)->PagingStructures()->pgdir_phys;
+-
+-	VMAddressSpace *newAddressSpace = to->team->address_space;
+-	VMTranslationMap *newTranslationMap = newAddressSpace->TranslationMap();
+-	phys_addr_t newPageDirectoryAddress =
+-		((ARMVMTranslationMap *)newTranslationMap)->PagingStructures()->pgdir_phys;
+-
+-	if (oldPageDirectoryAddress != newPageDirectoryAddress) {
+-		TRACE("arch_thread_context_switch: swap pgdir: "
+-			"0x%08" B_PRIxPHYSADDR " -> 0x%08" B_PRIxPHYSADDR "\n",
+-			oldPageDirectoryAddress, newPageDirectoryAddress);
+-		arm_swap_pgdir(newPageDirectoryAddress);
++	// Keep track of which paging structures are active on this CPU: the
++	// translation maps only invalidate the TLB entries of user pages on the
++	// CPUs in their active_on_cpus set, so with an empty set changes to user
++	// mappings (like making the pages of a forking team copy-on-write) were
++	// never seen by the CPU running the team, until it switched teams.
++	int cpu = smp_get_current_cpu();
++	ARMPagingStructures* activePagingStructures
++		= sActivePagingStructures[cpu];
++	ARMPagingStructures* toPagingStructures
++		= ((ARMVMTranslationMap*)to->team->address_space->TranslationMap())
++			->PagingStructures();
++
++	if (toPagingStructures != activePagingStructures) {
++		if (activePagingStructures != NULL)
++			activePagingStructures->active_on_cpus.ClearBitAtomic(cpu);
++		toPagingStructures->active_on_cpus.SetBitAtomic(cpu);
++
++		toPagingStructures->AddReference();
++		sActivePagingStructures[cpu] = toPagingStructures;
++
++		if (activePagingStructures == NULL
++			|| activePagingStructures->pgdir_phys
++				!= toPagingStructures->pgdir_phys) {
++			TRACE("arch_thread_context_switch: swap pgdir: "
++				"0x%08" B_PRIxPHYSADDR "\n", toPagingStructures->pgdir_phys);
++			arm_swap_pgdir(toPagingStructures->pgdir_phys);
++		}
++
++		// this CPU does not use the previous paging structures anymore
++		if (activePagingStructures != NULL)
++			activePagingStructures->RemoveReference();
+ 	}
+ 
+ 	TRACE("arch_thread_context_switch: %p(%s/%p) -> %p(%s/%p)\n",

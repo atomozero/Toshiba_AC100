@@ -1,0 +1,83 @@
+From 2a68190605750d0b86231621c2482f3b29dbd7c6 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 22:11:33 +0200
+Subject: [PATCH 048/203] ARM bring-up: turn the exception tick bar off (not
+ for merging)
+
+---
+ src/system/kernel/arch/arm/arch_cpu.cpp |  5 +++-
+ src/system/kernel/arch/arm/arch_int.cpp | 34 ++++++++++++++++++++++++-
+ 2 files changed, 37 insertions(+), 2 deletions(-)
+
+diff --git a/src/system/kernel/arch/arm/arch_cpu.cpp b/src/system/kernel/arch/arm/arch_cpu.cpp
+index 1d06bd2623..bce39721b1 100644
+--- a/src/system/kernel/arch/arm/arch_cpu.cpp
++++ b/src/system/kernel/arch/arm/arch_cpu.cpp
+@@ -209,7 +209,10 @@ arch_cpu_preboot_init_percpu(kernel_args *args, int curr_cpu)
+ 				= (uint8*)(addr_t)args->arch_args.bootMarkerFrameBuffer;
+ 			sBootMarkerBytesPerRow = args->frame_buffer.bytes_per_row;
+ 			sBootMarkerDepth = args->frame_buffer.depth;
+-			if (sBootMarkerDepth == 16 && args->frame_buffer.height > 20) {
++			// the exception tick bar is off: with userland running it
++			// fills up and garbles the screen
++			if (false && sBootMarkerDepth == 16
++				&& args->frame_buffer.height > 20) {
+ 				gArmTickBytesPerRow = sBootMarkerBytesPerRow;
+ 				gArmTickFrameBuffer = (uint32)(addr_t)sBootMarkerFrameBuffer
+ 					+ (args->frame_buffer.height - 12) * sBootMarkerBytesPerRow;
+diff --git a/src/system/kernel/arch/arm/arch_int.cpp b/src/system/kernel/arch/arm/arch_int.cpp
+index 4437ed4e72..dffd83293a 100644
+--- a/src/system/kernel/arch/arm/arch_int.cpp
++++ b/src/system/kernel/arch/arm/arch_int.cpp
+@@ -22,6 +22,7 @@
+ #include <kscheduler.h>
+ #include <interrupt_controller.h>
+ #include <ksyscalls.h>
++#include <signal.h>
+ #include <smp.h>
+ #include <syscall_numbers.h>
+ #include <thread.h>
+@@ -239,11 +240,42 @@ static struct arm_exception_record* arm_log_exception(uint32 type,
+ extern "C" void
+ arch_arm_undefined(struct iframe *iframe)
+ {
++<<<<<<< HEAD
+ 	arm_log_exception(5, 0, 0, iframe);
++=======
++	if ((iframe->spsr & CPSR_MODE_MASK) == CPSR_MODE_USR) {
++		// An instruction the CPU does not implement, e.g. a VFP register a
++		// VFPv3-D16 unit does not have: only the offending team has to go.
++		Thread* thread = thread_get_current_thread();
++		thread->arch_info.userFrame = iframe;
++		thread_at_kernel_entry(system_time());
++
++		enable_interrupts();
++
++		// the saved PC points behind the undefined instruction
++		Signal signal(SIGILL, ILL_ILLOPC, B_OK, thread->team->id);
++		signal.SetAddress((void*)(iframe->pc - 4));
++		send_signal_to_thread(thread, signal, 0);
++
++		disable_interrupts();
++		if ((thread->flags & (THREAD_FLAGS_SIGNALS_PENDING
++				| THREAD_FLAGS_DEBUG_THREAD
++				| THREAD_FLAGS_TRAP_FOR_CORE_DUMP)) != 0) {
++			enable_interrupts();
++			thread_at_kernel_exit();
++		} else
++			thread_at_kernel_exit_no_signals();
++
++		thread->arch_info.userFrame = NULL;
++		return;
++	}
++
++>>>>>>> e2e51af025 (kernel/arm: send SIGILL for undefined instructions in userland)
+ 	print_iframe("Undefined Instruction", iframe);
+ 	IFrameScope scope(iframe); // push/pop iframe
+ 
+-	panic("not handled!");
++	panic("undefined instruction in kernel mode at %#" B_PRIx32 "\n",
++		iframe->pc - 4);
+ }
+ 
+ 

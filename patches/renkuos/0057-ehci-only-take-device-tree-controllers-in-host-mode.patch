@@ -1,0 +1,31 @@
+From 133cb9e7921f3f9e58ea3ce0549e026e6708ae99 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 23:11:12 +0200
+Subject: [PATCH 057/203] ehci: only take device tree controllers in host mode
+
+A dual role controller whose "dr_mode" is "peripheral" or "otg", like
+the first USB controller of the Tegra 2 that is wired to the recovery
+port, is meant to be used as a device; driving it as a host made it
+raise interrupts nobody handled.
+---
+ src/add-ons/kernel/busses/usb/ehci.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/add-ons/kernel/busses/usb/ehci.cpp b/src/add-ons/kernel/busses/usb/ehci.cpp
+index 0e56bdde3a..8e286eb614 100644
+--- a/src/add-ons/kernel/busses/usb/ehci.cpp
++++ b/src/add-ons/kernel/busses/usb/ehci.cpp
+@@ -280,6 +280,13 @@ supports_device(device_node* parent)
+ 			return 0.0f;
+ 		}
+ 
++		// A dual role controller can also be wired as a device port (e.g. the
++		// USB recovery port of a Tegra), which is no host controller
++		const char* mode = (const char*)fdt->get_prop(fdtDevice, "dr_mode",
++			&length);
++		if (mode != NULL && strcmp(mode, "host") != 0)
++			return 0.0f;
++
+ 		TRACE_MODULE("EHCI device tree controller found!\n");
+ 		return 0.8f;
+ 	}

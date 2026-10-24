@@ -1,0 +1,55 @@
+From 1178380dbfc8bfcab020dd93363ad1d8745f8fb2 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 15:56:46 +0200
+Subject: [PATCH 015/203] ARM bring-up: markers for panic() and early page
+ faults (not for merging)
+
+---
+ src/system/kernel/arch/arm/arch_int.cpp | 8 ++++++++
+ src/system/kernel/debug/debug.cpp       | 7 +++++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/src/system/kernel/arch/arm/arch_int.cpp b/src/system/kernel/arch/arm/arch_int.cpp
+index 9fd5d99d76..8b9d657413 100644
+--- a/src/system/kernel/arch/arm/arch_int.cpp
++++ b/src/system/kernel/arch/arm/arch_int.cpp
+@@ -359,6 +359,14 @@ arch_arm_page_fault(struct iframe *frame, addr_t far, uint32 fsr, bool isWrite,
+ 	if (arch_arm_handle_access_flag_fault(far, fsr, isWrite, isExec))
+ 		return;
+ 
++	if (gKernelStartup) {
++		// bring-up aid: page faults are unexpected this early
++		arm_boot_marker(33);
++		arm_boot_marker_value(4, far);
++		arm_boot_marker_value(5, frame->pc);
++		arm_boot_marker_value(6, fsr);
++	}
++
+ 	Thread *thread = thread_get_current_thread();
+ 	bool isUser = (frame->spsr & CPSR_MODE_MASK) == CPSR_MODE_USR;
+ 	addr_t newip = 0;
+diff --git a/src/system/kernel/debug/debug.cpp b/src/system/kernel/debug/debug.cpp
+index cde05273ca..77431959f1 100644
+--- a/src/system/kernel/debug/debug.cpp
++++ b/src/system/kernel/debug/debug.cpp
+@@ -52,6 +52,9 @@
+ #include "debug_commands.h"
+ #include "debug_output_filter.h"
+ #include "debug_variables.h"
++#ifdef __ARM__
++#	include <arch/arm/arm_boot_marker.h>
++#endif
+ 
+ 
+ #if __GNUC__ == 2
+@@ -2128,6 +2131,10 @@ parse_expression(const char* expression)
+ void
+ panic(const char* format, ...)
+ {
++#ifdef __ARM__
++	arm_boot_marker(34);
++	arm_boot_marker_value(3, (uint32)(addr_t)__builtin_return_address(0));
++#endif
+ 	va_list args;
+ 	va_start(args, format);
+ 

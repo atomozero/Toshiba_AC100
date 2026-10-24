@@ -1,0 +1,23 @@
+From b7667b0a870c47a68bccf964d5497f61d6887ce5 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 19 Oct 2026 20:51:03 +0200
+Subject: [PATCH 140/203] minimum image: no usb_webcam add-on on ARM
+
+The AC100 image ships its own UVC webcam add-on; two add-ons would compete
+for the same camera.
+---
+ build/jam/images/definitions/minimum | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
+index 89e77006e4..efabc3d0c3 100644
+--- a/build/jam/images/definitions/minimum
++++ b/build/jam/images/definitions/minimum
+@@ -582,7 +582,6 @@ if arm in $(HAIKU_PACKAGING_ARCHS) {
+ 		hmulti_audio.media_addon
+ 		mixer.media_addon
+ 		tone_producer_demo.media_addon
+-		usb_webcam.media_addon
+ 		video_mixer.media_addon
+ 		video_producer_demo.media_addon
+ 		video_window_demo.media_addon

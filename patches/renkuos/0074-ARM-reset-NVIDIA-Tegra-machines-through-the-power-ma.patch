@@ -1,0 +1,103 @@
+From 4a659d81aa7c491d3b807f505d5d6bc22c6e32dd Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 10:37:36 +0200
+Subject: [PATCH 074/203] ARM: reset NVIDIA Tegra machines through the power
+ management controller
+
+arch_cpu_shutdown() never returned or did anything on ARM, so a reboot
+hung the machine. The boot loader now passes the registers of an
+"nvidia,tegra20-pmc" device tree node to the kernel, which resets the
+chip through it, and calls a power off hook a driver can install (like
+the one of the embedded controller of the Toshiba AC100).
+---
+ .../kernel/arch/arm/arch_kernel_args.h        |  1 +
+ .../boot/platform/efi/arch/arm/arch_dtb.cpp   |  6 ++++
+ src/system/kernel/arch/arm/arch_cpu.cpp       | 35 +++++++++++++++++++
+ 3 files changed, 42 insertions(+)
+
+diff --git a/headers/private/kernel/arch/arm/arch_kernel_args.h b/headers/private/kernel/arch/arm/arch_kernel_args.h
+index 3dcefdcc03..f4481cdf20 100644
+--- a/headers/private/kernel/arch/arm/arch_kernel_args.h
++++ b/headers/private/kernel/arch/arm/arch_kernel_args.h
+@@ -43,6 +43,7 @@ typedef struct {
+ 	uint32				timerFrequency;	// in Hz, if the timer needs it
+ 	uint32				bootMarkerFrameBuffer;	// kernel address, bring-up aid
+ 	uint32				bootDebug[8];	// loader's view of the CPU, bring-up aid
++	addr_range			pmc;	// NVIDIA Tegra power management controller
+ } _PACKED arch_kernel_args;
+ 
+ #endif	/* KERNEL_ARCH_ARM_KERNEL_ARGS_H */
+diff --git a/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp b/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp
+index e276bf8a92..ac77f840c5 100644
+--- a/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp
++++ b/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp
+@@ -141,6 +141,12 @@ arch_handle_fdt(const void* fdt, int node)
+ 		dtb_get_reg(fdt, node, 0, sTegraCARRegs);
+ 	}
+ 
++	// the kernel resets the machine through it
++	if (gKernelArgs.arch_args.pmc.start == 0
++		&& dtb_has_fdt_string(compatible, compatibleLen, "nvidia,tegra20-pmc")) {
++		dtb_get_reg(fdt, node, 0, gKernelArgs.arch_args.pmc);
++	}
++
+ 	if (sL2Regs.start == 0 && dtb_has_fdt_string(compatible, compatibleLen,
+ 			"arm,pl310-cache")) {
+ 		dtb_get_reg(fdt, node, 0, sL2Regs);
+diff --git a/src/system/kernel/arch/arm/arch_cpu.cpp b/src/system/kernel/arch/arm/arch_cpu.cpp
+index cee7c43d3b..0683297f26 100644
+--- a/src/system/kernel/arch/arm/arch_cpu.cpp
++++ b/src/system/kernel/arch/arm/arch_cpu.cpp
+@@ -266,10 +266,36 @@ arch_cpu_init(kernel_args *args)
+ }
+ 
+ 
++// NVIDIA Tegra power management controller: a write of MAIN_RST to its
++// control register resets the whole chip
++#define TEGRA_PMC_CNTRL				0x00
++#define TEGRA_PMC_CNTRL_MAIN_RST	(1 << 4)
++
++static volatile uint32* sTegraPMC;
++
++// set by the driver that can switch the machine off, like the embedded
++// controller of the Toshiba AC100
++extern "C" {
++void (*gArmPowerOffHook)(void) = NULL;
++}
++
++
+ status_t
+ arch_cpu_init_post_vm(kernel_args *args)
+ {
+ 	arm_boot_marker(16);
++
++	if (args->arch_args.pmc.start != 0) {
++		void* address;
++		area_id area = map_physical_memory("tegra pmc",
++			args->arch_args.pmc.start, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++		if (area >= B_OK) {
++			sTegraPMC = (volatile uint32*)((addr_t)address
++				+ (args->arch_args.pmc.start & (B_PAGE_SIZE - 1)));
++		}
++	}
++
+ 	return B_OK;
+ }
+ 
+@@ -285,6 +311,15 @@ arch_cpu_init_post_modules(kernel_args *args)
+ status_t
+ arch_cpu_shutdown(bool reboot)
+ {
++	if (reboot && sTegraPMC != NULL) {
++		disable_interrupts();
++		sTegraPMC[TEGRA_PMC_CNTRL / 4] |= TEGRA_PMC_CNTRL_MAIN_RST;
++		spin(100000);
++	}
++
++	if (!reboot && gArmPowerOffHook != NULL)
++		gArmPowerOffHook();
++
+ 	while(1)
+ 		arch_cpu_idle();
+ 

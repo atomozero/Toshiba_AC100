@@ -1,0 +1,214 @@
+From 3d2afc10bea910876353e780b8770ceb6bba525d Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 12:04:44 +0200
+Subject: [PATCH 080/203] ARM bring-up: dump the userland threads 90 and 180
+ seconds after boot, with their last user PC and callers (not for merging)
+
+---
+ .../kernel/arch/arm/arch_thread_types.h       |   6 +
+ src/system/kernel/arch/arm/arch_int.cpp       |  29 +++++
+ src/system/kernel/fs/vfs_boot.cpp             | 104 ++++++++++++++++++
+ 3 files changed, 139 insertions(+)
+
+diff --git a/headers/private/kernel/arch/arm/arch_thread_types.h b/headers/private/kernel/arch/arm/arch_thread_types.h
+index 5a9efc4ebb..c068fa6790 100644
+--- a/headers/private/kernel/arch/arm/arch_thread_types.h
++++ b/headers/private/kernel/arch/arm/arch_thread_types.h
+@@ -53,6 +53,12 @@ struct arch_thread {
+ 
+ 	struct iframe*	userFrame;
+ 	uint32	oldR0;
++
++	// bring-up aid: where the thread last was in userland
++	uint32	lastUserPC;
++	uint32	lastUserLR;
++	uint32	lastSyscall;
++	uint32	lastCallers[4];
+ };
+ 
+ struct arch_team {
+diff --git a/src/system/kernel/arch/arm/arch_int.cpp b/src/system/kernel/arch/arm/arch_int.cpp
+index a7e87c0b3c..2144e8f990 100644
+--- a/src/system/kernel/arch/arm/arch_int.cpp
++++ b/src/system/kernel/arch/arm/arch_int.cpp
+@@ -312,10 +312,33 @@ arch_arm_syscall(struct iframe *iframe)
+ 
+ 	thread_get_current_thread()->arch_info.userFrame = iframe;
+ 	thread_get_current_thread()->arch_info.oldR0 = iframe->r0;
++	thread_get_current_thread()->arch_info.lastSyscall = syscall;
++	thread_get_current_thread()->arch_info.lastUserPC = iframe->pc;
++	thread_get_current_thread()->arch_info.lastUserLR = iframe->usr_lr;
+ 	thread_at_kernel_entry(system_time());
+ 
+ 	enable_interrupts();
+ 
++	{
++		// bring-up aid: the user callers, following the frame pointers (the
++		// frame pointer points at the saved return address, the previous
++		// frame pointer is right below it)
++		uint32* callers = thread_get_current_thread()->arch_info.lastCallers;
++		uint32 fp = iframe->r11;
++		for (int32 i = 0; i < 4; i++) {
++			uint32 frame[2];
++			if (fp < 8 || !IS_USER_ADDRESS(fp - 4)
++				|| user_memcpy(frame, (void*)(addr_t)(fp - 4), sizeof(frame))
++					!= B_OK) {
++				callers[i] = 0;
++				fp = 0;
++				continue;
++			}
++			callers[i] = frame[1];
++			fp = frame[0];
++		}
++	}
++
+ 	uint64 returnValue = 0;
+ 	syscall_dispatcher(syscall, (void*)args, &returnValue);
+ 
+@@ -594,6 +617,12 @@ arch_arm_irq(struct iframe *iframe)
+ 	arm_log_exception(3, 0, 0, iframe);
+ 	IFrameScope scope(iframe);
+ 
++	if ((iframe->spsr & CPSR_MODE_MASK) == CPSR_MODE_USR) {
++		Thread* current = thread_get_current_thread();
++		current->arch_info.lastUserPC = iframe->pc;
++		current->arch_info.lastUserLR = iframe->usr_lr;
++	}
++
+ 	InterruptController *ic = InterruptController::Get();
+ 	if (ic != NULL)
+ 		ic->HandleInterrupt();
+diff --git a/src/system/kernel/fs/vfs_boot.cpp b/src/system/kernel/fs/vfs_boot.cpp
+index a0f7511740..1c9382bb4c 100644
+--- a/src/system/kernel/fs/vfs_boot.cpp
++++ b/src/system/kernel/fs/vfs_boot.cpp
+@@ -33,6 +33,13 @@
+ #include "vfs_net_boot.h"
+ 
+ #include <ByteOrder.h>
++#include <condition_variable.h>
++#include <lock.h>
++#include <sem.h>
++#include <team.h>
++#include <thread.h>
++#include <util/ThreadAutoLock.h>
++#include <image.h>
+ #include <fcntl.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -248,6 +255,94 @@ esp_write_log(esp_log_file* file, char* buffer, size_t size)
+ }
+ 
+ 
++/*!	Bring-up aid: lists the threads of every userland team, with what they
++	wait for and how much CPU time they used, to see which one hangs.
++*/
++static void
++dump_userland_threads()
++{
++	TeamListIterator teamIterator;
++	while (Team* team = teamIterator.Next()) {
++		BReference<Team> teamReference(team, true);
++		if (team == team_get_kernel_team())
++			continue;
++
++		bool busy = false;
++		TeamLocker teamLocker(team);
++		dprintf("AC100: team %" B_PRId32 " \"%s\"\n", team->id, team->Args());
++		for (Thread* thread = team->thread_list.Head(); thread != NULL;
++				thread = team->thread_list.GetNext(thread)) {
++			char wait[64] = "";
++			if (thread->state == B_THREAD_WAITING) {
++				switch (thread->wait.type) {
++					case THREAD_BLOCK_TYPE_SEMAPHORE:
++					{
++						sem_id sem = (sem_id)(addr_t)thread->wait.object;
++						const char* name = sem_get_name_unsafe(sem);
++						snprintf(wait, sizeof(wait), "sem %" B_PRId32 " \"%s\"",
++							sem, name != NULL ? name : "?");
++						break;
++					}
++					case THREAD_BLOCK_TYPE_CONDITION_VARIABLE:
++					{
++						char type[5] = "";
++						ConditionVariable::DebugGetType(
++							(ConditionVariable*)thread->wait.object, type,
++							sizeof(type));
++						snprintf(wait, sizeof(wait), "cvar \"%s\"", type);
++						break;
++					}
++					case THREAD_BLOCK_TYPE_MUTEX:
++						snprintf(wait, sizeof(wait), "mutex \"%s\"",
++							((mutex*)thread->wait.object)->name);
++						break;
++					case THREAD_BLOCK_TYPE_SNOOZE:
++						strlcpy(wait, "snooze", sizeof(wait));
++						break;
++					case THREAD_BLOCK_TYPE_SIGNAL:
++						strlcpy(wait, "signal", sizeof(wait));
++						break;
++					case THREAD_BLOCK_TYPE_USER:
++						strlcpy(wait, "user", sizeof(wait));
++						break;
++					default:
++						snprintf(wait, sizeof(wait), "type %" B_PRIu16,
++							thread->wait.type);
++						break;
++				}
++			}
++			dprintf("AC100:   thread %" B_PRId32 " \"%s\" state %" B_PRId32
++				" %s, user %" B_PRId64 " ms, kernel %" B_PRId64 " ms, pc %#"
++				B_PRIx32 " lr %#" B_PRIx32 " syscall %" B_PRIu32 "\n",
++				thread->id, thread->name, thread->state, wait,
++				thread->user_time / 1000, thread->kernel_time / 1000,
++				thread->arch_info.lastUserPC, thread->arch_info.lastUserLR,
++				thread->arch_info.lastSyscall);
++			const uint32* callers = thread->arch_info.lastCallers;
++			if (thread->state != B_THREAD_WAITING) {
++				dprintf("AC100:     callers %#" B_PRIx32 " %#" B_PRIx32 " %#"
++					B_PRIx32 " %#" B_PRIx32 "\n", callers[0], callers[1],
++					callers[2], callers[3]);
++			}
++			if (thread->state != B_THREAD_WAITING)
++				busy = true;
++		}
++		teamLocker.Unlock();
++
++		// where the code of a busy team is, to look the PC up
++		if (busy) {
++			int32 cookie = 0;
++			image_info info;
++			while (_get_next_image_info(team->id, &cookie, &info,
++					sizeof(info)) == B_OK) {
++				dprintf("AC100:   image %p %#" B_PRIx32 " %s\n", info.text,
++					(uint32)info.text_size, info.name);
++			}
++		}
++	}
++}
++
++
+ static status_t
+ syslog_to_esp_thread(void*)
+ {
+@@ -276,11 +371,20 @@ syslog_to_esp_thread(void*)
+ 	// can be read off the screen however fast it scrolls
+ 	uint32 writtenLines = 0;
+ 	uint32 writes = 0;
++	int32 threadDumps = 0;
+ 	bigtime_t lastWrite = 0;
+ 	bigtime_t lastReport = system_time();
+ 	while (true) {
+ 		snooze(250000);
+ 
++		// what userland is doing a while after the boot
++		static const bigtime_t kDumpTimes[] = { 90000000, 180000000 };
++		if (threadDumps < (int32)B_COUNT_OF(kDumpTimes)
++			&& system_time() > kDumpTimes[threadDumps]) {
++			dump_userland_threads();
++			threadDumps++;
++		}
++
+ 		if (system_time() - lastReport > 15000000) {
+ 			if (status == B_OK) {
+ 				dprintf("AC100: AC100LOG.TXT ok, %" B_PRIu32 " writes, %"

@@ -1,0 +1,61 @@
+From c2f0fe91cb6e5c37c49c6e76de7867e26ac3b0a6 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 20 Oct 2026 00:22:46 +0200
+Subject: [PATCH 152/203] sdhci: give the command line some time to become free
+
+On NVIDIA Tegra the command inhibit bit can stay set for a moment after a
+command completed, before the next one and right after the response of a
+data command. Wait up to 10ms for it instead of failing the command, and do
+not reset the command line under a data transfer that is running.
+---
+ src/add-ons/kernel/busses/mmc/sdhci.cpp | 29 ++++++++++++++++++++-----
+ 1 file changed, 24 insertions(+), 5 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/mmc/sdhci.cpp b/src/add-ons/kernel/busses/mmc/sdhci.cpp
+index 962794eefc..e2b6cecefa 100644
+--- a/src/add-ons/kernel/busses/mmc/sdhci.cpp
++++ b/src/add-ons/kernel/busses/mmc/sdhci.cpp
+@@ -279,7 +279,13 @@ SdhciBus::ExecuteCommand(uint8_t command, uint32_t argument, uint32_t* response)
+ 	// just say we're busy and the caller can retry later.
+ 	// Note that this should normally never happen: the command line is busy
+ 	// only during command execution, and we don't leave this function with a
+-	// command running.
++	// command running. Some controllers (NVIDIA Tegra) still show it busy
++	// for a moment after the previous command ended, so give it some time.
++	bigtime_t inhibitDeadline = system_time() + 10000;
++	while (fRegisters->present_state.CommandInhibit()
++		&& system_time() < inhibitDeadline) {
++		snooze(50);
++	}
+ 	if (fRegisters->present_state.CommandInhibit()) {
+ 		TRACE_ALWAYS("Command execution impossible, command inhibit\n");
+ 		return B_BUSY;
+@@ -453,11 +459,24 @@ SdhciBus::ExecuteCommand(uint8_t command, uint32_t argument, uint32_t* response)
+ 		return B_ERROR;
+ 	}
+ 
++	// The command line can still be marked busy for a moment after the
++	// response arrived, for example when a write starts sending its data
++	// right away (seen on NVIDIA Tegra)
++	bigtime_t stallDeadline = system_time() + 10000;
++	while (fRegisters->present_state.CommandInhibit()
++		&& system_time() < stallDeadline) {
++		snooze(50);
++	}
+ 	if (fRegisters->present_state.CommandInhibit()) {
+-		TRACE("Command execution failed, card stalled\n");
+-		// Clear the stall
+-		fRegisters->software_reset.ResetCommandLine();
+-		return B_ERROR;
++		ERROR("command %d: command line still busy, state %08" B_PRIx32 "\n",
++			command, fRegisters->present_state.Bits());
++		if (!dataCommand) {
++			// Clear the stall
++			fRegisters->software_reset.ResetCommandLine();
++			return B_ERROR;
++		}
++		// A data transfer is running, the data transfer code waits for its
++		// end and handles errors
+ 	}
+ 
+ 	switch (replyType & Command::kReplySizeMask) {

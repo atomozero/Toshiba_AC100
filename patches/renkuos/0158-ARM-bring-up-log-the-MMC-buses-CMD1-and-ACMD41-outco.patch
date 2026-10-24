@@ -1,0 +1,112 @@
+From f79452cb6f07ecd04d6d08be73f5b099ed3eb0d5 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 20 Oct 2026 00:25:58 +0200
+Subject: [PATCH 158/203] ARM bring-up: log the MMC buses, CMD1 and ACMD41
+ outcomes, failed MMC I/O and the first command timeout of a controller (not
+ for merging)
+
+---
+ .../kernel/bus_managers/mmc/mmc_bus.cpp       |  6 ++++++
+ src/add-ons/kernel/busses/mmc/sdhci.cpp       | 21 +++++++++++++++++++
+ src/add-ons/kernel/busses/mmc/sdhci_fdt.cpp   |  3 +++
+ .../kernel/drivers/disk/mmc/mmc_disk.cpp      |  3 +++
+ 4 files changed, 33 insertions(+)
+
+diff --git a/src/add-ons/kernel/bus_managers/mmc/mmc_bus.cpp b/src/add-ons/kernel/bus_managers/mmc/mmc_bus.cpp
+index 863f261162..10d9601bd6 100644
+--- a/src/add-ons/kernel/bus_managers/mmc/mmc_bus.cpp
++++ b/src/add-ons/kernel/bus_managers/mmc/mmc_bus.cpp
+@@ -42,6 +42,7 @@ MMCBus::MMCBus(device_node* node)
+ 		return;
+ 	}
+ 
++	dprintf("AC100: mmc bus %p on controller %p\n", this, fCookie);
+ 	fScanSemaphore = create_sem(0, "MMC bus scan");
+ 	fLockSemaphore = create_sem(1, "MMC bus lock");
+ 	fInitialScanDone = create_sem(0, "MMC bus initial scan");
+@@ -441,6 +442,9 @@ MMCBus::_WorkerThread(void* cookie)
+ 			} while ((ocr & (1 << 31)) == 0
+ 				&& system_time() - mmcStart < kMMCReadyTimeout);
+ 
++			dprintf("AC100: %p: MMC CMD1: %s, OCR %#" B_PRIx32 " after %"
++				B_PRId64 " ms\n", bus, replied ? "replied" : "no reply", ocr,
++				(system_time() - mmcStart) / 1000);
+ 			if (!replied)
+ 				TRACE("MMC CMD1 got no reply\n");
+ 			else if ((ocr & (1 << 31)) == 0)
+@@ -504,6 +508,8 @@ MMCBus::_WorkerThread(void* cookie)
+ 					snooze(100000);
+ 				}
+ 			} while ((ocr & (1 << 31)) == 0);
++			dprintf("AC100: %p: SD card ready after %" B_PRId64 " ms, OCR %#"
++				B_PRIx32 "\n", bus, (system_time() - readyStart) / 1000, ocr);
+ 		}
+ 
+ 		// FIXME this should be asked to each card, when there are multiple
+diff --git a/src/add-ons/kernel/busses/mmc/sdhci.cpp b/src/add-ons/kernel/busses/mmc/sdhci.cpp
+index 2f19af1f6a..388c63cce7 100644
+--- a/src/add-ons/kernel/busses/mmc/sdhci.cpp
++++ b/src/add-ons/kernel/busses/mmc/sdhci.cpp
+@@ -465,6 +465,27 @@ SdhciBus::ExecuteCommand(uint8_t command, uint32_t argument, uint32_t* response)
+ 		fRegisters->interrupt_status = fCommandResult & kClearableStatusBits;
+ 		if (fCommandResult & SDHCI_INT_COMMAND_TIMEOUT) {
+ 			ERROR("Command execution timed out\n");
++			// bring-up aid: line levels and controller state, once per bus
++			static void* sReported[4];
++			bool reported = false;
++			for (int i = 0; i < 4; i++) {
++				if (sReported[i] == fRegisters)
++					reported = true;
++			}
++			for (int i = 0; !reported && i < 4; i++) {
++				if (sReported[i] == NULL) {
++					sReported[i] = fRegisters;
++					break;
++				}
++			}
++			if (!reported) {
++				dprintf("AC100: sdhci %p CMD%u timeout: present %#" B_PRIx32
++					" power %#x clock %#x host %#x\n", fRegisters, command,
++					fRegisters->present_state.Bits(),
++					fRegisters->power_control.Bits(),
++					fRegisters->clock_control.Bits(),
++					fRegisters->host_control.Bits());
++			}
+ 			// At this point, the "command inhibit" bit is not set yet, it will be set only after
+ 			// another command is sent while the controller is in the timeout state.
+ 			// But resetting the controller state pre-emptively will allow to send another command.
+diff --git a/src/add-ons/kernel/busses/mmc/sdhci_fdt.cpp b/src/add-ons/kernel/busses/mmc/sdhci_fdt.cpp
+index 63b8915585..6eece5582d 100644
+--- a/src/add-ons/kernel/busses/mmc/sdhci_fdt.cpp
++++ b/src/add-ons/kernel/busses/mmc/sdhci_fdt.cpp
+@@ -224,6 +224,7 @@ tegra20_init(fdt_device_module_info* module, fdt_device* dev,
+ {
+ 	uint64 regBase = 0, regLength;
+ 	module->get_reg(dev, 0, &regBase, &regLength);
++	dprintf("AC100: sdhci Tegra controller %#" B_PRIx64 "\n", regBase);
+ 
+ 	// The slot may be powered through a GPIO, which the firmware could have
+ 	// turned off when it was done with the card
+@@ -357,6 +358,8 @@ init_bus_fdt(device_node* node, void** bus_cookie)
+ 		regs, irq);
+ 
+ 	SdhciBus* bus = new(std::nothrow) SdhciBus(registers, irq, false, &quirks);
++	dprintf("AC100: sdhci controller %p at %#" B_PRIx64 ", registers %p\n",
++		bus, regs, registers);
+ 
+ 	status = B_NO_MEMORY;
+ 	if (bus != NULL)
+diff --git a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
+index 2249d9ac51..df88247a43 100644
+--- a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
++++ b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
+@@ -229,6 +229,9 @@ mmc_disk_execute_iorequest(void* data, IOOperation* operation)
+ 		atomic_set(&info->cacheDirty, 1);
+ 
+ 	if (error != B_OK) {
++		dprintf("AC100: mmc_disk CMD%u at %" B_PRIdOFF ", %" B_PRIuGENADDR
++			" bytes failed: %s\n", command, operation->Offset(),
++			operation->Length(), strerror(error));
+ 		info->scheduler->OperationCompleted(operation, error, 0);
+ 		return error;
+ 	}

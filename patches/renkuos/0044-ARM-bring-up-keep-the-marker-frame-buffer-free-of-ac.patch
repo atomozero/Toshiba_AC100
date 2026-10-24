@@ -1,0 +1,33 @@
+From 0d7a9dea779704740f3e02bba0301d6bdd6e7031 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 20:04:26 +0200
+Subject: [PATCH 044/203] ARM bring-up: keep the marker frame buffer free of
+ access/dirty faults (not for merging)
+
+---
+ src/system/kernel/arch/arm/arch_vm.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/system/kernel/arch/arm/arch_vm.cpp b/src/system/kernel/arch/arm/arch_vm.cpp
+index 266ecdeff2..7a82d1b653 100644
+--- a/src/system/kernel/arch/arm/arch_vm.cpp
++++ b/src/system/kernel/arch/arm/arch_vm.cpp
+@@ -17,7 +17,7 @@
+ 
+ #include <vm/vm.h>
+ #include <vm/VMAddressSpace.h>
+-#include <vm/VMTranslationMap.h>
++#include "ARMVMTranslationMap.h"
+ #include <vm/vm_types.h>
+ #include <arch/vm.h>
+ #include <arch/arm/arm_boot_marker.h>
+@@ -121,7 +121,8 @@ arch_vm_init_end(kernel_args *args)
+ 	// frame buffer from the exception vectors, where an access flag or dirty
+ 	// bit fault on it would recurse; mark its pages accessed and modified
+ 	if (args->arch_args.bootMarkerFrameBuffer != 0) {
+-		VMTranslationMap* map = VMAddressSpace::Kernel()->TranslationMap();
++		ARMVMTranslationMap* map = static_cast<ARMVMTranslationMap*>(
++			VMAddressSpace::Kernel()->TranslationMap());
+ 		addr_t start = ROUNDDOWN(args->arch_args.bootMarkerFrameBuffer,
+ 			B_PAGE_SIZE);
+ 		addr_t end = args->arch_args.bootMarkerFrameBuffer

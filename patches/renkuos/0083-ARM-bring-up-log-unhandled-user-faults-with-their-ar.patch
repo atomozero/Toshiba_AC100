@@ -1,0 +1,86 @@
+From 0329cfcae59313dbf85f9b2c60824c2efd15ac00 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 12:50:28 +0200
+Subject: [PATCH 083/203] ARM bring-up: log unhandled user faults with their
+ area, keep the faulting PC/LR, list the images of all teams in the last dump
+ (not for merging)
+
+---
+ src/system/kernel/arch/arm/arch_int.cpp | 6 ++++++
+ src/system/kernel/fs/vfs_boot.cpp       | 9 +++++----
+ src/system/kernel/vm/vm.cpp             | 4 ++--
+ 3 files changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/src/system/kernel/arch/arm/arch_int.cpp b/src/system/kernel/arch/arm/arch_int.cpp
+index 2144e8f990..69faee35ca 100644
+--- a/src/system/kernel/arch/arm/arch_int.cpp
++++ b/src/system/kernel/arch/arm/arch_int.cpp
+@@ -578,6 +578,12 @@ arch_arm_page_fault(struct iframe *frame, addr_t far, uint32 fsr, bool isWrite,
+ 		return;
+ 	}
+ 
++	if (isUser) {
++		// bring-up aid: where a crashing thread was
++		thread->arch_info.lastUserPC = frame->pc;
++		thread->arch_info.lastUserLR = frame->usr_lr;
++	}
++
+ 	enable_interrupts();
+ 
+ 	vm_page_fault(far, frame->pc, isWrite, isExec, isUser, &newip);
+diff --git a/src/system/kernel/fs/vfs_boot.cpp b/src/system/kernel/fs/vfs_boot.cpp
+index f7b44fa1ef..03c454c632 100644
+--- a/src/system/kernel/fs/vfs_boot.cpp
++++ b/src/system/kernel/fs/vfs_boot.cpp
+@@ -266,7 +266,7 @@ extern "C" status_t gPrecacheLastError;
+ 
+ 
+ static void
+-dump_userland_threads()
++dump_userland_threads(bool allImages)
+ {
+ 	dprintf("AC100: prefetch I/O started %" B_PRId32 ", finished %" B_PRId32
+ 		", last start error %s\n", gPrecacheStarted, gPrecacheFinished,
+@@ -377,8 +377,9 @@ dump_userland_threads()
+ 		}
+ 		teamLocker.Unlock();
+ 
+-		// where the code of a busy team is, to look the PC up
+-		if (busy) {
++		// where the code of a busy team is, to look the PC up; on the last
++		// dump for all teams
++		if (busy || (allImages && team != team_get_kernel_team())) {
+ 			int32 cookie = 0;
+ 			image_info info;
+ 			while (_get_next_image_info(team->id, &cookie, &info,
+@@ -429,7 +430,7 @@ syslog_to_esp_thread(void*)
+ 		static const bigtime_t kDumpTimes[] = { 90000000, 180000000 };
+ 		if (threadDumps < (int32)B_COUNT_OF(kDumpTimes)
+ 			&& system_time() > kDumpTimes[threadDumps]) {
+-			dump_userland_threads();
++			dump_userland_threads(threadDumps == (int32)B_COUNT_OF(kDumpTimes) - 1);
+ 			threadDumps++;
+ 		}
+ 
+diff --git a/src/system/kernel/vm/vm.cpp b/src/system/kernel/vm/vm.cpp
+index 2263c9c181..e1199bff31 100644
+--- a/src/system/kernel/vm/vm.cpp
++++ b/src/system/kernel/vm/vm.cpp
+@@ -3820,7 +3820,7 @@ vm_page_fault(addr_t address, addr_t faultAddress, bool isWrite, bool isExecute,
+ 		} else {
+ 			Thread* thread = thread_get_current_thread();
+ 
+-#ifdef TRACE_FAULTS
++#if 1	// bring-up aid, was TRACE_FAULTS
+ 			VMArea* area = NULL;
+ 			if (addressSpace != NULL) {
+ 				addressSpace->ReadLock();
+@@ -3837,7 +3837,7 @@ vm_page_fault(addr_t address, addr_t faultAddress, bool isWrite, bool isExecute,
+ 
+ 			if (addressSpace != NULL)
+ 				addressSpace->ReadUnlock();
+-#endif
++#endif	// bring-up aid
+ 
+ 			// If the thread has a signal handler for SIGSEGV, we simply
+ 			// send it the signal. Otherwise we notify the user debugger

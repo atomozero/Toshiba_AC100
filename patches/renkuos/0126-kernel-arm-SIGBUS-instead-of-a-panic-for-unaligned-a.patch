@@ -1,0 +1,46 @@
+From 3e134698cb75cfb13b5e84e43c49eded8eca3cd5 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 19 Oct 2026 00:10:16 +0200
+Subject: [PATCH 126/203] kernel/arm: SIGBUS instead of a panic for unaligned
+ accesses in userland
+
+An unaligned floating point load in an application (a BPoint in a message
+buffer) took the whole system to the kernel debugger on the AC100. As
+Linux does, only send the offending thread a SIGBUS (BUS_ADRALN); an
+alignment fault in the kernel still panics.
+---
+ src/system/kernel/arch/arm/arch_int.cpp | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/src/system/kernel/arch/arm/arch_int.cpp b/src/system/kernel/arch/arm/arch_int.cpp
+index a7169c92aa..a6d08e6035 100644
+--- a/src/system/kernel/arch/arm/arch_int.cpp
++++ b/src/system/kernel/arch/arm/arch_int.cpp
+@@ -590,7 +590,26 @@ arch_arm_page_fault(struct iframe *frame, addr_t far, uint32 fsr, bool isWrite,
+ 		panic("PXN violation trying to execute user-mapped address 0x%08" B_PRIxADDR " from kernel mode\n",
+ 			far);
+ 	} else if (!isExec && ((fsr & 0x060f) == FSR_FS_ALIGNMENT_FAULT)) {
+-		panic("unhandled alignment exception\n");
++		if (!isUser)
++			panic("unhandled alignment exception\n");
++
++		// e.g. a floating point load from an unaligned address, which ARM
++		// does not do: only the offending team has to go, as in Linux
++		thread->arch_info.userFrame = frame;
++		thread_at_kernel_entry(system_time());
++		enable_interrupts();
++
++		dprintf("AC100: SIGBUS for team %" B_PRId32 " \"%s\": unaligned access "
++			"to %#" B_PRIxADDR " at pc %#" B_PRIx32 "\n", thread->team->id,
++			thread->team->Name(), far, frame->pc);
++		Signal signal(SIGBUS, BUS_ADRALN, B_OK, thread->team->id);
++		signal.SetAddress((void*)far);
++		send_signal_to_thread(thread, signal, 0);
++
++		disable_interrupts();
++		arm_kernel_exit_to_userland(thread, frame,
++			arm_exception_fpu_context(frame));
++		return;
+ 	} else if ((frame->spsr & CPSR_I) != 0) {
+ 		// interrupts disabled
+ 

@@ -1,0 +1,32 @@
+From a6367b2835517e6092ce8fbc8794c8a490c70a58 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 21:45:57 +0200
+Subject: [PATCH 046/203] ARM bring-up: let panics after kernel startup reach
+ the kernel debugger (not for merging)
+
+---
+ src/system/kernel/debug/debug.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/system/kernel/debug/debug.cpp b/src/system/kernel/debug/debug.cpp
+index af8cae9dda..542eeb2deb 100644
+--- a/src/system/kernel/debug/debug.cpp
++++ b/src/system/kernel/debug/debug.cpp
+@@ -2135,14 +2135,15 @@ panic(const char* format, ...)
+ 	{
+ 		// bring-up aid: show the first panic on screen and stop there, as
+ 		// the kernel debugger may not survive this early
++		// Once the kernel is up, the kernel debugger works and shows more.
+ 		static bool sPanicShown = false;
+-		if (sPanicShown) {
++		if (gKernelStartup && sPanicShown) {
+ 			// keep the first panic on screen
+ 			asm volatile ("cpsid aif");
+ 			while (true)
+ 				;
+ 		}
+-		if (!sPanicShown) {
++		if (gKernelStartup) {
+ 			asm volatile ("cpsid aif");
+ 			sPanicShown = true;
+ 			arm_boot_marker(34);

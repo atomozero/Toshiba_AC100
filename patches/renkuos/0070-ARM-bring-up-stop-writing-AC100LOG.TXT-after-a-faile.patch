@@ -1,0 +1,46 @@
+From 9a99f72427da4b8e07a284b4c5af00db972031e9 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 09:21:41 +0200
+Subject: [PATCH 070/203] ARM bring-up: stop writing AC100LOG.TXT after a
+ failed write (not for merging)
+
+---
+ src/system/kernel/fs/vfs_boot.cpp | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/src/system/kernel/fs/vfs_boot.cpp b/src/system/kernel/fs/vfs_boot.cpp
+index f36517898b..7022000fb3 100644
+--- a/src/system/kernel/fs/vfs_boot.cpp
++++ b/src/system/kernel/fs/vfs_boot.cpp
+@@ -268,7 +268,6 @@ syslog_to_esp_thread(void*)
+ 	// there is anything new
+ 	uint32 writtenLines = 0;
+ 	bigtime_t lastWrite = 0;
+-	bool reported = false;
+ 	while (true) {
+ 		snooze(250000);
+ 
+@@ -280,16 +279,19 @@ syslog_to_esp_thread(void*)
+ 
+ 		size_t size = debug_copy_syslog(buffer, kSize, &lines);
+ 		status = esp_write_log(&file, buffer, size);
+-		if (status != B_OK && !reported) {
+-			dprintf("AC100: writing AC100LOG.TXT failed: %s\n",
++		if (status != B_OK) {
++			// leave the disk alone, the boot needs it more than the log
++			dprintf("AC100: writing AC100LOG.TXT failed: %s, giving up\n",
+ 				strerror(status));
+-			reported = true;
++			break;
+ 		}
+ 		writtenLines = lines;
+ 		lastWrite = system_time();
+ 	}
+ 
+-	return B_OK;
++	_kern_close(file.fd);
++	free(buffer);
++	return status;
+ }
+ 
+ 

@@ -1,0 +1,49 @@
+From b03d90bde5ecadb1fba953008c3cdcedbcd94023 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 12:33:31 +0200
+Subject: [PATCH 081/203] kernel/arm: report the right modified flag when
+ unmapping pages
+
+The ARM paging code emulates the dirty bit: a page stays read only
+(AP[2] set) until it is written to, so a clear AP[2] means modified. The
+unmap paths had it the other way round: clean pages were reported as
+modified and modified ones as clean. Clean pages of read only files,
+like the libraries in packagefs, were thus queued for writing back; the
+write never completed, the pages stayed busy, and every team faulting
+on them hung (the desktop never came up). And data written through a
+mapping could be lost.
+---
+ .../arch/arm/paging/32bit/ARMVMTranslationMap32Bit.cpp    | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/src/system/kernel/arch/arm/paging/32bit/ARMVMTranslationMap32Bit.cpp b/src/system/kernel/arch/arm/paging/32bit/ARMVMTranslationMap32Bit.cpp
+index 2a55fd6d33..f0573f8413 100644
+--- a/src/system/kernel/arch/arm/paging/32bit/ARMVMTranslationMap32Bit.cpp
++++ b/src/system/kernel/arch/arm/paging/32bit/ARMVMTranslationMap32Bit.cpp
+@@ -355,13 +355,15 @@ ARMVMTranslationMap32Bit::UnmapPage(VMArea* area, addr_t address,
+ 			// PageUnmapped() will unlock for us
+ 
+ 		PageUnmapped(area, (oldEntry & ARM_PTE_ADDRESS_MASK) / B_PAGE_SIZE,
+-			(oldEntry & ARM_MMU_L2_FLAG_AP0) != 0, (oldEntry & ARM_MMU_L2_FLAG_AP2) != 0,
++			(oldEntry & ARM_MMU_L2_FLAG_AP0) != 0,
++			(oldEntry & ARM_MMU_L2_FLAG_AP2) == 0,
+ 			updatePageQueue);
+ 	} else {
+ 		uint32 flags = PAGE_PRESENT;
+ 		if ((oldEntry & ARM_MMU_L2_FLAG_AP0) != 0)
+ 			flags |= PAGE_ACCESSED;
+-		if ((oldEntry & ARM_MMU_L2_FLAG_AP2) != 0)
++		// AP[2] (read only) is set as long as the page was not written to
++		if ((oldEntry & ARM_MMU_L2_FLAG_AP2) == 0)
+ 			flags |= PAGE_MODIFIED;
+ 		*_flags = flags;
+ 	}
+@@ -425,7 +427,7 @@ ARMVMTranslationMap32Bit::UnmapPages(VMArea* area, addr_t base, size_t size,
+ 				page_num_t page = (oldEntry & ARM_PTE_ADDRESS_MASK) / B_PAGE_SIZE;
+ 				PageUnmapped(area, page,
+ 					(oldEntry & ARM_MMU_L2_FLAG_AP0) != 0,
+-					(oldEntry & ARM_MMU_L2_FLAG_AP2) != 0,
++					(oldEntry & ARM_MMU_L2_FLAG_AP2) == 0,
+ 					updatePageQueue, &queue);
+ 			}
+ 		}

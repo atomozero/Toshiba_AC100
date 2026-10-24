@@ -1,0 +1,26 @@
+From 64c4aa1d2572b13880925e2eaf77cdddc22eaa6d Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 24 Oct 2026 00:51:11 +0200
+Subject: [PATCH 194/203] nvec: the EC switches the power off after some
+ seconds, don't log a failure
+
+---
+ src/add-ons/kernel/busses/i2c/nvec/nvec.cpp | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+index 9cedac25bd..83e7074192 100644
+--- a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
++++ b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+@@ -1278,9 +1278,8 @@ nvec_power_off()
+ 	nvec_write(device, kNoEvents, sizeof(kNoEvents));
+ 	nvec_write(device, kPowerDown, sizeof(kPowerDown));
+ 
+-	// the EC cuts the power once it has read the message
+-	snooze(3000000);
+-	TRACE_ALWAYS("the EC did not switch the power off\n");
++	// the EC cuts the power some seconds after it has read the message
++	TRACE_ALWAYS("power off requested, waiting for the EC\n");
+ }
+ 
+ 

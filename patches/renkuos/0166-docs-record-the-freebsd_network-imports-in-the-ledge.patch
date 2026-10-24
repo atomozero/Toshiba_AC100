@@ -1,0 +1,24 @@
+From 691a02ee3f2015450326bd9ebe2e09da7b8f8f5a Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 20 Oct 2026 18:09:11 +0200
+Subject: [PATCH 166/203] docs: record the freebsd_network imports in the
+ ledger
+
+---
+ UPSTREAM.md | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/UPSTREAM.md b/UPSTREAM.md
+index b7dd1fd396..c1942db5c1 100644
+--- a/UPSTREAM.md
++++ b/UPSTREAM.md
+@@ -28,6 +28,9 @@ upstream honest and the fix attributable.
+ | 2026-10-20 | `12338959e1` | cpu_type.h: split per arch and add arm64 identification | Prerequisite of `e38532af25`: the CPU identification tables are split per architecture, so the ARM vendor and model lookup has a home |
+ | 2026-10-20 | `b0812fef89` | arm64: move MIDR definitions to arch_cpu_type.h and sync with FreeBSD | Prerequisite of `e38532af25`: the MIDR implementer and part numbers it decodes |
+ | 2026-10-20 | `e38532af25` | kernel/arm64: read CPU ID and report vendor/model | Adds the ARM CPU vendors (`B_CPU_VENDOR_ARM`, `B_CPU_VENDOR_NVIDIA`, ...) to OS.h; the 32-bit ARM port needs them to report the CPU, and without them it does not build |
++| 2026-10-20 | `1d73eca40b` | freebsd_network: enable on arm64 | Prerequisite of `ae25f101ad`, which rewrites the same lines |
++| 2026-10-20 | `ae25f101ad` | freebsd_network: use generic bus.h and cpufunc.h for all non-x86 architectures | The FreeBSD compatibility layer did not build for 32-bit ARM, so no FreeBSD network driver could be built there (the USB Ethernet adapters used with the Toshiba AC100) |
++| 2026-10-20 | `5f79cf3d8e` | freebsd_network: add missing bpf stub | Companion of `ae25f101ad`: a stub the drivers need once the layer builds on the other architectures |
+ 
+ ## Declined
+ 

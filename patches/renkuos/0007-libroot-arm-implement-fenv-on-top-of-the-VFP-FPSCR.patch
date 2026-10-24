@@ -1,0 +1,128 @@
+From 05c44a494562605943df6cff343cc0a268c077c9 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 12:33:53 +0200
+Subject: [PATCH 007/203] libroot/arm: implement fenv on top of the VFP FPSCR
+
+The ARM fenv.h came from the FPA era: __rfs()/__wfs() were empty unless
+ARM_HARD_FLOAT was defined (it never is), leaving the variables they
+should fill uninitialized, and fegetround() always returned -1.
+
+glibc's __printf_fp() passes fegetround() to round_away(), which calls
+abort() for an unknown mode, so printing a rounded floating point number
+aborted the program (seen with package_daemon).
+
+Read and write the FPSCR with vmrs/vmsr, map its RMode field to the
+existing FE_* rounding values, use the VFP trap enable bit position and
+define __fe_dfl_env.
+---
+ headers/posix/arch/arm/fenv.h            | 58 ++++++++++++++++++------
+ src/system/libroot/posix/arch/arm/fenv.c |  8 ++--
+ 2 files changed, 48 insertions(+), 18 deletions(-)
+
+diff --git a/headers/posix/arch/arm/fenv.h b/headers/posix/arch/arm/fenv.h
+index 308976c024..2f27df73aa 100644
+--- a/headers/posix/arch/arm/fenv.h
++++ b/headers/posix/arch/arm/fenv.h
+@@ -58,15 +58,23 @@ __BEGIN_DECLS
+ extern const fenv_t	__fe_dfl_env;
+ #define	FE_DFL_ENV	(&__fe_dfl_env)
+ 
+-/* We need to be able to map status flag positions to mask flag positions */
+-#define _FPUSW_SHIFT	16
++/*
++ * The environment is the VFP status and control register (FPSCR). Its
++ * cumulative exception flags (bits 0-4) match the FE_* exception values, the
++ * trap enable bits sit 8 bits higher, and the rounding mode is RMode
++ * (bits 22-23).
++ */
++#define _FPUSW_SHIFT	8
+ #define	_ENABLE_MASK	(FE_ALL_EXCEPT << _FPUSW_SHIFT)
+ 
+-#ifdef	ARM_HARD_FLOAT
+-#define	__rfs(__fpsr)	__asm __volatile("rfs %0" : "=r" (*(__fpsr)))
+-#define	__wfs(__fpsr)	__asm __volatile("wfs %0" : : "r" (__fpsr))
++#define	_FPSCR_RMODE_SHIFT	22
++#define	_FPSCR_RMODE_MASK	(0x3 << _FPSCR_RMODE_SHIFT)
++
++#ifdef	__ARM_FP
++#define	__rfs(__fpsr)	__asm __volatile("vmrs %0, fpscr" : "=r" (*(__fpsr)))
++#define	__wfs(__fpsr)	__asm __volatile("vmsr fpscr, %0" : : "r" (__fpsr))
+ #else
+-#define __rfs(__fpsr)
++#define __rfs(__fpsr)	(*(__fpsr) = 0)
+ #define __wfs(__fpsr)
+ #endif
+ 
+@@ -124,20 +132,44 @@ fetestexcept(int __excepts)
+ static __inline int
+ fegetround(void)
+ {
++	/* FPSCR RMode: nearest, plus infinity, minus infinity, zero */
++	static const int __modes[] = {
++		FE_TONEAREST, FE_UPWARD, FE_DOWNWARD, FE_TOWARDZERO
++	};
++	fexcept_t __fpsr;
+ 
+-	/*
+-	 * Apparently, the rounding mode is specified as part of the
+-	 * instruction format on ARM, so the dynamic rounding mode is
+-	 * indeterminate.  Some FPUs may differ.
+-	 */
+-	return (-1);
++	__rfs(&__fpsr);
++	return (__modes[(__fpsr & _FPSCR_RMODE_MASK) >> _FPSCR_RMODE_SHIFT]);
+ }
+ 
+ static __inline int
+ fesetround(int __round)
+ {
++	fexcept_t __fpsr;
++	uint32_t __rmode;
++
++	switch (__round) {
++	case FE_TONEAREST:
++		__rmode = 0;
++		break;
++	case FE_UPWARD:
++		__rmode = 1;
++		break;
++	case FE_DOWNWARD:
++		__rmode = 2;
++		break;
++	case FE_TOWARDZERO:
++		__rmode = 3;
++		break;
++	default:
++		return (-1);
++	}
+ 
+-	return (-1);
++	__rfs(&__fpsr);
++	__fpsr &= ~_FPSCR_RMODE_MASK;
++	__fpsr |= __rmode << _FPSCR_RMODE_SHIFT;
++	__wfs(__fpsr);
++	return (0);
+ }
+ 
+ static __inline int
+diff --git a/src/system/libroot/posix/arch/arm/fenv.c b/src/system/libroot/posix/arch/arm/fenv.c
+index 406de4a508..3ae4d2b054 100644
+--- a/src/system/libroot/posix/arch/arm/fenv.c
++++ b/src/system/libroot/posix/arch/arm/fenv.c
+@@ -26,13 +26,11 @@
+  * $FreeBSD$
+  */
+ 
+-#if 0 // disabled for now
+-#include <posix/fenv.h>
++#include <fenv.h>
+ 
+ /*
+- * Hopefully the system ID byte is immutable, so it's valid to use
+- * this as a default environment.
++ * The default environment is an all zero FPSCR: no exception flags, no traps,
++ * round to nearest.
+  */
+ const fenv_t __fe_dfl_env = 0;
+-#endif
+ 

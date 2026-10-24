@@ -1,0 +1,43 @@
+From 4f1d30945fc7fc7e22761337b4caa95a35eac121 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 19 Oct 2026 22:07:31 +0200
+Subject: [PATCH 144/203] debug_server: print the link register and the
+ registers on ARM
+
+The scan of the stack does not see the caller of a function that keeps its
+return address in LR.
+---
+ src/servers/debug/DebugServer.cpp | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/src/servers/debug/DebugServer.cpp b/src/servers/debug/DebugServer.cpp
+index bf6bd2a87c..45af15976d 100644
+--- a/src/servers/debug/DebugServer.cpp
++++ b/src/servers/debug/DebugServer.cpp
+@@ -971,6 +971,26 @@ TeamDebugHandler::_PrintStackTrace(thread_id thread)
+ 
+ 		debug_printf("stack trace, current PC %p  %s:\n", ip, symbolBuffer);
+ 
++#if defined(__arm__)
++		// Without frame pointers the scan of the stack cannot see the caller
++		// of a function that keeps its return address in a register.
++		debug_cpu_state cpuState;
++		if (debug_get_cpu_state(&fDebugContext, thread, NULL, &cpuState)
++				== B_OK) {
++			_LookupSymbolAddress(lookupContext, (void*)cpuState.r14,
++				symbolBuffer, sizeof(symbolBuffer) - 1);
++			debug_printf("  LR %p  %s\n", (void*)cpuState.r14, symbolBuffer);
++			debug_printf("  r0 %08lx r1 %08lx r2 %08lx r3 %08lx\n"
++				"  r4 %08lx r5 %08lx r6 %08lx r7 %08lx\n"
++				"  r8 %08lx r9 %08lx r10 %08lx r11 %08lx\n"
++				"  r12 %08lx sp %08lx cpsr %08lx\n",
++				cpuState.r0, cpuState.r1, cpuState.r2, cpuState.r3,
++				cpuState.r4, cpuState.r5, cpuState.r6, cpuState.r7,
++				cpuState.r8, cpuState.r9, cpuState.r10, cpuState.r11,
++				cpuState.r12, cpuState.r13, cpuState.cpsr);
++		}
++#endif
++
+ 		for (int32 i = 0; i < 50; i++) {
+ 			debug_stack_frame_info stackFrameInfo;
+ 

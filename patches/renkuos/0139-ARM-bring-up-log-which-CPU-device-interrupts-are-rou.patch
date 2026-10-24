@@ -1,0 +1,30 @@
+From 3b118b265dcedca4bd9a38bfb0d33f50b1bb10fe Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 19 Oct 2026 20:50:53 +0200
+Subject: [PATCH 139/203] ARM bring-up: log which CPU device interrupts are
+ routed to (not for merging)
+
+---
+ src/system/kernel/arch/arm/arch_int.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/system/kernel/arch/arm/arch_int.cpp b/src/system/kernel/arch/arm/arch_int.cpp
+index 3f94cd5261..d53a217bdd 100644
+--- a/src/system/kernel/arch/arm/arch_int.cpp
++++ b/src/system/kernel/arch/arm/arch_int.cpp
+@@ -106,7 +106,14 @@ arch_int_assign_to_cpu(int32 irq, int32 cpu)
+ 	if (ic == NULL || !sSpreadInterrupts)
+ 		return 0;
+ 
+-	return ic->AssignToCpu(irq, cpu);
++	int32 assigned = ic->AssignToCpu(irq, cpu);
++
++	// bring-up aid: show where the interrupts go (not for merging)
++	static int32 sLogged = 0;
++	if (irq >= 32 && atomic_add(&sLogged, 1) < 64)
++		dprintf("AC100: irq %" B_PRId32 " -> cpu %" B_PRId32 "\n", irq, assigned);
++
++	return assigned;
+ }
+ 
+ 

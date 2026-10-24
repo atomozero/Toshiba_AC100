@@ -1,0 +1,27 @@
+From eeecb5c622ff4c8283b3f7de315474752aeb3e4e Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 19 Oct 2026 19:44:38 +0200
+Subject: [PATCH 136/203] device_manager: get_next_child_node() continues after
+ the last node
+
+The loop that skips the children already traversed never stopped at the
+last one, so only the first matching child could ever be found.
+---
+ src/system/kernel/device_manager/device_manager.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/system/kernel/device_manager/device_manager.cpp b/src/system/kernel/device_manager/device_manager.cpp
+index db6ade41d3..4fa9325353 100644
+--- a/src/system/kernel/device_manager/device_manager.cpp
++++ b/src/system/kernel/device_manager/device_manager.cpp
+@@ -633,8 +633,8 @@ get_next_child_node(device_node* parent, const device_attr* attributes,
+ 	while (iterator.HasNext() && last != NULL) {
+ 		device_node* node = iterator.Next();
+ 
+-		if (node != last)
+-			continue;
++		if (node == last)
++			break;
+ 	}
+ 
+ 	// find the next one that fits

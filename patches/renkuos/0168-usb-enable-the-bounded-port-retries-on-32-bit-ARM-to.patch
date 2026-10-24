@@ -1,0 +1,49 @@
+From e3de3e850de3838e7b3f3de9cef0fc76b446022c Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 20 Oct 2026 19:10:26 +0200
+Subject: [PATCH 168/203] usb: enable the bounded port retries on 32-bit ARM
+ too
+
+On the Toshiba AC100 (Tegra 2) the internal camera, behind the SMSC
+USB2513 hub of the third EHCI controller, comes up at full speed and
+stalls the first SETUP packet. Without the bounded retries its port was
+reset and re-enumerated on every explore pass for the whole session:
+255 failed SET_ADDRESS rounds and 1024 failed transfers in about
+fifteen minutes, enough to fill the boot log.
+
+The retry cap, power cycle and cooldown from 64d38d0286 and 14576fdf3c
+handle exactly this case, so enable them on __arm__ as 9abfa5e06e did
+for x86_64.
+---
+ src/add-ons/kernel/bus_managers/usb/Hub.cpp | 18 ++++++++++--------
+ 1 file changed, 10 insertions(+), 8 deletions(-)
+
+diff --git a/src/add-ons/kernel/bus_managers/usb/Hub.cpp b/src/add-ons/kernel/bus_managers/usb/Hub.cpp
+index c450c0fe9e..a84a613479 100644
+--- a/src/add-ons/kernel/bus_managers/usb/Hub.cpp
++++ b/src/add-ons/kernel/bus_managers/usb/Hub.cpp
+@@ -16,14 +16,16 @@
+ 
+ 
+ // The bounded per-port retry/power-cycle backoff below is enabled on x86,
+-// 32- and 64-bit. It was written for the early-boot behaviour of old
+-// 32-bit-only machines (the Sony VAIO P's Intel SCH companions and its
+-// EC-powered internal devices); on x86_64 it stops a device that keeps
+-// failing setup from being reset several times a second for as long as it
+-// stays plugged in. Those are the only places it has been exercised; every
+-// other architecture keeps servicing a failing port on every poll, exactly
+-// as before. The compiler drops the guarded code entirely.
+-#if defined(__i386__) || defined(__x86_64__)
++// 32- and 64-bit, and on 32-bit ARM. It was written for the early-boot
++// behaviour of old 32-bit-only machines (the Sony VAIO P's Intel SCH
++// companions and its EC-powered internal devices); on x86_64 it stops a
++// device that keeps failing setup from being reset several times a second
++// for as long as it stays plugged in, and so it does on ARM (the internal
++// camera of the Toshiba AC100). Those are the only places it has been
++// exercised; every other architecture keeps servicing a failing port on
++// every poll, exactly as before. The compiler drops the guarded code
++// entirely.
++#if defined(__i386__) || defined(__x86_64__) || defined(__arm__)
+ static const bool kBoundedPortRetries = true;
+ #else
+ static const bool kBoundedPortRetries = false;

@@ -1,0 +1,24 @@
+From 51a986f432d6cbf6454b12405030bae453a5e54e Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 22:32:20 +0200
+Subject: [PATCH 050/203] ARM bring-up: quieter MMC log, log SIGILL (not for
+ merging)
+
+---
+ src/system/kernel/arch/arm/arch_int.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/system/kernel/arch/arm/arch_int.cpp b/src/system/kernel/arch/arm/arch_int.cpp
+index af1dac53ba..a7e87c0b3c 100644
+--- a/src/system/kernel/arch/arm/arch_int.cpp
++++ b/src/system/kernel/arch/arm/arch_int.cpp
+@@ -250,6 +250,9 @@ arch_arm_undefined(struct iframe *iframe)
+ 
+ 		enable_interrupts();
+ 
++		dprintf("AC100: SIGILL for team %" B_PRId32 " \"%s\" at pc %#" B_PRIx32
++			"\n", thread->team->id, thread->team->Name(), iframe->pc - 4);
++
+ 		// the saved PC points behind the undefined instruction
+ 		Signal signal(SIGILL, ILL_ILLOPC, B_OK, thread->team->id);
+ 		signal.SetAddress((void*)(iframe->pc - 4));

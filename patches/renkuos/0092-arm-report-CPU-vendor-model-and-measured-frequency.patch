@@ -1,0 +1,200 @@
+From fa90913b43c138df694d607d66b2fd9a04b47e45 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 14:29:35 +0200
+Subject: [PATCH 092/203] arm: report CPU vendor, model and measured frequency
+
+---
+ .../private/shared/arch/arm64/arch_cpu_type.h | 16 +++-
+ headers/private/shared/cpu_type.h             |  4 +-
+ .../kernel/arch/arm/arch_system_info.cpp      | 87 +++++++++++++++++--
+ 3 files changed, 98 insertions(+), 9 deletions(-)
+
+diff --git a/headers/private/shared/arch/arm64/arch_cpu_type.h b/headers/private/shared/arch/arm64/arch_cpu_type.h
+index ca7897eb44..54fe646e39 100644
+--- a/headers/private/shared/arch/arm64/arch_cpu_type.h
++++ b/headers/private/shared/arch/arm64/arch_cpu_type.h
+@@ -60,6 +60,13 @@
+ /* Part numbers from FreeBSD, sys/arm64/arm64/identcpu.c */
+ 
+ /* ARM Part numbers */
++#define	CPU_PART_CORTEX_A5		0xC05
++#define	CPU_PART_CORTEX_A7		0xC07
++#define	CPU_PART_CORTEX_A8		0xC08
++#define	CPU_PART_CORTEX_A9		0xC09
++#define	CPU_PART_CORTEX_A12		0xC0D
++#define	CPU_PART_CORTEX_A15		0xC0F
++#define	CPU_PART_CORTEX_A17		0xC0E
+ #define	CPU_PART_FOUNDATION		0xD00
+ #define	CPU_PART_CORTEX_A34		0xD02
+ #define	CPU_PART_CORTEX_A53		0xD03
+@@ -184,6 +191,13 @@ struct cpu_implementers {
+  */
+ /* ARM Ltd. */
+ static const struct cpu_parts cpu_parts_arm[] = {
++	{CPU_PART_CORTEX_A5, "Cortex-A5"},
++	{CPU_PART_CORTEX_A7, "Cortex-A7"},
++	{CPU_PART_CORTEX_A8, "Cortex-A8"},
++	{CPU_PART_CORTEX_A9, "Cortex-A9"},
++	{CPU_PART_CORTEX_A12, "Cortex-A12"},
++	{CPU_PART_CORTEX_A15, "Cortex-A15"},
++	{CPU_PART_CORTEX_A17, "Cortex-A17"},
+ 	{CPU_PART_AEM_V8, "AEMv8"},
+ 	{CPU_PART_FOUNDATION, "Foundation-Model"},
+ 	{CPU_PART_CORTEX_A34, "Cortex-A34"},
+@@ -313,7 +327,7 @@ get_cpu_model_string(enum cpu_platform platform, enum cpu_vendor cpuVendor, uint
+ {
+ 	(void)cpuVendor;
+ 
+-	if (platform != B_CPU_ARM_64)
++	if (platform != B_CPU_ARM_64 && platform != B_CPU_ARM)
+ 		return NULL;
+ 
+ 	uint32 impl = CPU_IMPL(cpuModel);
+diff --git a/headers/private/shared/cpu_type.h b/headers/private/shared/cpu_type.h
+index 7d26aebcb3..bfdfb26b30 100644
+--- a/headers/private/shared/cpu_type.h
++++ b/headers/private/shared/cpu_type.h
+@@ -15,8 +15,8 @@
+ // get_cpu_model_string, implemented per architecture
+ #if defined(__i386__) || defined(__x86_64__)
+ #include <arch/x86/arch_cpu_type.h>
+-#elif defined(__aarch64__)
+-// TODO: This should be easy to adapt to arm32 as well
++#elif defined(__aarch64__) || defined(__arm__)
++// the MIDR layout and the part numbers are the same on 32 bit ARM
+ #include <arch/arm64/arch_cpu_type.h>
+ #else
+ 
+diff --git a/src/system/kernel/arch/arm/arch_system_info.cpp b/src/system/kernel/arch/arm/arch_system_info.cpp
+index 1f8c1d3d2b..cb060f6246 100644
+--- a/src/system/kernel/arch/arm/arch_system_info.cpp
++++ b/src/system/kernel/arch/arm/arch_system_info.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ 
++#include <KernelExport.h>
+ #include <OS.h>
+ 
+ #include <arch_cpu.h>
+@@ -17,6 +18,60 @@
+ #include <boot/kernel_args.h>
+ 
+ 
++static cpu_vendor sCPUVendor = B_CPU_VENDOR_UNKNOWN;
++static uint32 sMIDR;
++static uint64 sCPUFrequency;
++
++
++static uint32
++read_cycle_counter()
++{
++	uint32 cycles;
++	asm volatile ("mrc p15, 0, %0, c9, c13, 0" : "=r" (cycles));
++	return cycles;
++}
++
++
++/*!	Measures the clock of the CPU with the cycle counter of its performance
++	monitor, against the system timer. Done when it is first asked for, as
++	the timer does not run yet when the system info is initialized.
++*/
++static uint64
++measure_cpu_frequency()
++{
++	// enable and reset the cycle counter (PMCR.E, PMCR.C), count every
++	// cycle (PMCR.D clear) and enable it (PMCNTENSET bit 31)
++	uint32 control;
++	asm volatile ("mrc p15, 0, %0, c9, c12, 0" : "=r" (control));
++	control = (control & ~(1 << 3)) | (1 << 0) | (1 << 2);
++	asm volatile ("mcr p15, 0, %0, c9, c12, 0" : : "r" (control));
++	asm volatile ("mcr p15, 0, %0, c9, c12, 1" : : "r" (1U << 31));
++	asm volatile ("isb");
++
++	cpu_status state = disable_interrupts();
++	bigtime_t start = system_time();
++	uint32 startCycles = read_cycle_counter();
++	while (system_time() - start < 10000)
++		;
++	uint32 cycles = read_cycle_counter() - startCycles;
++	bigtime_t elapsed = system_time() - start;
++	restore_interrupts(state);
++
++	if (elapsed <= 0)
++		return 0;
++	return (uint64)cycles * 1000000 / elapsed;
++}
++
++
++static uint64
++cpu_frequency()
++{
++	if (sCPUFrequency == 0)
++		sCPUFrequency = measure_cpu_frequency();
++	return sCPUFrequency;
++}
++
++
+ status_t
+ arch_get_system_info(system_info *info, size_t size)
+ {
+@@ -29,18 +84,17 @@ arch_fill_topology_node(cpu_topology_node_info* node, int32 cpu)
+ {
+ 	switch (node->type) {
+ 		case B_TOPOLOGY_ROOT:
+-			// TODO: ARM_64?
+ 			node->data.root.platform = B_CPU_ARM;
+ 			break;
+ 
+ 		case B_TOPOLOGY_PACKAGE:
+-			//TODO node->data.package.vendor = sCPUVendor;
++			node->data.package.vendor = sCPUVendor;
+ 			node->data.package.cache_line_size = CACHE_LINE_SIZE;
+ 			break;
+ 
+ 		case B_TOPOLOGY_CORE:
+-			//TODO node->data.core.model = sPVR;
+-			//TODO node->data.core.default_frequency = sCPUClockFrequency;
++			node->data.core.model = sMIDR;
++			node->data.core.default_frequency = cpu_frequency();
+ 			break;
+ 
+ 		default:
+@@ -52,6 +106,28 @@ arch_fill_topology_node(cpu_topology_node_info* node, int32 cpu)
+ status_t
+ arch_system_info_init(struct kernel_args *args)
+ {
++	asm volatile ("mrc p15, 0, %0, c0, c0, 0" : "=r" (sMIDR));
++
++	// implementer codes, as in the MIDR
++	switch (sMIDR >> 24) {
++		case 0x41:
++			sCPUVendor = B_CPU_VENDOR_ARM;
++			break;
++		case 0x42:
++			sCPUVendor = B_CPU_VENDOR_BROADCOM;
++			break;
++		case 0x4e:
++			sCPUVendor = B_CPU_VENDOR_NVIDIA;
++			break;
++		case 0x51:
++			sCPUVendor = B_CPU_VENDOR_QUALCOMM;
++			break;
++		case 0x56:
++			sCPUVendor = B_CPU_VENDOR_MARVELL;
++			break;
++		default:
++			break;
++	}
+ 	return B_OK;
+ }
+ 
+@@ -59,7 +135,6 @@ arch_system_info_init(struct kernel_args *args)
+ status_t
+ arch_get_frequency(uint64 *frequency, int32 cpu)
+ {
+-	*frequency = 0;
++	*frequency = cpu_frequency();
+ 	return B_OK;
+ }
+-

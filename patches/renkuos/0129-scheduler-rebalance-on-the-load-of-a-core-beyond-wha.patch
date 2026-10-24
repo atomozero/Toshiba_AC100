@@ -1,0 +1,67 @@
+From 244c5da812aef1e14f49092d95c69d90fac64200 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 19 Oct 2026 07:45:43 +0200
+Subject: [PATCH 129/203] scheduler: rebalance on the load of a core beyond
+ what its CPUs can take
+
+rebalance() compared core loads capped at kMaxLoad. With one CPU per core a
+core running two busy threads then looked as loaded as one running a single
+busy thread, the difference never exceeded the load of a thread, and both
+threads shared one CPU while the other one stayed idle. Compare the uncapped
+loads instead.
+---
+ src/system/kernel/scheduler/low_latency.cpp |  9 ++++++---
+ src/system/kernel/scheduler/scheduler_cpu.h | 13 +++++++++++++
+ 2 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/src/system/kernel/scheduler/low_latency.cpp b/src/system/kernel/scheduler/low_latency.cpp
+index bb81211d4b..12fd3470eb 100644
+--- a/src/system/kernel/scheduler/low_latency.cpp
++++ b/src/system/kernel/scheduler/low_latency.cpp
+@@ -116,9 +116,12 @@ rebalance(const ThreadData* threadData)
+ 	ASSERT(other != NULL);
+ 
+ 	// Check if the least loaded core is significantly less loaded than
+-	// the current one.
+-	int32 coreLoad = core->GetLoad();
+-	int32 otherLoad = other->GetLoad();
++	// the current one. Without the cap at kMaxLoad: with one CPU per core a
++	// core with two busy threads would otherwise look as loaded as one with
++	// a single busy thread, and neither thread would ever move to an idle
++	// core.
++	int32 coreLoad = core->GetUncappedLoad();
++	int32 otherLoad = other->GetUncappedLoad();
+ 	if (other == core || otherLoad + kLoadDifference >= coreLoad)
+ 		return core;
+ 
+diff --git a/src/system/kernel/scheduler/scheduler_cpu.h b/src/system/kernel/scheduler/scheduler_cpu.h
+index 1665c51ee0..34f259af6a 100644
+--- a/src/system/kernel/scheduler/scheduler_cpu.h
++++ b/src/system/kernel/scheduler/scheduler_cpu.h
+@@ -157,6 +157,7 @@ public:
+ 											bigtime_t activeTime);
+ 
+ 	inline				int32			GetLoad() const;
++	inline				int32			GetUncappedLoad() const;
+ 	inline				uint32			LoadMeasurementEpoch() const
+ 											{ return fLoadMeasurementEpoch; }
+ 
+@@ -405,6 +406,18 @@ CoreEntry::GetLoad() const
+ }
+ 
+ 
++// the load of the threads assigned to this core, even beyond what its CPUs
++// can take: tells two busy threads on a core from one
++inline int32
++CoreEntry::GetUncappedLoad() const
++{
++	SCHEDULER_ENTER_FUNCTION();
++
++	ASSERT(fCPUCount > 0);
++	return fLoad / fCPUCount;
++}
++
++
+ inline void
+ CoreEntry::AddLoad(int32 load, uint32 epoch, bool updateLoad)
+ {

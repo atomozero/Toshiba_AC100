@@ -1,0 +1,34 @@
+From 50fe2860e3cf7dcfddc103560f09ecabfb0b154f Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 00:04:50 +0200
+Subject: [PATCH 066/203] ehci: no NAK count reload for full and low speed
+ endpoints
+
+The NAK count reload field of a queue head must be zero for full and
+low speed endpoints, which are reached through split transactions
+(EHCI 1.0, section 3.6), as Linux does. The ChipIdea core of the Tegra 2
+halted every transfer to a full speed device behind a high speed hub
+otherwise, so a USB keyboard could not even get an address on the
+Toshiba AC100.
+---
+ src/add-ons/kernel/busses/usb/ehci.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/ehci.cpp b/src/add-ons/kernel/busses/usb/ehci.cpp
+index 5542816f79..7b612e1256 100644
+--- a/src/add-ons/kernel/busses/usb/ehci.cpp
++++ b/src/add-ons/kernel/busses/usb/ehci.cpp
+@@ -3113,7 +3113,12 @@ EHCI::InitQueueHead(ehci_qh *queueHead, Pipe *pipe)
+ 			return B_ERROR;
+ 	}
+ 
+-	queueHead->endpoint_chars |= (3 << EHCI_QH_CHARS_RL_SHIFT)
++	// The NAK count reload must be 0 for full and low speed endpoints, which
++	// are reached through split transactions (EHCI 1.0, 3.6). Some
++	// controllers, like the ChipIdea core of the Tegra 2, halt the transfers
++	// right away otherwise.
++	uint32 nakReload = pipe->Speed() == USB_SPEED_HIGHSPEED ? 3 : 0;
++	queueHead->endpoint_chars |= (nakReload << EHCI_QH_CHARS_RL_SHIFT)
+ 		| (pipe->MaxPacketSize() << EHCI_QH_CHARS_MPL_SHIFT)
+ 		| (pipe->EndpointAddress() << EHCI_QH_CHARS_EPT_SHIFT)
+ 		| (pipe->DeviceAddress() << EHCI_QH_CHARS_DEV_SHIFT)

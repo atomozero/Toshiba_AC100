@@ -1,0 +1,38 @@
+From feb7227f63c7f759b76a2760b82d29eb0728ca91 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 14:38:29 +0200
+Subject: [PATCH 095/203] minimum image: add PowerStatus on ARM
+
+The AC100 has a battery (through the NVEC); the first login script adds
+the replicant to Deskbar when the app is there.
+---
+ build/jam/images/definitions/minimum | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
+index ed19fe86fc..8b0ef3aa5e 100644
+--- a/build/jam/images/definitions/minimum
++++ b/build/jam/images/definitions/minimum
+@@ -138,6 +138,7 @@ SYSTEM_APPS = [ FFilterByBuildFeatures
+ 	Expander
+ 	Installer
+ 	NetworkStatus
++	PowerStatus@arm
+ 	ProcessController
+ 	ShowImage
+ 	StyledEdit
+@@ -159,11 +160,12 @@ DESKBAR_APPLICATIONS =
+ 	Terminal
+ ;
+ 
+-DESKBAR_DESKTOP_APPLETS =
++DESKBAR_DESKTOP_APPLETS = [ FFilterByBuildFeatures
+ 	NetworkStatus
++	PowerStatus@arm
+ 	ProcessController
+ 	Workspaces
+-;
++] ;
+ 
+ SYSTEM_PREFERENCES = [ FFilterByBuildFeatures
+ 	Appearance

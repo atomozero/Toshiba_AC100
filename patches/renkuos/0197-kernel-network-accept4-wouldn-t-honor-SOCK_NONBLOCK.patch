@@ -1,0 +1,155 @@
+From 2549d92132188b77ed80f5335b1d34374e5b96a5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?J=C3=A9r=C3=B4me=20Duval?= <jerome.duval@gmail.com>
+Date: Mon, 14 Sep 2026 17:16:12 +0200
+Subject: [PATCH 197/203] kernel/network: accept4 wouldn't honor SOCK_NONBLOCK
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+* curl tests were completely broken.
+* accept4 should base the state of O_NONBLOCK solely on the presence of SOCK_NONBLOCK.
+For this, we distinguish an accept() call with SOCK_INHERIT. Other uses of create_socket_fd()
+doesn't use spawned sockets.
+
+Change-Id: I67eb91a7cfa0d6d7b5b51a875402aa7775c9b926
+Reviewed-on: https://review.haiku-os.org/c/haiku/+/11748
+Reviewed-by: Jérôme Duval <jerome.duval@gmail.com>
+Reviewed-by: waddlesplash <waddlesplash@gmail.com>
+Tested-by: Commit checker robot <no-reply+buildbot@haiku-os.org>
+(cherry picked from commit 99fee83ce1b78a0afddca41697956109b2aa778b)
+---
+ headers/private/system/socket_defs.h | 13 +++++++++++++
+ src/system/kernel/fs/socket.cpp      | 28 ++++++++++++++++++----------
+ src/system/libnetwork/socket.cpp     | 26 +++++++++++++++++---------
+ 3 files changed, 48 insertions(+), 19 deletions(-)
+ create mode 100644 headers/private/system/socket_defs.h
+
+diff --git a/headers/private/system/socket_defs.h b/headers/private/system/socket_defs.h
+new file mode 100644
+index 0000000000..339dae940b
+--- /dev/null
++++ b/headers/private/system/socket_defs.h
+@@ -0,0 +1,13 @@
++/*
++ * Copyright 2026, Haiku, Inc. All rights reserved.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _SYSTEM_SOCKET_DEFS_H
++#define _SYSTEM_SOCKET_DEFS_H
++
++
++// for accept() inherit behavior
++#define SOCK_INHERIT 0x1
++
++
++#endif	/* _SYSTEM_SOCKET_DEFS_H */
+diff --git a/src/system/kernel/fs/socket.cpp b/src/system/kernel/fs/socket.cpp
+index 468b85b80f..be93d65780 100644
+--- a/src/system/kernel/fs/socket.cpp
++++ b/src/system/kernel/fs/socket.cpp
+@@ -15,6 +15,7 @@
+ #include <AutoDeleter.h>
+ #include <AutoDeleterDrivers.h>
+ 
++#include <socket_defs.h>
+ #include <syscall_utils.h>
+ 
+ #include <fd.h>
+@@ -386,21 +387,28 @@ get_socket_descriptor(int fd, bool kernel, file_descriptor*& descriptor)
+ static int
+ create_socket_fd(net_socket* socket, int flags, bool kernel)
+ {
+-	// Get the socket's non-blocking flag, so we can set the respective
+-	// open mode flag.
+-	int32 nonBlock;
+-	socklen_t nonBlockLen = sizeof(int32);
+-	status_t error = sStackInterface->getsockopt(socket, SOL_SOCKET,
+-		SO_NONBLOCK, &nonBlock, &nonBlockLen);
+-	if (error != B_OK)
+-		return error;
+ 	int oflags = 0;
+ 	if ((flags & SOCK_CLOEXEC) != 0)
+ 		oflags |= O_CLOEXEC;
+ 	if ((flags & SOCK_CLOFORK) != 0)
+ 		oflags |= O_CLOFORK;
+-	if ((flags & SOCK_NONBLOCK) != 0 || nonBlock)
++	if ((flags & SOCK_INHERIT) != 0) {
++		// Get the socket's non-blocking flag, so we can set the respective
++		// open mode flag.
++		int32 nonBlock;
++		socklen_t nonBlockLen = sizeof(nonBlock);
++		status_t error = sStackInterface->getsockopt(socket, SOL_SOCKET,
++			SO_NONBLOCK, &nonBlock, &nonBlockLen);
++		if (error != B_OK)
++			return error;
++		if (nonBlock)
++			oflags |= O_NONBLOCK;
++	} else if ((flags & SOCK_NONBLOCK) != 0) {
+ 		oflags |= O_NONBLOCK;
++		int32 nonBlock = 1;
++		sStackInterface->setsockopt(socket, SOL_SOCKET,
++			SO_NONBLOCK, &nonBlock, sizeof(nonBlock));
++	}
+ 
+ 	// allocate a file descriptor
+ 	file_descriptor* descriptor = alloc_fd();
+@@ -520,7 +528,7 @@ common_accept(int fd, struct sockaddr *address, socklen_t *_addressLength, int f
+ 	GET_SOCKET_FD_OR_RETURN(fd, kernel, descriptor);
+ 	FileDescriptorPutter _(descriptor);
+ 
+-	if ((flags & ~(SOCK_CLOEXEC | SOCK_NONBLOCK | SOCK_CLOFORK)) != 0)
++	if ((flags & ~(SOCK_CLOEXEC | SOCK_NONBLOCK | SOCK_CLOFORK | SOCK_INHERIT)) != 0)
+ 		RETURN_AND_SET_ERRNO(B_BAD_VALUE);
+ 
+ 	net_socket* acceptedSocket;
+diff --git a/src/system/libnetwork/socket.cpp b/src/system/libnetwork/socket.cpp
+index dfc8184346..de832a9d66 100644
+--- a/src/system/libnetwork/socket.cpp
++++ b/src/system/libnetwork/socket.cpp
+@@ -18,6 +18,7 @@
+ #include <sys/ioctl.h>
+ #include <unistd.h>
+ 
++#include <socket_defs.h>
+ #include <syscall_utils.h>
+ 
+ #include <syscalls.h>
+@@ -189,15 +190,8 @@ listen(int socket, int backlog)
+ }
+ 
+ 
+-extern "C" int
+-accept(int socket, struct sockaddr *_address, socklen_t *_addressLength)
+-{
+-	return accept4(socket, _address, _addressLength, 0);
+-}
+-
+-
+-extern "C" int
+-accept4(int socket, struct sockaddr *_address, socklen_t *_addressLength, int flags)
++static int
++_accept(int socket, struct sockaddr *_address, socklen_t *_addressLength, int flags)
+ {
+ 	bool r5compatible = check_r5_compatibility();
+ 	struct sockaddr haikuAddr;
+@@ -233,6 +227,20 @@ accept4(int socket, struct sockaddr *_address, socklen_t *_addressLength, int fl
+ }
+ 
+ 
++extern "C" int
++accept(int socket, struct sockaddr *_address, socklen_t *_addressLength)
++{
++	return _accept(socket, _address, _addressLength, SOCK_INHERIT);
++}
++
++
++extern "C" int
++accept4(int socket, struct sockaddr *_address, socklen_t *_addressLength, int flags)
++{
++	return _accept(socket, _address, _addressLength, flags);
++}
++
++
+ extern "C" ssize_t
+ recv(int socket, void *data, size_t length, int flags)
+ {

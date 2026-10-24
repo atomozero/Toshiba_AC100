@@ -1,0 +1,103 @@
+From 14ce6df75868231a880363f8058254e93f1efb9f Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 16:08:03 +0200
+Subject: [PATCH 016/203] ARM bring-up: show marker values as hex digits (not
+ for merging)
+
+---
+ .../private/kernel/arch/arm/arm_boot_marker.h | 72 ++++++++++++++-----
+ 1 file changed, 56 insertions(+), 16 deletions(-)
+
+diff --git a/headers/private/kernel/arch/arm/arm_boot_marker.h b/headers/private/kernel/arch/arm/arm_boot_marker.h
+index 183580c769..e883b7a0f5 100644
+--- a/headers/private/kernel/arch/arm/arm_boot_marker.h
++++ b/headers/private/kernel/arch/arm/arm_boot_marker.h
+@@ -49,32 +49,72 @@ arm_boot_marker_draw(uint8* frameBuffer, uint32 bytesPerRow, uint32 depth,
+ }
+ 
+ 
+-/*!	Draws \a value as 32 squares (most significant bit first) in row \a row
+-	below the stage markers: white for 1, gray for 0, a gap every 8 bits.
++/*!	Draws \a value as 8 large hexadecimal digits on a black background, in
++	text line \a row below the stage markers, preceded by a square in the
++	stage marker color of \a row (row 3 red, 4 green, 5 blue, 6 yellow...).
+ */
+ static inline void
+ arm_boot_marker_draw_value(uint8* frameBuffer, uint32 bytesPerRow,
+ 	uint32 depth, int row, uint32 value)
+ {
+-	const int kSize = 10;
++	// 5x7 font for 0-9 and A-F, one byte per line, bit 4 is the left column
++	static const uint8 kFont[16][7] = {
++		{ 0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e },	// 0
++		{ 0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e },	// 1
++		{ 0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f },	// 2
++		{ 0x1f, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0e },	// 3
++		{ 0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02 },	// 4
++		{ 0x1f, 0x10, 0x1e, 0x01, 0x01, 0x11, 0x0e },	// 5
++		{ 0x06, 0x08, 0x10, 0x1e, 0x11, 0x11, 0x0e },	// 6
++		{ 0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08 },	// 7
++		{ 0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e },	// 8
++		{ 0x0e, 0x11, 0x11, 0x0f, 0x01, 0x02, 0x0c },	// 9
++		{ 0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11 },	// A
++		{ 0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e },	// B
++		{ 0x0e, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0e },	// C
++		{ 0x1c, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1c },	// D
++		{ 0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f },	// E
++		{ 0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x10 },	// F
++	};
++	static const uint32 kColors32[] = {
++		0xff0000, 0x00ff00, 0x0000ff, 0xffff00, 0xff00ff, 0x00ffff, 0xffffff
++	};
++	static const uint16 kColors16[] = {
++		0xf800, 0x07e0, 0x001f, 0xffe0, 0xf81f, 0x07ff, 0xffff
++	};
++	const int kScale = 3;
++	const int kLineHeight = 7 * kScale + 9;
++	const int kLeft = 40;
+ 
+ 	if (frameBuffer == NULL)
+ 		return;
+ 
+-	for (int bit = 0; bit < 32; bit++) {
+-		bool set = (value & (1U << (31 - bit))) != 0;
+-		uint32 color32 = set ? 0xffffff : 0x505050;
+-		uint16 color16 = set ? 0xffff : 0x528a;
+-		int left = 8 + bit * (kSize + 4) + (bit / 8) * 10;
+-		int top = 36 + row * (kSize + 8);
+-		for (int y = 0; y < kSize; y++) {
+-			uint8* line = frameBuffer + (top + y) * bytesPerRow;
+-			for (int x = left; x < left + kSize; x++) {
+-				if (depth == 32)
+-					((volatile uint32*)line)[x] = color32;
+-				else if (depth == 16)
+-					((volatile uint16*)line)[x] = color16;
++	int top = 40 + row * kLineHeight;
++	int width = 30 + 8 * 6 * kScale + 8;
++	int color = (row + 4) % 7;
++		// row 3 red, 4 green, 5 blue, 6 yellow
++
++	for (int y = top - 4; y < top + 7 * kScale + 4; y++) {
++		uint8* line = frameBuffer + y * bytesPerRow;
++		for (int x = kLeft - 4; x < kLeft + width; x++) {
++			bool square = x < kLeft + 18 && y >= top && y < top + 18;
++			bool pixel = false;
++			int digitX = x - (kLeft + 30);
++			int digitY = y - top;
++			if (!square && digitX >= 0 && digitX < 8 * 6 * kScale && digitY >= 0
++				&& digitY < 7 * kScale) {
++				int digit = digitX / (6 * kScale);
++				int column = (digitX % (6 * kScale)) / kScale;
++				int nibble = (value >> (28 - digit * 4)) & 0xf;
++				pixel = column < 5
++					&& (kFont[nibble][digitY / kScale] & (0x10 >> column)) != 0;
+ 			}
++			uint32 c32 = square ? kColors32[color] : (pixel ? 0xffffff : 0);
++			uint16 c16 = square ? kColors16[color] : (pixel ? 0xffff : 0);
++			if (depth == 32)
++				((volatile uint32*)line)[x] = c32;
++			else if (depth == 16)
++				((volatile uint16*)line)[x] = c16;
+ 		}
+ 	}
+ }

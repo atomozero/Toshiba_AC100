@@ -1,0 +1,103 @@
+From 6b934e98f6ef1f0da06425d1cd2f3af6ee722f64 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 24 Oct 2026 10:35:30 +0200
+Subject: [PATCH 201/203] efi/arm: run the Tegra20 system clock at 200 MHz on
+ the AC100
+
+The firmware leaves SCLK (and the AHB) at 108 MHz from PLL P, and the
+EHCI driver moves it to 72 MHz to free PLLP_OUT4 for the ULPI PHY; the
+APB runs at the same rate. Switch SCLK to PLLC_OUT1 at up to 200 MHz,
+the maximum of the Tegra 2 TRM, with the APB at half of it, as Linux
+runs it from PLL C. PLL C keeps its rate (600 MHz on the AC100, host1x
+uses it); only its OUT1 divider is set.
+
+The same register values were applied by hand on a running AC100, which
+kept working (Wi-Fi, USB, SD and eMMC reads, memory tests).
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../boot/platform/efi/arch/arm/arch_dtb.cpp   | 64 +++++++++++++++++++
+ 1 file changed, 64 insertions(+)
+
+diff --git a/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp b/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp
+index d7009721ee..26245ced12 100644
+--- a/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp
++++ b/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp
+@@ -329,6 +329,68 @@ arch_quiesce_usb(void)
+ }
+ 
+ 
++/*!	Runs the system clock (SCLK, and the AHB with it) of a Tegra20 at up to
++	200 MHz, its maximum, and the APB at half of it, from PLL C, as Linux does.
++	The firmware of the AC100 leaves it at 108 MHz from PLL P, and the EHCI
++	driver later moves it to 72 MHz when it needs that PLL P output for the
++	ULPI PHY. PLL C keeps its rate: only its OUT1 divider changes, which
++	nothing else uses.
++*/
++static void
++raise_system_clock(void)
++{
++	if (sTegraCARRegs.start == 0)
++		return;
++
++	addr_t car = (addr_t)sTegraCARRegs.start;
++	volatile uint32* sclkPolicy = (volatile uint32*)(car + 0x28);
++	volatile uint32* systemRate = (volatile uint32*)(car + 0x30);
++	volatile uint32* pllcBase = (volatile uint32*)(car + 0x80);
++	volatile uint32* pllcOut = (volatile uint32*)(car + 0x84);
++
++	// OSC_CTRL frequency: 13, 19.2, 12 or 26 MHz
++	static const uint32 kOscillatorKHz[] = { 13000, 19200, 12000, 26000 };
++	uint32 oscillator = kOscillatorKHz[*(volatile uint32*)(car + 0x50) >> 30];
++
++	// PLL C: enabled, not bypassed (the lock bit only means something with
++	// lock detection enabled in PLLC_MISC, which the firmware leaves off)
++	uint32 base = *pllcBase;
++	if ((base & (3U << 30)) != (1U << 30)) {
++		dprintf("SCLK: PLL C not running (%#" B_PRIx32 "), left alone\n",
++			base);
++		return;
++	}
++	uint32 m = base & 0x1f;
++	uint32 n = (base >> 8) & 0x3ff;
++	uint32 p = (base >> 20) & 7;
++	if (m == 0)
++		return;
++	uint32 pllcKHz = (uint32)((uint64)oscillator * n / m) >> p;
++
++	// OUT1 = PLL C / ((ratio + 2) / 2), at most 200 MHz
++	const uint32 kMaxKHz = 200000;
++	uint32 ratio = (2 * pllcKHz + kMaxKHz - 1) / kMaxKHz;
++	ratio = ratio > 2 ? ratio - 2 : 0;
++	if (ratio > 0xff)
++		return;
++	uint32 sclkKHz = 2 * pllcKHz / (ratio + 2);
++
++	*pllcOut = (ratio << 8) | 3;
++		// the divider out of reset, its clock enabled
++	for (volatile int i = 0; i < 1000; i++)
++		;
++
++	// APB at half of the AHB first, so that it never runs above 100 MHz
++	*systemRate = 1;
++	// run from PLLC_OUT1 (source 1), idle from clk_m as before
++	*sclkPolicy = (*sclkPolicy & ~0xf0U) | (1U << 4);
++
++	dprintf("SCLK: PLL C %" B_PRIu32 " kHz, SCLK/AHB %" B_PRIu32 " kHz, APB %"
++		B_PRIu32 " kHz (policy %#" B_PRIx32 ")\n", pllcKHz, sclkKHz,
++		sclkKHz / 2, *sclkPolicy);
++}
++
++
+ /*!	Switches the radios of rfkill-gpio nodes on, as Linux does when they are
+ 	not blocked: drives their GPIOs active, as outputs in GPIO mode.
+ */
+@@ -367,6 +429,8 @@ void
+ arch_dtb_set_kernel_args(void)
+ {
+ 	enable_radio_gpios();
++	if (sIsAC100)
++		raise_system_clock();
+ 
+ 	// bring-up aid: record the state the firmware left the CPU in
+ 	uint32* debug = gKernelArgs.arch_args.bootDebug;

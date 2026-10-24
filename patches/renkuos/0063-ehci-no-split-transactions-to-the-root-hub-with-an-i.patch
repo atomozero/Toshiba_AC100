@@ -1,0 +1,40 @@
+From 99926234282183c9cbf531c485370d943ee14b04 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 17 Oct 2026 23:34:48 +0200
+Subject: [PATCH 063/203] ehci: no split transactions to the root hub with an
+ integrated TT
+
+Full and low speed devices on a root port of a controller with an
+integrated transaction translator are reached directly; the queue heads
+were set up with the root hub as the hub to split the transactions to,
+and the controller halted every transfer to such a device right away
+(e.g. a USB keyboard on the Toshiba AC100 could not get its address).
+Leave the hub address and port 0 in that case, like Linux does for TDI
+controllers.
+---
+ src/add-ons/kernel/busses/usb/ehci.cpp | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/ehci.cpp b/src/add-ons/kernel/busses/usb/ehci.cpp
+index dd30a497ea..7a5617c327 100644
+--- a/src/add-ons/kernel/busses/usb/ehci.cpp
++++ b/src/add-ons/kernel/busses/usb/ehci.cpp
+@@ -3112,8 +3112,16 @@ EHCI::InitQueueHead(ehci_qh *queueHead, Pipe *pipe)
+ 		if ((pipe->Type() & USB_OBJECT_CONTROL_PIPE) != 0)
+ 			queueHead->endpoint_chars |= EHCI_QH_CHARS_CONTROL;
+ 
+-		queueHead->endpoint_caps |= (pipe->HubPort() << EHCI_QH_CAPS_PORT_SHIFT)
+-			| (pipe->HubAddress() << EHCI_QH_CAPS_HUB_SHIFT);
++		// With an integrated transaction translator, a full or low speed
++		// device on a root port is reached without a split transaction to
++		// some hub: the hub address and port must stay 0, as Linux does for
++		// TDI controllers.
++		if ((fFlags & kIntegratedTT) == 0
++			|| pipe->HubAddress() != fRootHubAddress) {
++			queueHead->endpoint_caps
++				|= (pipe->HubPort() << EHCI_QH_CAPS_PORT_SHIFT)
++				| (pipe->HubAddress() << EHCI_QH_CAPS_HUB_SHIFT);
++		}
+ 	}
+ 
+ 	return B_OK;

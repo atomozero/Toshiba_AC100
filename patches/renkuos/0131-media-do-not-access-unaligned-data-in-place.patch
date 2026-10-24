@@ -1,0 +1,222 @@
+From d271df3873f4c011c4d58b2f5af6ceee1d76b1e1 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 19 Oct 2026 09:34:59 +0200
+Subject: [PATCH 131/203] media: do not access unaligned data in place
+
+On ARM media_server and media_addon_server died with SIGBUS at start:
+dormant_flavor_info::Flatten() and Unflatten() accessed the values after the
+strings in place, unaligned, and the compiler uses multi-word loads and
+stores for them; and the requests were read into a char buffer on the stack
+and used in place. Copy the flattened values with memcpy() and align the
+request buffers.
+---
+ src/kits/media/MediaAddOn.cpp                | 74 +++++++++++++-------
+ src/kits/media/MediaNode.cpp                 |  4 +-
+ src/servers/media/media_server.cpp           |  4 +-
+ src/servers/media_addon/MediaAddonServer.cpp |  4 +-
+ 4 files changed, 57 insertions(+), 29 deletions(-)
+
+diff --git a/src/kits/media/MediaAddOn.cpp b/src/kits/media/MediaAddOn.cpp
+index 569abd07c1..b716f93632 100644
+--- a/src/kits/media/MediaAddOn.cpp
++++ b/src/kits/media/MediaAddOn.cpp
+@@ -36,6 +36,26 @@
+ #include "DataExchange.h"
+ 
+ 
++// The flattened data is packed: the values after the strings are unaligned.
++// Copy them byte-wise, a direct access can fault on some CPUs (ARM).
++template<typename Type>
++static inline void
++write_flat(char* buffer, const Type& value)
++{
++	memcpy(buffer, &value, sizeof(Type));
++}
++
++
++template<typename Type>
++static inline Type
++read_flat(const char* buffer)
++{
++	Type value;
++	memcpy(&value, buffer, sizeof(Type));
++	return value;
++}
++
++
+ #define MAX_FLAVOR_IN_FORMAT_COUNT	300
+ #define MAX_FLAVOR_OUT_FORMAT_COUNT	300
+ 
+@@ -334,40 +354,41 @@ dormant_flavor_info::Flatten(void *buffer, ssize_t size) const
+ 	}
+ 
+ 	// magic
+-	*(int32*)buf = FLATTEN_MAGIC; buf += sizeof(int32);
++	write_flat<int32>(buf, FLATTEN_MAGIC); buf += sizeof(int32);
+ 
+ 	// size
+-	*(int32*)buf = FlattenedSize(); buf += sizeof(int32);
++	write_flat<int32>(buf, FlattenedSize()); buf += sizeof(int32);
+ 
+ 	// struct flavor_info
+-	*(int32*)buf = nameLength; buf += sizeof(int32);
++	write_flat<int32>(buf, nameLength); buf += sizeof(int32);
+ 	if (nameLength > 0) {
+ 		memcpy(buf, name, nameLength);
+ 		buf += nameLength;
+ 	}
+-	*(int32*)buf = infoLength; buf += sizeof(int32);
++	write_flat<int32>(buf, infoLength); buf += sizeof(int32);
+ 	if (infoLength > 0) {
+ 		memcpy(buf, info, infoLength);
+ 		buf += infoLength;
+ 	}
+ 
+-	*(uint64*)buf = kinds; buf += sizeof(uint64);
+-	*(uint32*)buf = flavor_flags; buf += sizeof(uint32);
+-	*(int32*)buf = internal_id; buf += sizeof(int32);
+-	*(int32*)buf = possible_count; buf += sizeof(int32);
+-	*(int32*)buf = inFormatCount; buf += sizeof(int32);
+-	*(uint32*)buf = in_format_flags; buf += sizeof(uint32);
++	write_flat<uint64>(buf, kinds); buf += sizeof(uint64);
++	write_flat<uint32>(buf, flavor_flags); buf += sizeof(uint32);
++	write_flat<int32>(buf, internal_id); buf += sizeof(int32);
++	write_flat<int32>(buf, possible_count); buf += sizeof(int32);
++	write_flat<int32>(buf, inFormatCount); buf += sizeof(int32);
++	write_flat<uint32>(buf, in_format_flags); buf += sizeof(uint32);
+ 
+ 	// XXX FIXME! we should not!!! make flat copies	of media_format
+ 	memcpy(buf, in_formats, inFormatSize); buf += inFormatSize;
+ 
+-	*(int32*)buf = outFormatCount; buf += sizeof(int32);
+-	*(uint32*)buf = out_format_flags; buf += sizeof(uint32);
++	write_flat<int32>(buf, outFormatCount); buf += sizeof(int32);
++	write_flat<uint32>(buf, out_format_flags); buf += sizeof(uint32);
+ 
+ 	// XXX FIXME! we should not!!! make flat copies	of media_format
+ 	memcpy(buf, out_formats, outFormatSize); buf += outFormatSize;
+ 
+-	*(dormant_node_info*)buf = node_info; buf += sizeof(dormant_node_info);
++	write_flat<dormant_node_info>(buf, node_info);
++	buf += sizeof(dormant_node_info);
+ 
+ 	return B_OK;
+ }
+@@ -386,12 +407,12 @@ dormant_flavor_info::Unflatten(type_code c, const void *buffer, ssize_t size)
+ 	int32 infoLength;
+ 
+ 	// check magic
+-	if (*(int32*)buf != FLATTEN_MAGIC)
++	if (read_flat<int32>(buf) != FLATTEN_MAGIC)
+ 		return B_ERROR;
+ 	buf += sizeof(int32);
+ 
+ 	// check size
+-	if (*(uint32*)buf > (uint32)size)
++	if (read_flat<uint32>(buf) > (uint32)size)
+ 		return B_ERROR;
+ 	buf += sizeof(int32);
+ 
+@@ -407,7 +428,7 @@ dormant_flavor_info::Unflatten(type_code c, const void *buffer, ssize_t size)
+ 	out_format_count = 0;
+ 
+ 	// struct flavor_info
+-	nameLength = *(int32*)buf; buf += sizeof(int32);
++	nameLength = read_flat<int32>(buf); buf += sizeof(int32);
+ 	if (nameLength >= 0) { // if nameLength is -1, we leave name = 0
+ 		char* nameStorage = new(std::nothrow) char [nameLength + 1];
+ 		name = nameStorage;
+@@ -418,7 +439,7 @@ dormant_flavor_info::Unflatten(type_code c, const void *buffer, ssize_t size)
+ 		}
+ 	}
+ 
+-	infoLength = *(int32*)buf; buf += sizeof(int32);
++	infoLength = read_flat<int32>(buf); buf += sizeof(int32);
+ 	if (infoLength >= 0) { // if infoLength is -1, we leave info = 0
+ 		char* infoStorage = new(std::nothrow) char [infoLength + 1];
+ 		info = infoStorage;
+@@ -431,12 +452,12 @@ dormant_flavor_info::Unflatten(type_code c, const void *buffer, ssize_t size)
+ 
+ 	int32 count;
+ 
+-	kinds = *(uint64*)buf; buf += sizeof(uint64);
+-	flavor_flags = *(uint32*)buf; buf += sizeof(uint32);
+-	internal_id = *(int32*)buf; buf += sizeof(int32);
+-	possible_count = *(int32*)buf; buf += sizeof(int32);
+-	count = *(int32*)buf; buf += sizeof(int32);
+-	in_format_flags = *(uint32*)buf; buf += sizeof(uint32);
++	kinds = read_flat<uint64>(buf); buf += sizeof(uint64);
++	flavor_flags = read_flat<uint32>(buf); buf += sizeof(uint32);
++	internal_id = read_flat<int32>(buf); buf += sizeof(int32);
++	possible_count = read_flat<int32>(buf); buf += sizeof(int32);
++	count = read_flat<int32>(buf); buf += sizeof(int32);
++	in_format_flags = read_flat<uint32>(buf); buf += sizeof(uint32);
+ 
+ 	if (count > 0) {
+ 		if (count <= MAX_FLAVOR_IN_FORMAT_COUNT) {
+@@ -453,8 +474,8 @@ dormant_flavor_info::Unflatten(type_code c, const void *buffer, ssize_t size)
+ 		}
+ 	}
+ 
+-	count = *(int32*)buf; buf += sizeof(int32);
+-	out_format_flags = *(uint32*)buf; buf += sizeof(uint32);
++	count = read_flat<int32>(buf); buf += sizeof(int32);
++	out_format_flags = read_flat<uint32>(buf); buf += sizeof(uint32);
+ 
+ 	if (count > 0) {
+ 		if (count <= MAX_FLAVOR_OUT_FORMAT_COUNT) {
+@@ -471,7 +492,8 @@ dormant_flavor_info::Unflatten(type_code c, const void *buffer, ssize_t size)
+ 		}
+ 	}
+ 
+-	node_info = *(dormant_node_info*)buf; buf += sizeof(dormant_node_info);
++	node_info = read_flat<dormant_node_info>(buf);
++	buf += sizeof(dormant_node_info);
+ 
+ 	return B_OK;
+ }
+diff --git a/src/kits/media/MediaNode.cpp b/src/kits/media/MediaNode.cpp
+index b779ec1439..68aa307aa0 100644
+--- a/src/kits/media/MediaNode.cpp
++++ b/src/kits/media/MediaNode.cpp
+@@ -358,7 +358,9 @@ BMediaNode::WaitForMessage(bigtime_t waitUntil, uint32 flags,
+ 	// waitUntil or a message is received on the control port.
+ 	// The flags are currently unused and should be 0.
+ 	// Note: about 16 KByte stack used
+-	char data[B_MEDIA_MESSAGE_SIZE];
++	// aligned: the requests are read in place, some CPUs (ARM) fault on
++	// unaligned multi-word accesses
++	char data[B_MEDIA_MESSAGE_SIZE] __attribute__((aligned(8)));
+ 	int32 message;
+ 	ssize_t size;
+ 
+diff --git a/src/servers/media/media_server.cpp b/src/servers/media/media_server.cpp
+index 071792a0e6..561eeec68a 100644
+--- a/src/servers/media/media_server.cpp
++++ b/src/servers/media/media_server.cpp
+@@ -907,7 +907,9 @@ ServerApp::_ControlThread(void* _server)
+ {
+ 	ServerApp* server = (ServerApp*)_server;
+ 
+-	char data[B_MEDIA_MESSAGE_SIZE];
++	// aligned: the requests are read in place, some CPUs (ARM) fault on
++	// unaligned multi-word accesses
++	char data[B_MEDIA_MESSAGE_SIZE] __attribute__((aligned(8)));
+ 	ssize_t size;
+ 	int32 code;
+ 	while ((size = read_port_etc(server->_ControlPort(), &code, data,
+diff --git a/src/servers/media_addon/MediaAddonServer.cpp b/src/servers/media_addon/MediaAddonServer.cpp
+index 1b4e491c28..f2b1d9fa84 100644
+--- a/src/servers/media_addon/MediaAddonServer.cpp
++++ b/src/servers/media_addon/MediaAddonServer.cpp
+@@ -428,7 +428,9 @@ MediaAddonServer::_ControlThread(void* _server)
+ {
+ 	MediaAddonServer* server = (MediaAddonServer*)_server;
+ 
+-	char data[B_MEDIA_MESSAGE_SIZE];
++	// aligned: the requests are read in place, some CPUs (ARM) fault on
++	// unaligned multi-word accesses
++	char data[B_MEDIA_MESSAGE_SIZE] __attribute__((aligned(8)));
+ 	ssize_t size;
+ 	int32 code;
+ 	while ((size = read_port_etc(server->_ControlPort(), &code, data,

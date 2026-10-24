@@ -1,0 +1,174 @@
+From 886ebb523229185d76537fb68856e69ff83c85aa Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 18 Oct 2026 16:38:33 +0200
+Subject: [PATCH 103/203] nvec: backlight keys, power button only from variable
+ size events
+
+The backlight up and down keys (e0 39, e0 3a, unmapped in Linux' table)
+change the duty cycle of the Tegra PWM driving the backlight, when the
+firmware left its clock running; the PWM state found is logged.
+
+As in Linux, only the power button comes as a variable size keyboard event:
+recognize it there only, e0 5e in a 3 byte event is another key.
+---
+ src/add-ons/kernel/busses/i2c/nvec/nvec.cpp | 90 +++++++++++++++++++--
+ 1 file changed, 83 insertions(+), 7 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+index c8caf4462c..83cee83941 100644
+--- a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
++++ b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+@@ -79,6 +79,12 @@
+ #define TEGRA_PINMUX_TRI_DTF		0x20	// tristate register, bit 12
+ #define TEGRA_PINMUX_MUX_DTF		0x98	// mux register, bits 30-31
+ #define TEGRA20_GPIO_BASE			0x6000d000
++#define TEGRA20_PWM_BASE			0x7000a000	// channel 0: backlight
++#define TEGRA20_CLK_PWM				17
++#define TEGRA_PWM_ENABLE			(1U << 31)
++#define TEGRA_PWM_DUTY_SHIFT		16
++#define TEGRA_PWM_DUTY_MASK			(0x1ffU << 16)	// 0 - 256
++#define BACKLIGHT_LEVELS			16
+ #define TEGRA_GPIO_REG(gpio, reg)	(((gpio) / 32) * 0x80 \
+ 										+ (((gpio) / 8) % 4) * 4 + (reg))
+ #define TEGRA_GPIO_CNF				0x00
+@@ -159,6 +165,9 @@ struct nvec_device {
+ 	area_id				registersArea;
+ 	volatile uint8*		registers;
+ 	area_id				gpioArea;
++	area_id				pwmArea;
++	volatile uint32*	pwm;			// backlight, if its clock runs
++	int32				backlightLevel;	// 1 - BACKLIGHT_LEVELS
+ 	volatile uint8*		gpio;
+ 	uint32				requestGPIO;
+ 	bool				requestActiveLow;
+@@ -671,6 +680,67 @@ put_key(nvec_device* device, uint32 keycode, bool down)
+ }
+ 
+ 
++/*!	The backlight keys (Fn + F4 and F5) change the duty cycle of the PWM
++	driving the backlight, if the firmware left it running.
++*/
++static void
++change_backlight(nvec_device* device, int32 delta)
++{
++	if (device->pwm == NULL)
++		return;
++
++	int32 level = device->backlightLevel + delta;
++	if (level < 1)
++		level = 1;
++	if (level > BACKLIGHT_LEVELS)
++		level = BACKLIGHT_LEVELS;
++	device->backlightLevel = level;
++
++	uint32 duty = level * 256 / BACKLIGHT_LEVELS;
++	*device->pwm = (*device->pwm & ~TEGRA_PWM_DUTY_MASK) | TEGRA_PWM_ENABLE
++		| (duty << TEGRA_PWM_DUTY_SHIFT);
++	TRACE_ALWAYS("backlight level %" B_PRId32 ", PWM %#" B_PRIx32 "\n", level,
++		*device->pwm);
++}
++
++
++static void
++setup_backlight(nvec_device* device)
++{
++	area_id area;
++	volatile uint8* car;
++	if (map_registers("tegra car", TEGRA20_CAR_BASE, &area, &car) != B_OK)
++		return;
++	uint32 bit = 1U << (TEGRA20_CLK_PWM % 32);
++	uint32 bank = TEGRA20_CLK_PWM / 32;
++	bool clocked = (*(volatile uint32*)(car + TEGRA_CAR_CLK_OUT_ENB(bank))
++		& bit) != 0;
++	bool inReset = (*(volatile uint32*)(car + TEGRA_CAR_RST_DEVICES(bank))
++		& bit) != 0;
++	delete_area(area);
++
++	// a register access to a device without clock can hang the bus
++	if (!clocked || inReset) {
++		TRACE_ALWAYS("backlight PWM not running (clock %d, reset %d)\n",
++			clocked, inReset);
++		return;
++	}
++
++	volatile uint8* pwm;
++	if (map_registers("tegra pwm", TEGRA20_PWM_BASE, &device->pwmArea, &pwm)
++			!= B_OK) {
++		return;
++	}
++	device->pwm = (volatile uint32*)pwm;
++	uint32 duty = (*device->pwm & TEGRA_PWM_DUTY_MASK) >> TEGRA_PWM_DUTY_SHIFT;
++	device->backlightLevel = (duty * BACKLIGHT_LEVELS + 128) / 256;
++	if (device->backlightLevel < 1)
++		device->backlightLevel = BACKLIGHT_LEVELS;
++	TRACE_ALWAYS("backlight PWM %#" B_PRIx32 ", level %" B_PRId32 "\n",
++		*device->pwm, device->backlightLevel);
++}
++
++
+ static void
+ power_button_pressed(nvec_device* device)
+ {
+@@ -699,10 +769,10 @@ handle_scan_code(nvec_device* device, uint8 code)
+ 	bool down = (code & 0x80) == 0;
+ 	uint32 scancode = (code & 0x7f) | (extended ? 0x80 : 0);
+ 
+-	// the power button is no key: the power_daemon asks to shut down
+-	if (scancode == 0xde) {
++	if (scancode == 0xb9 || scancode == 0xba) {
++		// backlight up and down
+ 		if (down)
+-			power_button_pressed(device);
++			change_backlight(device, scancode == 0xb9 ? 1 : -1);
+ 		return;
+ 	}
+ 
+@@ -720,9 +790,12 @@ handle_key_event(nvec_device* device, const nvec_msg* message)
+ {
+ 	uint32 eventSize = (message->data[0] >> 5) & 3;
+ 	if (eventSize == NVEC_VAR_SIZE) {
+-		// a sequence of scan codes, e.g. the power button's e0 5e e0 de
+-		for (uint32 i = 0; i < message->data[1] && i + 2 < message->size; i++)
+-			handle_scan_code(device, message->data[2 + i]);
++		// only the power button comes like this (e0 5e e0 de); it is no
++		// key: the power_daemon asks to shut down
++		if (message->size >= 4 && message->data[1] >= 2
++			&& message->data[2] == 0xe0 && message->data[3] == 0x5e) {
++			power_button_pressed(device);
++		}
+ 		return;
+ 	}
+ 
+@@ -1452,7 +1525,7 @@ nvec_init_driver(device_node* node, void** _cookie)
+ 	device->mouseLock = B_SPINLOCK_INITIALIZER;
+ 	device->batteryLock = B_SPINLOCK_INITIALIZER;
+ 	mutex_init(&device->powerButtonLock, "nvec power button");
+-	device->registersArea = device->gpioArea = -1;
++	device->registersArea = device->gpioArea = device->pwmArea = -1;
+ 	device->rxSem = device->txSem = device->transferSem = device->keySem
+ 		= device->mouseSem = -1;
+ 	device->repeatDelay = 300000;
+@@ -1509,6 +1582,7 @@ nvec_init_driver(device_node* node, void** _cookie)
+ 	status = setup_hardware(device);
+ 	if (status != B_OK)
+ 		goto err;
++	setup_backlight(device);
+ 
+ 	status = install_io_interrupt_handler(device->irq, nvec_interrupt, device,
+ 		0);
+@@ -1544,6 +1618,7 @@ err:
+ 	delete_sem(device->mouseSem);
+ 	delete_area(device->registersArea);
+ 	delete_area(device->gpioArea);
++	delete_area(device->pwmArea);
+ 	delete device;
+ 	return status;
+ }
+@@ -1571,6 +1646,7 @@ nvec_uninit_driver(void* cookie)
+ 	wait_for_thread(device->pollThread, &result);
+ 	delete_area(device->registersArea);
+ 	delete_area(device->gpioArea);
++	delete_area(device->pwmArea);
+ 	delete device;
+ }
+ 
