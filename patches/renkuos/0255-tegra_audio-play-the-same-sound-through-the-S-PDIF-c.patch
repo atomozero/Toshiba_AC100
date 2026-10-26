@@ -1,0 +1,238 @@
+From ac541eaf841e607f600135b5b9b06037d75eb760 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 26 Oct 2026 14:53:53 +0100
+Subject: [PATCH 255/270] tegra_audio: play the same sound through the S/PDIF
+ controller
+
+A second APB DMA channel feeds the S/PDIF transmitter from the same
+buffers, 16 bit stereo packed in one word per frame. Its clock,
+128 x 44.1 kHz, is PLL A out 0 divided by 4, so it runs in step with
+I2S1. The HDMI block takes its audio from there. 'spdif false' in the
+driver settings leaves it off.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../drivers/audio/tegra/tegra_audio.cpp       | 126 +++++++++++++++++-
+ 1 file changed, 125 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp b/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
+index 662816bfdc..2a9a582bec 100644
+--- a/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
++++ b/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
+@@ -14,6 +14,11 @@
+ 	continuous mode, one buffer after the other. The codec, on the first I2C
+ 	bus, is a slave that routes its DAC to the speaker (class D amplifier) and
+ 	the headphones.
++
++	The same buffers also go to the S/PDIF controller, through a second DMA
++	channel: the HDMI block takes its audio from there (TRM 27.3). Its clock,
++	128 fs = 5.6448 MHz, is PLL A out 0 divided by 4, so both outputs run at
++	exactly the same rate.
+ */
+ 
+ 
+@@ -79,6 +84,8 @@ struct tegra_audio_diag {
+ #define PLL_BASE_LOCK				(1U << 27)
+ #define PLL_MISC_LOCK_ENABLE		(1U << 18)
+ #define PLL_MISC_CPCON_SHIFT		8
++#define CAR_CLK_SOURCE_SPDIF_OUT	0x108
++#define CLOCK_SPDIF					10
+ #define CLOCK_I2S1					11
+ #define CLOCK_I2S2					18
+ #define CLOCK_APBDMA				34
+@@ -122,6 +129,18 @@ struct tegra_audio_diag {
+ #define I2S_FIFO1					0x40
+ #define I2S_DMA_REQUEST				2		// APB DMA requester
+ 
++// S/PDIF, in the same page as I2S1
++#define SPDIF_BASE					0x70002400
++#define SPDIF_CTRL					0x00
++#define SPDIF_CTRL_TX_EN			(1U << 28)
++#define SPDIF_CTRL_PACK				(1U << 14)	// left and right in a word
++#define SPDIF_CTRL_BIT_MODE_16		(0U << 12)
++#define SPDIF_DATA_FIFO_CSR			0x0c
++#define SPDIF_FIFO_TX_CLR			(1U << 7)
++#define SPDIF_FIFO_TX_ATN_FOUR_SLOTS	(1U << 5)
++#define SPDIF_DATA_OUT				0x40
++#define SPDIF_DMA_REQUEST			3
++
+ // APB DMA
+ #define APBDMA_BASE					0x6000a000
+ #define APBDMA_GENERAL				0x000
+@@ -130,6 +149,9 @@ struct tegra_audio_diag {
+ #define APBDMA_CHANNEL				1
+ #define APBDMA_CHANNEL_OFFSET		(0x1000 + APBDMA_CHANNEL * 0x20)
+ #define APBDMA_CHANNEL_IRQ			(32 + 104 + APBDMA_CHANNEL)
++#define SPDIF_DMA_CHANNEL			2
++#define SPDIF_DMA_CHANNEL_OFFSET	(0x1000 + SPDIF_DMA_CHANNEL * 0x20)
++#define SPDIF_DMA_CHANNEL_IRQ		(32 + 104 + SPDIF_DMA_CHANNEL)
+ #define DMA_CSR						0x00
+ #define DMA_CSR_ENABLE				(1U << 31)
+ #define DMA_CSR_IE_EOC				(1U << 30)
+@@ -201,6 +223,11 @@ struct tegra_audio {
+ 	area_id					dmaArea;
+ 	volatile uint8*			dma;		// controller
+ 	volatile uint8*			channel;	// our channel in it
++	volatile uint8*			spdif;
++	volatile uint8*			spdifChannel;
++	bool					spdifEnabled;
++	bool					spdifInterruptInstalled;
++	int32					spdifPlaying;
+ 
+ 	mutex					lock;
+ 	bool					opened;
+@@ -569,6 +596,25 @@ setup_i2s(tegra_audio* audio)
+ }
+ 
+ 
++/*!	S/PDIF output at 44.1 kHz, 16 bit stereo packed in one word per frame
++	as in the buffers: PLL A out 0 (22.5792 MHz) divided by 4.
++*/
++static void
++setup_spdif(tegra_audio* audio)
++{
++	// source 0 is PLL A out 0; the divisor is 7.1 fixed point, minus 1
++	write32(audio->car, CAR_CLK_SOURCE_SPDIF_OUT, 2 * (4 - 1));
++	set_clock(audio, CLOCK_SPDIF, true);
++	set_reset(audio, CLOCK_SPDIF, true);
++	spin(10);
++	set_reset(audio, CLOCK_SPDIF, false);
++
++	write32(audio->spdif, SPDIF_CTRL, SPDIF_CTRL_PACK
++		| SPDIF_CTRL_BIT_MODE_16);
++	write32(audio->spdif, SPDIF_DATA_FIFO_CSR, SPDIF_FIFO_TX_ATN_FOUR_SLOTS);
++}
++
++
+ //	#pragma mark - DMA
+ 
+ 
+@@ -606,6 +652,51 @@ dma_interrupt(void* data)
+ }
+ 
+ 
++/*!	The S/PDIF channel follows the buffers on its own: it only needs the
++	address of the buffer after the one it just started.
++*/
++static int32
++spdif_dma_interrupt(void* data)
++{
++	tegra_audio* audio = (tegra_audio*)data;
++	uint32 status = read32(audio->spdifChannel, DMA_STATUS);
++	if ((status & DMA_STATUS_EOC) == 0)
++		return B_UNHANDLED_INTERRUPT;
++	write32(audio->spdifChannel, DMA_STATUS, status);
++
++	audio->spdifPlaying = (audio->spdifPlaying + 1) % audio->bufferCount;
++	write32(audio->spdifChannel, DMA_AHB_PTR, buffer_physical(audio,
++		(audio->spdifPlaying + 1) % audio->bufferCount));
++	return B_HANDLED_INTERRUPT;
++}
++
++
++static void
++start_spdif_dma(tegra_audio* audio)
++{
++	audio->spdifPlaying = 0;
++	write32(audio->dma, APBDMA_IRQ_MASK_SET, 1U << SPDIF_DMA_CHANNEL);
++
++	volatile uint8* channel = audio->spdifChannel;
++	uint32 csr = DMA_CSR_DIR_TO_DEVICE | DMA_CSR_FLOW | DMA_CSR_IE_EOC
++		| (SPDIF_DMA_REQUEST << DMA_CSR_REQ_SEL_SHIFT)
++		| ((audio->bufferFrames * FRAME_SIZE - 4) & 0xfffc);
++	write32(channel, DMA_CSR, csr);
++	write32(channel, DMA_STATUS, read32(channel, DMA_STATUS));
++	write32(channel, DMA_APB_SEQ,
++		DMA_APB_SEQ_BUS_WIDTH_32 | DMA_APB_SEQ_WRAP_WORD_1);
++	write32(channel, DMA_APB_PTR, SPDIF_BASE + SPDIF_DATA_OUT);
++	write32(channel, DMA_AHB_SEQ, DMA_AHB_SEQ_INTR_ENABLE
++		| DMA_AHB_SEQ_BUS_WIDTH_32 | DMA_AHB_SEQ_BURST_4);
++	write32(channel, DMA_AHB_PTR, buffer_physical(audio, 0));
++	write32(audio->spdif, SPDIF_DATA_FIFO_CSR,
++		SPDIF_FIFO_TX_ATN_FOUR_SLOTS | SPDIF_FIFO_TX_CLR);
++	write32(channel, DMA_CSR, csr | DMA_CSR_ENABLE);
++	write32(channel, DMA_AHB_PTR,
++		buffer_physical(audio, 1 % audio->bufferCount));
++}
++
++
+ static void
+ start_playback(tegra_audio* audio)
+ {
+@@ -634,9 +725,17 @@ start_playback(tegra_audio* audio)
+ 	// taken over once the first buffer is done (continuous mode)
+ 	write32(audio->channel, DMA_AHB_PTR,
+ 		buffer_physical(audio, 1 % audio->bufferCount));
++	if (audio->spdifEnabled)
++		start_spdif_dma(audio);
+ 
+ 	write32(audio->i2s, I2S_FIFO_SCR,
+ 		I2S_FIFO_SCR_ATN_FOUR_SLOTS | I2S_FIFO_SCR_FIFO1_CLR);
++	if (audio->spdifEnabled) {
++		// the DMA fills the S/PDIF FIFO first (TRM 27.3.3.7)
++		spin(20);
++		write32(audio->spdif, SPDIF_CTRL,
++			read32(audio->spdif, SPDIF_CTRL) | SPDIF_CTRL_TX_EN);
++	}
+ 	write32(audio->i2s, I2S_CTRL,
+ 		read32(audio->i2s, I2S_CTRL) | I2S_CTRL_FIFO1_ENABLE);
+ 
+@@ -655,6 +754,15 @@ stop_playback(tegra_audio* audio)
+ 	write32(audio->channel, DMA_CSR, read32(audio->channel, DMA_CSR)
+ 		& ~(DMA_CSR_ENABLE | DMA_CSR_IE_EOC));
+ 	write32(audio->channel, DMA_STATUS, read32(audio->channel, DMA_STATUS));
++	if (audio->spdifEnabled) {
++		write32(audio->spdif, SPDIF_CTRL,
++			read32(audio->spdif, SPDIF_CTRL) & ~SPDIF_CTRL_TX_EN);
++		write32(audio->spdifChannel, DMA_CSR,
++			read32(audio->spdifChannel, DMA_CSR)
++				& ~(DMA_CSR_ENABLE | DMA_CSR_IE_EOC));
++		write32(audio->spdifChannel, DMA_STATUS,
++			read32(audio->spdifChannel, DMA_STATUS));
++	}
+ 	audio->running = false;
+ }
+ 
+@@ -1415,6 +1523,10 @@ tegra_audio_free_resources(tegra_audio* audio)
+ 		remove_io_interrupt_handler(APBDMA_CHANNEL_IRQ, dma_interrupt,
+ 			audio);
+ 	}
++	if (audio->spdifInterruptInstalled) {
++		remove_io_interrupt_handler(SPDIF_DMA_CHANNEL_IRQ,
++			spdif_dma_interrupt, audio);
++	}
+ 	if (audio->bufferArea >= B_OK)
+ 		delete_area(audio->bufferArea);
+ 	if (audio->bufferReadySem >= B_OK)
+@@ -1474,6 +1586,8 @@ tegra_audio_init_driver(device_node* node, void** _cookie)
+ 	}
+ 	audio->dma = (volatile uint8*)dmaBase;
+ 	audio->channel = audio->dma + APBDMA_CHANNEL_OFFSET;
++	audio->spdifChannel = audio->dma + SPDIF_DMA_CHANNEL_OFFSET;
++	audio->spdif = audio->i2s + (SPDIF_BASE & (B_PAGE_SIZE - 1));
+ 	audio->i2s += I2S1_BASE & (B_PAGE_SIZE - 1);
+ 
+ 	audio->bufferReadySem = create_sem(0, "tegra audio buffer ready");
+@@ -1500,11 +1614,21 @@ tegra_audio_init_driver(device_node* node, void** _cookie)
+ 	}
+ 
+ 	// the bring-up tests end with a tone of 1.5 s, so they only run when
+-	// "self_test true" is in the tegra_audio driver settings
++	// "self_test true" is in the tegra_audio driver settings; "spdif false"
++	// keeps the sound off the S/PDIF controller and HDMI
+ 	void* settings = load_driver_settings("tegra_audio");
+ 	bool selfTest = get_driver_boolean_parameter(settings, "self_test", false,
+ 		true);
++	bool spdif = get_driver_boolean_parameter(settings, "spdif", true, true);
+ 	unload_driver_settings(settings);
++
++	if (spdif) {
++		setup_spdif(audio);
++		audio->spdifEnabled = install_io_interrupt_handler(
++			SPDIF_DMA_CHANNEL_IRQ, spdif_dma_interrupt, audio, 0) == B_OK;
++		audio->spdifInterruptInstalled = audio->spdifEnabled;
++		TRACE_ALWAYS("S/PDIF: %s\n", audio->spdifEnabled ? "on" : "off");
++	}
+ 	if (selfTest)
+ 		self_test(audio);
+ 	start_jack_detection(audio);

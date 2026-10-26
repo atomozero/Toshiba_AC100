@@ -1,7 +1,7 @@
-From b47df4faaaffe4a6eed401c1e98ab06dff011cda Mon Sep 17 00:00:00 2001
+From 2262a8fc1625ee2b0bbecb3ee9745ca91701b76c Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 22:38:28 +0200
-Subject: [PATCH 120/203] ARM bring-up: show how far a CPU that does not answer
+Subject: [PATCH 120/270] ARM bring-up: show how far a CPU that does not answer
  an early call got
 
 The second CPU of the AC100 does not answer the first early CPU call. After

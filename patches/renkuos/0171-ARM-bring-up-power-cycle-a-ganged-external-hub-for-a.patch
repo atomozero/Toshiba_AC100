@@ -1,7 +1,7 @@
-From 47e7856ce5fd6632dc8ba9c74606c02b1e051cf2 Mon Sep 17 00:00:00 2001
+From 76a2286780b3071263bcd3a2a546db53730e2fc2 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Tue, 20 Oct 2026 19:17:37 +0200
-Subject: [PATCH 171/203] ARM bring-up: power cycle a ganged external hub for a
+Subject: [PATCH 171/270] ARM bring-up: power cycle a ganged external hub for a
  failing port, log power cycles (not for merging)
 
 ---

@@ -1,7 +1,7 @@
-From b55da33b11fd2ffb049dc8b37439e94e9e03b7fd Mon Sep 17 00:00:00 2001
+From c98081b6a53f10a6516608aeb27ce2b0862414b8 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Tue, 20 Oct 2026 00:24:40 +0200
-Subject: [PATCH 154/203] sdhci: keep DMA coherent with the CPU caches on ARM
+Subject: [PATCH 154/270] sdhci: keep DMA coherent with the CPU caches on ARM
 
 The SDHCI DMA engines do not snoop the CPU caches on ARM SoCs such as the
 NVIDIA Tegra 2. The ADMA2 descriptor table and the bounce buffer are now

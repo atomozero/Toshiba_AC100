@@ -1,7 +1,7 @@
-From 97c4312073e8ace80bf9bc44958fc10b9f203875 Mon Sep 17 00:00:00 2001
+From 69f29ef8fc25c6b37a1cc2092a92041277467c49 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 17:36:18 +0200
-Subject: [PATCH 025/203] ARM bring-up: check the kernel code pages against the
+Subject: [PATCH 025/270] ARM bring-up: check the kernel code pages against the
  kernel file (not for merging)
 
 ---

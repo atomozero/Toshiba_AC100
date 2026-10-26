@@ -1,7 +1,7 @@
-From 92e2276d0903b0389a5c01fe3ea7cbde10d9bfe2 Mon Sep 17 00:00:00 2001
+From 605ec061f39e2ff6e2beb7e62a1b8dfce50f74b3 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 20:49:48 +0200
-Subject: [PATCH 115/203] minimum image: demos, ActivityMonitor, Magnify,
+Subject: [PATCH 115/270] minimum image: demos, ActivityMonitor, Magnify,
  Screenshot on ARM
 
 With the libraries they and SDL2 need (libgame, libmedia, libmidi2,
@@ -11,7 +11,7 @@ libscreensaver), for the Toshiba AC100.
  1 file changed, 17 insertions(+), 1 deletion(-)
 
 diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
-index 32d294c55c..293203516e 100644
+index 1fa5492acb..597883423d 100644
 --- a/build/jam/images/definitions/minimum
 +++ b/build/jam/images/definitions/minimum
 @@ -128,6 +128,7 @@ SYSTEM_BIN = [ FFilterByBuildFeatures

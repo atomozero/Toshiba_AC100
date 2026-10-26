@@ -1,7 +1,7 @@
-From 3d2afc10bea910876353e780b8770ceb6bba525d Mon Sep 17 00:00:00 2001
+From b45f901ac17e9174e1ef996c6dfe6222c4210ad4 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 12:04:44 +0200
-Subject: [PATCH 080/203] ARM bring-up: dump the userland threads 90 and 180
+Subject: [PATCH 080/270] ARM bring-up: dump the userland threads 90 and 180
  seconds after boot, with their last user PC and callers (not for merging)
 
 ---

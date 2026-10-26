@@ -1,0 +1,24 @@
+From 0f168f22f08ab24a6068c695208ffb0cbd05d8ca Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 25 Oct 2026 22:21:25 +0100
+Subject: [PATCH 241/270] tegra_dc: a device name that fits
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/add-ons/accelerants/tegra_dc/accelerant.cpp | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/src/add-ons/accelerants/tegra_dc/accelerant.cpp b/src/add-ons/accelerants/tegra_dc/accelerant.cpp
+index a97df0adeb..5ff33374a5 100644
+--- a/src/add-ons/accelerants/tegra_dc/accelerant.cpp
++++ b/src/add-ons/accelerants/tegra_dc/accelerant.cpp
+@@ -155,8 +155,7 @@ status_t
+ tegra_dc_get_accelerant_device_info(accelerant_device_info* info)
+ {
+ 	info->version = B_ACCELERANT_VERSION;
+-	strlcpy(info->name, "NVIDIA Tegra 2 display controller",
+-		sizeof(info->name));
++	strlcpy(info->name, "NVIDIA Tegra 2", sizeof(info->name));
+ 	strlcpy(info->chipset, "Tegra20 DC", sizeof(info->chipset));
+ 	strlcpy(info->serial_no, "None", sizeof(info->serial_no));
+ 	info->memory = gInfo->shared_info->frame_buffer_size;

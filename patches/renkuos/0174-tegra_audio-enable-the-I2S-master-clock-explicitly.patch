@@ -1,7 +1,7 @@
-From 35cc3d359bafd5cd4b6685e98d5bbf1e3f8c017b Mon Sep 17 00:00:00 2001
+From a07700cf4e6d1a3989bda5b9edae275be2a73cba Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Tue, 20 Oct 2026 21:38:43 +0200
-Subject: [PATCH 174/203] tegra_audio: enable the I2S master clock explicitly
+Subject: [PATCH 174/270] tegra_audio: enable the I2S master clock explicitly
 
 Bit 28 of CLK_SOURCE_I2S1 is I2S1_MASTER_CLKEN (Tegra 2 TRM, 5.4.46).
 It comes up set, but do not depend on that.

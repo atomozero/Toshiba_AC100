@@ -1,7 +1,7 @@
-From bbeef76631c3b97c96a798a6d2d8913bbb69817c Mon Sep 17 00:00:00 2001
+From b141d2050e1f9e25fbe747303e5cc0fa4f6d572d Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 12:33:31 +0200
-Subject: [PATCH 082/203] ARM bring-up: show busy page waits, kernel stacks and
+Subject: [PATCH 082/270] ARM bring-up: show busy page waits, kernel stacks and
  prefetch I/O counts in the thread dump (not for merging)
 
 ---

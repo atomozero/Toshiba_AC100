@@ -1,7 +1,7 @@
-From 38576d2b381eb1a5dcd3f896b44d2d3f3d5a961d Mon Sep 17 00:00:00 2001
+From 01119890a2b70a2d3dd4d0feab9b1edaae393ba0 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Fri, 23 Oct 2026 14:25:58 +0200
-Subject: [PATCH 181/203] usb_raw: accept control requests without a data stage
+Subject: [PATCH 181/270] usb_raw: accept control requests without a data stage
  and buffer
 
 BUSBDevice::ControlTransfer() passes a NULL buffer for requests without

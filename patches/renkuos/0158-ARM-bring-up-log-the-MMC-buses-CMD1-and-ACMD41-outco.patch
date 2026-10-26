@@ -1,7 +1,7 @@
-From f79452cb6f07ecd04d6d08be73f5b099ed3eb0d5 Mon Sep 17 00:00:00 2001
+From 7642a6a3af85db644c8e14251bbe6c82e92c3879 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Tue, 20 Oct 2026 00:25:58 +0200
-Subject: [PATCH 158/203] ARM bring-up: log the MMC buses, CMD1 and ACMD41
+Subject: [PATCH 158/270] ARM bring-up: log the MMC buses, CMD1 and ACMD41
  outcomes, failed MMC I/O and the first command timeout of a controller (not
  for merging)
 

@@ -1,7 +1,7 @@
-From 4a659d81aa7c491d3b807f505d5d6bc22c6e32dd Mon Sep 17 00:00:00 2001
+From 6fb8fdf31934e69187f2789a39ba5158090218fd Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 10:37:36 +0200
-Subject: [PATCH 074/203] ARM: reset NVIDIA Tegra machines through the power
+Subject: [PATCH 074/270] ARM: reset NVIDIA Tegra machines through the power
  management controller
 
 arch_cpu_shutdown() never returned or did anything on ARM, so a reboot

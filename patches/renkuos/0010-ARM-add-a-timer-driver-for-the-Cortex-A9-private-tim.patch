@@ -1,7 +1,7 @@
-From a59807038302fdb1234b5dc9dae27c42b9a7fb60 Mon Sep 17 00:00:00 2001
+From 90be0de98d4509894815764cdcafe927533e31e6 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 13:40:19 +0200
-Subject: [PATCH 010/203] ARM: add a timer driver for the Cortex-A9 private
+Subject: [PATCH 010/270] ARM: add a timer driver for the Cortex-A9 private
  timer (TWD)
 
 Cortex-A9 has no generic timer, so on boards without a supported SoC

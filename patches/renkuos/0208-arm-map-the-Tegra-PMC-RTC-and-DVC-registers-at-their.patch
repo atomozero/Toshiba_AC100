@@ -1,0 +1,55 @@
+From 76762544f7b183fd0542965e322e7a895bf10fd3 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 24 Oct 2026 19:27:46 +0200
+Subject: [PATCH 208/270] arm: map the Tegra PMC, RTC and DVC registers at
+ their page
+
+map_physical_memory() already adds the offset within the page to the
+address it returns, so adding it again moved the PMC registers by 0x400:
+the MAIN_RST write of a reboot missed the PMC and the machine hung. The
+RTC and DVC blocks start on a page, so only the PMC was affected.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/system/kernel/arch/arm/arch_cpu.cpp             | 3 ++-
+ src/system/kernel/arch/arm/arch_real_time_clock.cpp | 6 ++++--
+ 2 files changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/src/system/kernel/arch/arm/arch_cpu.cpp b/src/system/kernel/arch/arm/arch_cpu.cpp
+index 8cd3fe9adc..bd2723f777 100644
+--- a/src/system/kernel/arch/arm/arch_cpu.cpp
++++ b/src/system/kernel/arch/arm/arch_cpu.cpp
+@@ -132,7 +132,8 @@ arch_cpu_init_post_vm(kernel_args *args)
+ 	if (args->arch_args.pmc.start != 0) {
+ 		void* address;
+ 		area_id area = map_physical_memory("tegra pmc",
+-			args->arch_args.pmc.start, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++			args->arch_args.pmc.start & ~(phys_addr_t)(B_PAGE_SIZE - 1),
++			B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+ 			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
+ 		if (area >= B_OK) {
+ 			sTegraPMC = (volatile uint32*)((addr_t)address
+diff --git a/src/system/kernel/arch/arm/arch_real_time_clock.cpp b/src/system/kernel/arch/arm/arch_real_time_clock.cpp
+index d5069427e2..b3233623b3 100644
+--- a/src/system/kernel/arch/arm/arch_real_time_clock.cpp
++++ b/src/system/kernel/arch/arm/arch_real_time_clock.cpp
+@@ -337,7 +337,8 @@ arch_rtc_init(kernel_args *args, struct real_time_data *data)
+ 	if (args->arch_args.rtc.start != 0) {
+ 		void* address;
+ 		area_id area = map_physical_memory("tegra rtc",
+-			args->arch_args.rtc.start, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++			args->arch_args.rtc.start & ~(phys_addr_t)(B_PAGE_SIZE - 1),
++			B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+ 			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
+ 		if (area >= B_OK) {
+ 			sTegraRTC = (volatile uint32*)((addr_t)address
+@@ -357,7 +358,8 @@ arch_rtc_init(kernel_args *args, struct real_time_data *data)
+ 	if (sTegraRTC != NULL && args->arch_args.pmicI2C.start != 0 && usePMIC) {
+ 		void* address;
+ 		area_id area = map_physical_memory("tegra dvc i2c",
+-			args->arch_args.pmicI2C.start, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++			args->arch_args.pmicI2C.start & ~(phys_addr_t)(B_PAGE_SIZE - 1),
++			B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+ 			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
+ 		if (area >= B_OK) {
+ 			sDVC = (volatile uint8*)address

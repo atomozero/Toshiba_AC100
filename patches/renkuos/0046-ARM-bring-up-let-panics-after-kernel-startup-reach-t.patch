@@ -1,7 +1,7 @@
-From a6367b2835517e6092ce8fbc8794c8a490c70a58 Mon Sep 17 00:00:00 2001
+From efd89573ed821ae2c4f4fa2668574b97cba71132 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 21:45:57 +0200
-Subject: [PATCH 046/203] ARM bring-up: let panics after kernel startup reach
+Subject: [PATCH 046/270] ARM bring-up: let panics after kernel startup reach
  the kernel debugger (not for merging)
 
 ---

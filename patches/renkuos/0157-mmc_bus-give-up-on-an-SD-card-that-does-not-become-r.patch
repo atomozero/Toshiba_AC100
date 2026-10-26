@@ -1,7 +1,7 @@
-From 2629fd7de29ce092e44837d2e8d7a770d7f6bc66 Mon Sep 17 00:00:00 2001
+From 00e282ebb1af0068b18f68276061ecfafebab8e6 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Tue, 20 Oct 2026 00:25:33 +0200
-Subject: [PATCH 157/203] mmc_bus: give up on an SD card that does not become
+Subject: [PATCH 157/270] mmc_bus: give up on an SD card that does not become
  ready
 
 ACMD41 was repeated forever while a card stayed busy, holding the bus. Stop

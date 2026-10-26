@@ -1,0 +1,60 @@
+From 1ddb6a254e4dfc4453c4e2c5c2ed5183438bb456 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 25 Oct 2026 19:15:22 +0100
+Subject: [PATCH 225/270] ARM bring-up: log which disk system claims a disk and
+ the GPT headers found (not for merging)
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/add-ons/kernel/partitioning_systems/gpt/Header.cpp |  9 +++++++++
+ .../kernel/disk_device_manager/KDiskDeviceManager.cpp  | 10 ++++++++++
+ 2 files changed, 19 insertions(+)
+
+diff --git a/src/add-ons/kernel/partitioning_systems/gpt/Header.cpp b/src/add-ons/kernel/partitioning_systems/gpt/Header.cpp
+index c9a05da5df..ad943a99d2 100644
+--- a/src/add-ons/kernel/partitioning_systems/gpt/Header.cpp
++++ b/src/add-ons/kernel/partitioning_systems/gpt/Header.cpp
+@@ -80,6 +80,15 @@ Header::Header(int fd, uint64 lastBlock, uint32 blockSize)
+ 			status = B_BAD_DATA;
+ 	}
+ 
++#ifdef _KERNEL_MODE
++	// AC100 bring-up: what the two headers looked like
++	dprintf("AC100: gpt: last block %" B_PRIu64 ", primary %s (%.8s, block %"
++		B_PRIu64 ", alternate %" B_PRIu64 "), backup %s (%.8s, block %"
++		B_PRIu64 ")\n", lastBlock, strerror(fStatus), fHeader.header,
++		fHeader.AbsoluteBlock(), fHeader.AlternateBlock(), strerror(status),
++		fBackupHeader.header, fBackupHeader.AbsoluteBlock());
++#endif
++
+ 	// If both headers are invalid, bail out -- this is probably not a GPT disk
+ 	if (status != B_OK && fStatus != B_OK)
+ 		return;
+diff --git a/src/system/kernel/disk_device_manager/KDiskDeviceManager.cpp b/src/system/kernel/disk_device_manager/KDiskDeviceManager.cpp
+index bd6813f5db..c82ebfb696 100644
+--- a/src/system/kernel/disk_device_manager/KDiskDeviceManager.cpp
++++ b/src/system/kernel/disk_device_manager/KDiskDeviceManager.cpp
+@@ -1421,6 +1421,11 @@ KDiskDeviceManager::_ScanPartition(KPartition* partition,
+ 		float priority = diskSystem->Identify(partition, &cookie);
+ 
+ 		TRACE("  returned: %g\n", priority);
++		if (partition->Parent() == NULL) {
++			// AC100 bring-up: which disk system claims a whole disk
++			dprintf("AC100: identify %s on %" B_PRIdOFF " bytes: %g\n",
++				diskSystem->Name(), partition->Size(), priority);
++		}
+ 
+ 		if (priority >= 0 && priority > bestPriority) {
+ 			// new best disk system
+@@ -1444,6 +1449,11 @@ KDiskDeviceManager::_ScanPartition(KPartition* partition,
+ 	if (bestDiskSystem != NULL) {
+ 		TRACE("  scanning with: %s\n", bestDiskSystem->Name());
+ 		error = bestDiskSystem->Scan(partition, bestCookie);
++		if (partition->Parent() == NULL) {
++			dprintf("AC100: scan with %s: %s, %" B_PRId32 " children\n",
++				bestDiskSystem->Name(), strerror(error),
++				partition->CountChildren());
++		}
+ 		bestDiskSystem->FreeIdentifyCookie(partition, bestCookie);
+ 		if (error == B_OK) {
+ 			partition->SetDiskSystem(bestDiskSystem, bestPriority);

@@ -1,7 +1,7 @@
-From bdd4fcfe321b1cd6713214412b0caf3e7cd87354 Mon Sep 17 00:00:00 2001
+From e7094db7bac73075cc2a1eec127ff21495266aa0 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 24 Oct 2026 00:18:25 +0200
-Subject: [PATCH 193/203] PicturePlayer: don't hand out unaligned pointers into
+Subject: [PATCH 193/270] PicturePlayer: don't hand out unaligned pointers into
  the picture data
 
 The picture data is packed (each op starts with a 6 byte header), so the

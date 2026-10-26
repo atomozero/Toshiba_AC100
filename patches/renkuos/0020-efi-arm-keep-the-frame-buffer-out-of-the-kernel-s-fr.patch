@@ -1,7 +1,7 @@
-From ac91f761b7e6edd19937f880ae6b25de8fa24323 Mon Sep 17 00:00:00 2001
+From dd83a3e6026ad50d9aa06b6b70f054da889cdb55 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 16:49:35 +0200
-Subject: [PATCH 020/203] efi/arm: keep the frame buffer out of the kernel's
+Subject: [PATCH 020/270] efi/arm: keep the frame buffer out of the kernel's
  free memory
 
 On NVIDIA Tegra, U-Boot's frame buffer is ordinary RAM inside an

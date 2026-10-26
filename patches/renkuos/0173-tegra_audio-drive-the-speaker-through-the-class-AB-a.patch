@@ -1,7 +1,7 @@
-From 159165b9aa670a3c44731009c3aa6cc7cccf33d0 Mon Sep 17 00:00:00 2001
+From b5b1596ea035f819cf706956dcd0221a7a1710b6 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Tue, 20 Oct 2026 21:03:20 +0200
-Subject: [PATCH 173/203] tegra_audio: drive the speaker through the class AB
+Subject: [PATCH 173/270] tegra_audio: drive the speaker through the class AB
  amplifier, as Android on the AC100 does
 
 The Android port of the AC100 (zombah/android_device_toshiba_paz00-common,

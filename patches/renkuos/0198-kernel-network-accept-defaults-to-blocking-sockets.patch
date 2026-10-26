@@ -1,7 +1,7 @@
-From 14fa9e99597f3cc3ce11c937295dc660bafcebc6 Mon Sep 17 00:00:00 2001
+From a7b137e0efe4c5f1a9eb89892e2817f164616ef0 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?J=C3=A9r=C3=B4me=20Duval?= <jerome.duval@gmail.com>
 Date: Thu, 1 Oct 2026 22:07:59 +0200
-Subject: [PATCH 198/203] kernel/network: accept() defaults to blocking sockets
+Subject: [PATCH 198/270] kernel/network: accept() defaults to blocking sockets
 
 as suggested by waddlesplash on the change 11748
 tested with curl test suite
@@ -39,7 +39,7 @@ index 339dae940b..0000000000
 -
 -#endif	/* _SYSTEM_SOCKET_DEFS_H */
 diff --git a/src/system/kernel/fs/socket.cpp b/src/system/kernel/fs/socket.cpp
-index be93d65780..2cbfae1767 100644
+index 02e2238ef1..14b1fa1c8d 100644
 --- a/src/system/kernel/fs/socket.cpp
 +++ b/src/system/kernel/fs/socket.cpp
 @@ -15,7 +15,6 @@

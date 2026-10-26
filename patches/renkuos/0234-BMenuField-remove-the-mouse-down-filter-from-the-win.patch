@@ -1,0 +1,38 @@
+From a82672b734d6f5f7e826d5ebcd87e72fb9e4647a Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 25 Oct 2026 21:49:09 +0100
+Subject: [PATCH 234/270] BMenuField: remove the mouse down filter from the
+ window when detached
+
+MouseDown() adds the filter to the window and MouseUp() removes it. When
+the mouse up does not reach the menu field (the menu may take it), the
+filter stays in the window's common filters. Closing the window then
+deletes it twice: once in ~BMenuField, once in ~BLooper. Seen on the
+Toshiba AC100 as a "double free" debugger call when closing the Screen
+preferences.
+
+Remove the filter in DetachedFromWindow() if it is still there.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/kits/interface/MenuField.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/kits/interface/MenuField.cpp b/src/kits/interface/MenuField.cpp
+index 1bddb26e30..d656a54954 100644
+--- a/src/kits/interface/MenuField.cpp
++++ b/src/kits/interface/MenuField.cpp
+@@ -554,6 +554,13 @@ BMenuField::MouseUp(BPoint where)
+ void
+ BMenuField::DetachedFromWindow()
+ {
++	// MouseDown() adds the filter to the window and MouseUp() removes it,
++	// but the mouse up does not always reach us (the menu may take it).
++	// Left there, the window would delete it once more after our
++	// destructor did.
++	if (fMouseDownFilter->Looper() != NULL)
++		Window()->RemoveCommonFilter(fMouseDownFilter);
++
+ 	BView::DetachedFromWindow();
+ }
+ 

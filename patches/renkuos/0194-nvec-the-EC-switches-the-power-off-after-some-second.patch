@@ -1,7 +1,7 @@
-From 64c4aa1d2572b13880925e2eaf77cdddc22eaa6d Mon Sep 17 00:00:00 2001
+From 4f17746a11f3e1e10fe6eb06caed900d7b149787 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 24 Oct 2026 00:51:11 +0200
-Subject: [PATCH 194/203] nvec: the EC switches the power off after some
+Subject: [PATCH 194/270] nvec: the EC switches the power off after some
  seconds, don't log a failure
 
 ---

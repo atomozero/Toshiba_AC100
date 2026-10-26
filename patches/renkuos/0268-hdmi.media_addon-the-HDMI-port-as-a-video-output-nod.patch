@@ -1,0 +1,795 @@
+From abe1af69abde60ad915a3393e4db523aeee7ae2b Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 26 Oct 2026 22:32:24 +0100
+Subject: [PATCH 268/270] hdmi.media_addon: the HDMI port as a video output
+ node
+
+The node shows in the video outputs of the Media preferences and in
+Cortex. What is sent to it fills the whole HDMI screen while the
+panel keeps the desktop: frames are copied into two overlay buffers
+of the display driver in turn. Its parameters turn the HDMI output on
+and off and set the resolution choice, plain DVI and a stronger
+signal, in the tegra_dc driver settings; the status line shows the
+screen and its mode.
+
+It replaces the separate HDMI preferences application, which goes.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ build/jam/images/definitions/minimum          |   2 +-
+ src/add-ons/media/media-add-ons/Jamfile       |   1 +
+ .../media/media-add-ons/hdmi/HDMIAddOn.cpp    | 703 ++++++++++++++++++
+ src/add-ons/media/media-add-ons/hdmi/Jamfile  |   9 +
+ src/preferences/Jamfile                       |   1 -
+ 5 files changed, 714 insertions(+), 2 deletions(-)
+ create mode 100644 src/add-ons/media/media-add-ons/hdmi/HDMIAddOn.cpp
+ create mode 100644 src/add-ons/media/media-add-ons/hdmi/Jamfile
+
+diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
+index a44844a62c..99f7238a41 100644
+--- a/build/jam/images/definitions/minimum
++++ b/build/jam/images/definitions/minimum
+@@ -176,7 +176,6 @@ SYSTEM_PREFERENCES = [ FFilterByBuildFeatures
+ 	Backgrounds
+ 	<preference>Deskbar
+ 	FileTypes
+-	HDMI@arm
+ 	Input
+ 	Keymap
+ 	Locale
+@@ -617,6 +616,7 @@ if arm in $(HAIKU_PACKAGING_ARCHS) {
+ 		cortex_flanger.media_addon
+ 		cortex_logging_consumer.media_addon
+ 		equalizer.media_addon
++		hdmi.media_addon@arm
+ 		hmulti_audio.media_addon
+ 		mixer.media_addon
+ 		tone_producer_demo.media_addon
+diff --git a/src/add-ons/media/media-add-ons/Jamfile b/src/add-ons/media/media-add-ons/Jamfile
+index a4c0a22928..b370ed553b 100644
+--- a/src/add-ons/media/media-add-ons/Jamfile
++++ b/src/add-ons/media/media-add-ons/Jamfile
+@@ -15,6 +15,7 @@ SubInclude HAIKU_TOP src add-ons media media-add-ons usb_vision ;
+ SubInclude HAIKU_TOP src add-ons media media-add-ons usb_webcam ;
+ SubInclude HAIKU_TOP src add-ons media media-add-ons video_producer_demo ;
+ SubInclude HAIKU_TOP src add-ons media media-add-ons videowindow ;
++SubInclude HAIKU_TOP src add-ons media media-add-ons hdmi ;
+ SubInclude HAIKU_TOP src add-ons media media-add-ons video_mixer ;
+ SubInclude HAIKU_TOP src add-ons media media-add-ons vst_host ;
+ SubInclude HAIKU_TOP src add-ons media media-add-ons writer ;
+diff --git a/src/add-ons/media/media-add-ons/hdmi/HDMIAddOn.cpp b/src/add-ons/media/media-add-ons/hdmi/HDMIAddOn.cpp
+new file mode 100644
+index 0000000000..eab97efb3d
+--- /dev/null
++++ b/src/add-ons/media/media-add-ons/hdmi/HDMIAddOn.cpp
+@@ -0,0 +1,703 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++/*!	The HDMI output of the NVIDIA Tegra 2 as a video output node: what is
++	sent to it fills the whole HDMI screen, while the panel keeps the
++	desktop; without a connection the HDMI screen mirrors the panel. Its
++	parameters (Media preferences, Cortex) turn the HDMI output on and off
++	and set how the tegra_dc driver drives the screen.
++
++	Frames are copied into two overlay buffers of the display driver in
++	turn; the driver shows the latest from the next frame on.
++*/
++
++
++#include <Buffer.h>
++#include <BufferConsumer.h>
++#include <Controllable.h>
++#include <File.h>
++#include <FindDirectory.h>
++#include <Directory.h>
++#include <MediaAddOn.h>
++#include <MediaEventLooper.h>
++#include <ParameterWeb.h>
++#include <Path.h>
++#include <String.h>
++#include <StringList.h>
++#include <TimeSource.h>
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "tegra_dc_info.h"
++
++
++static const char* kDevice = "/dev/" TEGRA_DC_DEVICE_NAME;
++
++enum {
++	PARAMETER_STATUS = 1,
++	PARAMETER_OUTPUT,
++	PARAMETER_MODE,
++	PARAMETER_DVI,
++	PARAMETER_SIGNAL
++};
++
++// the "hdmi_mode" values, in the order of the resolution parameter
++static const char* kModeValues[] = { NULL, "preferred", "720p" };
++
++
++/*!	The tegra_dc driver settings file: lines of "key value", kept as they
++	are except for the keys changed here.
++*/
++class DriverSettings {
++public:
++	DriverSettings()
++	{
++		find_directory(B_USER_SETTINGS_DIRECTORY, &fPath);
++		fPath.Append("kernel/drivers/tegra_dc");
++
++		BFile file(fPath.Path(), B_READ_ONLY);
++		off_t size;
++		if (file.InitCheck() != B_OK || file.GetSize(&size) != B_OK
++			|| size > 65536) {
++			return;
++		}
++		BString text;
++		char* buffer = text.LockBuffer(size + 1);
++		ssize_t bytes = file.Read(buffer, size);
++		text.UnlockBuffer(bytes >= 0 ? bytes : 0);
++		text.Split("\n", true, fLines);
++	}
++
++	BString Get(const char* key) const
++	{
++		for (int32 i = 0; i < fLines.CountStrings(); i++) {
++			BString line = fLines.StringAt(i);
++			line.Trim();
++			if (line.StartsWith(BString(key) << " ")
++				|| line.StartsWith(BString(key) << "\t")) {
++				BString value(line.String() + strlen(key));
++				return value.Trim();
++			}
++		}
++		return BString();
++	}
++
++	bool GetBool(const char* key, bool defaultValue) const
++	{
++		BString value = Get(key);
++		if (value.IsEmpty())
++			return defaultValue;
++		return value == "true" || value == "on" || value == "yes"
++			|| value == "1" || value == "enabled";
++	}
++
++	void Set(const char* key, const char* value)
++	{
++		for (int32 i = fLines.CountStrings() - 1; i >= 0; i--) {
++			BString line = fLines.StringAt(i);
++			line.Trim();
++			if (line == key || line.StartsWith(BString(key) << " ")
++				|| line.StartsWith(BString(key) << "\t")) {
++				fLines.Remove(i);
++			}
++		}
++		if (value != NULL)
++			fLines.Add(BString(key) << " " << value);
++	}
++
++	status_t Save() const
++	{
++		BPath directory;
++		fPath.GetParent(&directory);
++		create_directory(directory.Path(), 0755);
++
++		BFile file(fPath.Path(), B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);
++		if (file.InitCheck() != B_OK)
++			return file.InitCheck();
++		BString text = fLines.Join("\n");
++		text << "\n";
++		ssize_t written = file.Write(text.String(), text.Length());
++		return written == text.Length() ? B_OK : B_IO_ERROR;
++	}
++
++private:
++	BPath				fPath;
++	BStringList			fLines;
++};
++
++
++//	#pragma mark - node
++
++
++class HDMINode : public BMediaEventLooper, public BBufferConsumer,
++	public BControllable {
++public:
++								HDMINode(BMediaAddOn* addOn, int32 id);
++	virtual						~HDMINode();
++
++	virtual	BMediaAddOn*		AddOn(int32* _internalID) const;
++
++protected:
++	virtual	void				NodeRegistered();
++	virtual	status_t			HandleMessage(int32 message, const void* data,
++									size_t size);
++	virtual	void				HandleEvent(const media_timed_event* event,
++									bigtime_t lateness, bool realTimeEvent);
++
++	// BBufferConsumer
++	virtual	status_t			AcceptFormat(const media_destination& destination,
++									media_format* format);
++	virtual	status_t			GetNextInput(int32* cookie, media_input* input);
++	virtual	void				DisposeInputCookie(int32 cookie);
++	virtual	void				BufferReceived(BBuffer* buffer);
++	virtual	void				ProducerDataStatus(
++									const media_destination& destination,
++									int32 status, bigtime_t when);
++	virtual	status_t			GetLatencyFor(
++									const media_destination& destination,
++									bigtime_t* _latency,
++									media_node_id* _timeSource);
++	virtual	status_t			Connected(const media_source& source,
++									const media_destination& destination,
++									const media_format& format,
++									media_input* input);
++	virtual	void				Disconnected(const media_source& source,
++									const media_destination& destination);
++	virtual	status_t			FormatChanged(const media_source& source,
++									const media_destination& destination,
++									int32 changeTag,
++									const media_format& format);
++
++	// BControllable
++	virtual	status_t			GetParameterValue(int32 id,
++									bigtime_t* _lastChange, void* value,
++									size_t* _size);
++	virtual	void				SetParameterValue(int32 id, bigtime_t when,
++									const void* value, size_t size);
++
++private:
++			status_t			_CreateBuffers(const media_format& format);
++			void				_DeleteBuffers();
++			void				_ShowFrame(BBuffer* buffer);
++			void				_UpdateWeb();
++			void				_Apply(DriverSettings& settings);
++
++			BMediaAddOn*		fAddOn;
++			int32				fInternalID;
++			int					fDevice;
++			media_input			fInput;
++
++			tegra_dc_overlay_buffer fBuffers[2];
++			int32				fBufferCount;
++			int32				fNext;
++			uint32				fBytesPerRow;
++			uint32				fSourceBytesPerRow;
++			uint32				fWidth;
++			uint32				fHeight;
++			color_space			fSpace;
++			bigtime_t			fLastChange;
++};
++
++
++HDMINode::HDMINode(BMediaAddOn* addOn, int32 id)
++	:
++	BMediaNode("HDMI"),
++	BMediaEventLooper(),
++	BBufferConsumer(B_MEDIA_RAW_VIDEO),
++	BControllable(),
++	fAddOn(addOn),
++	fInternalID(id),
++	fDevice(open(kDevice, O_RDWR)),
++	fBufferCount(0),
++	fNext(0),
++	fLastChange(system_time())
++{
++	AddNodeKind(B_PHYSICAL_OUTPUT);
++}
++
++
++HDMINode::~HDMINode()
++{
++	Quit();
++	_DeleteBuffers();
++	if (fDevice >= 0)
++		close(fDevice);
++}
++
++
++BMediaAddOn*
++HDMINode::AddOn(int32* _internalID) const
++{
++	*_internalID = fInternalID;
++	return fAddOn;
++}
++
++
++void
++HDMINode::NodeRegistered()
++{
++	fInput.node = Node();
++	fInput.source = media_source::null;
++	fInput.destination.port = ControlPort();
++	fInput.destination.id = 0;
++	fInput.format.type = B_MEDIA_RAW_VIDEO;
++	fInput.format.u.raw_video = media_raw_video_format::wildcard;
++	strlcpy(fInput.name, "video in", sizeof(fInput.name));
++
++	_UpdateWeb();
++	SetPriority(B_DISPLAY_PRIORITY);
++	Run();
++}
++
++
++status_t
++HDMINode::HandleMessage(int32 message, const void* data, size_t size)
++{
++	if (BControllable::HandleMessage(message, data, size) == B_OK
++		|| BBufferConsumer::HandleMessage(message, data, size) == B_OK
++		|| BMediaNode::HandleMessage(message, data, size) == B_OK) {
++		return B_OK;
++	}
++	BMediaNode::HandleBadMessage(message, data, size);
++	return B_ERROR;
++}
++
++
++void
++HDMINode::HandleEvent(const media_timed_event* event, bigtime_t lateness,
++	bool realTimeEvent)
++{
++	switch (event->type) {
++		case BTimedEventQueue::B_HANDLE_BUFFER:
++			_ShowFrame((BBuffer*)event->pointer);
++			break;
++		case BTimedEventQueue::B_STOP:
++			EventQueue()->FlushEvents(event->event_time,
++				BTimedEventQueue::B_ALWAYS, true,
++				BTimedEventQueue::B_HANDLE_BUFFER);
++			break;
++		default:
++			break;
++	}
++}
++
++
++status_t
++HDMINode::AcceptFormat(const media_destination& destination,
++	media_format* format)
++{
++	if (destination != fInput.destination)
++		return B_MEDIA_BAD_DESTINATION;
++	if (format->type == B_MEDIA_NO_TYPE)
++		format->type = B_MEDIA_RAW_VIDEO;
++	if (format->type != B_MEDIA_RAW_VIDEO)
++		return B_MEDIA_BAD_FORMAT;
++
++	// the window of the display controller takes YCbCr 4:2:2 and RGB32
++	color_space& space = format->u.raw_video.display.format;
++	if (space == B_NO_COLOR_SPACE)
++		space = B_YCbCr422;
++	if (space != B_YCbCr422 && space != B_RGB32 && space != B_RGBA32)
++		return B_MEDIA_BAD_FORMAT;
++	return B_OK;
++}
++
++
++status_t
++HDMINode::GetNextInput(int32* cookie, media_input* input)
++{
++	if (*cookie != 0)
++		return B_BAD_INDEX;
++	*input = fInput;
++	(*cookie)++;
++	return B_OK;
++}
++
++
++void
++HDMINode::DisposeInputCookie(int32 cookie)
++{
++}
++
++
++void
++HDMINode::BufferReceived(BBuffer* buffer)
++{
++	if (RunState() != B_STARTED || buffer->Header()->destination
++			!= fInput.destination.id) {
++		buffer->Recycle();
++		return;
++	}
++	media_timed_event event(buffer->Header()->start_time,
++		BTimedEventQueue::B_HANDLE_BUFFER, buffer,
++		BTimedEventQueue::B_RECYCLE_BUFFER);
++	EventQueue()->AddEvent(event);
++}
++
++
++void
++HDMINode::ProducerDataStatus(const media_destination& destination,
++	int32 status, bigtime_t when)
++{
++}
++
++
++status_t
++HDMINode::GetLatencyFor(const media_destination& destination,
++	bigtime_t* _latency, media_node_id* _timeSource)
++{
++	if (destination != fInput.destination)
++		return B_MEDIA_BAD_DESTINATION;
++	// the frame shows from the next vertical blank
++	*_latency = 20000;
++	*_timeSource = TimeSource()->ID();
++	return B_OK;
++}
++
++
++status_t
++HDMINode::Connected(const media_source& source,
++	const media_destination& destination, const media_format& format,
++	media_input* input)
++{
++	if (destination != fInput.destination)
++		return B_MEDIA_BAD_DESTINATION;
++
++	status_t status = _CreateBuffers(format);
++	if (status != B_OK)
++		return status;
++
++	fInput.source = source;
++	fInput.format = format;
++	fInput.format.u.raw_video.display.format = fSpace;
++	*input = fInput;
++	return B_OK;
++}
++
++
++void
++HDMINode::Disconnected(const media_source& source,
++	const media_destination& destination)
++{
++	if (source != fInput.source || destination != fInput.destination)
++		return;
++	_DeleteBuffers();
++	fInput.source = media_source::null;
++}
++
++
++status_t
++HDMINode::FormatChanged(const media_source& source,
++	const media_destination& destination, int32 changeTag,
++	const media_format& format)
++{
++	if (source != fInput.source)
++		return B_MEDIA_BAD_SOURCE;
++	if (destination != fInput.destination)
++		return B_MEDIA_BAD_DESTINATION;
++
++	_DeleteBuffers();
++	status_t status = _CreateBuffers(format);
++	if (status != B_OK)
++		return B_MEDIA_BAD_FORMAT;
++	fInput.format = format;
++	return B_OK;
++}
++
++
++status_t
++HDMINode::_CreateBuffers(const media_format& format)
++{
++	const media_raw_video_format& video = format.u.raw_video;
++	fSpace = video.display.format;
++	if (fSpace == B_NO_COLOR_SPACE)
++		fSpace = B_YCbCr422;
++	if (fSpace == B_RGBA32)
++		fSpace = B_RGB32;
++	uint32 bytesPerPixel = fSpace == B_YCbCr422 ? 2 : 4;
++	fWidth = video.display.line_width;
++	fHeight = video.display.line_count;
++	if (fDevice < 0 || fWidth < 2 || fHeight < 2 || fWidth > 2048
++		|| fHeight > 2048) {
++		return B_MEDIA_BAD_FORMAT;
++	}
++	fSourceBytesPerRow = video.display.bytes_per_row != 0
++		? video.display.bytes_per_row : fWidth * bytesPerPixel;
++	fBytesPerRow = (fWidth * bytesPerPixel + 63) & ~63u;
++
++	for (fBufferCount = 0; fBufferCount < 2; fBufferCount++) {
++		tegra_dc_overlay_buffer& buffer = fBuffers[fBufferCount];
++		memset(&buffer, 0, sizeof(buffer));
++		buffer.size = fBytesPerRow * fHeight;
++		if (ioctl(fDevice, TEGRA_DC_ALLOCATE_OVERLAY_BUFFER, &buffer,
++				sizeof(buffer)) != 0) {
++			status_t status = errno;
++			_DeleteBuffers();
++			return status;
++		}
++	}
++	fNext = 0;
++	return B_OK;
++}
++
++
++void
++HDMINode::_DeleteBuffers()
++{
++	if (fBufferCount == 0)
++		return;
++
++	// the panel again on the HDMI screen, before the buffers go
++	tegra_dc_hdmi_video off = {};
++	ioctl(fDevice, TEGRA_DC_SET_HDMI_VIDEO, &off, sizeof(off));
++	for (int32 i = 0; i < fBufferCount; i++) {
++		delete_area(fBuffers[i].area);
++		ioctl(fDevice, TEGRA_DC_RELEASE_OVERLAY_BUFFER, &fBuffers[i].handle,
++			sizeof(fBuffers[i].handle));
++	}
++	fBufferCount = 0;
++}
++
++
++void
++HDMINode::_ShowFrame(BBuffer* buffer)
++{
++	if (fBufferCount == 2) {
++		tegra_dc_overlay_buffer& target = fBuffers[fNext];
++		const uint8* source = (const uint8*)buffer->Data();
++		uint8* destination = (uint8*)target.address;
++		uint32 rowBytes = min_c(fSourceBytesPerRow, fBytesPerRow);
++		uint32 rows = min_c(fHeight,
++			(uint32)(buffer->SizeUsed() / fSourceBytesPerRow));
++		for (uint32 row = 0; row < rows; row++) {
++			memcpy(destination + row * fBytesPerRow,
++				source + row * fSourceBytesPerRow, rowBytes);
++		}
++
++		tegra_dc_hdmi_video video = {};
++		video.enable = 1;
++		video.handle = target.handle;
++		video.space = fSpace;
++		video.bytes_per_row = fBytesPerRow;
++		video.width = fWidth;
++		video.height = fHeight;
++		ioctl(fDevice, TEGRA_DC_SET_HDMI_VIDEO, &video, sizeof(video));
++		fNext = 1 - fNext;
++	}
++	buffer->Recycle();
++}
++
++
++//	#pragma mark - parameters
++
++
++void
++HDMINode::_UpdateWeb()
++{
++	BString status;
++	tegra_dc_hdmi_status hdmi;
++	if (fDevice < 0 || ioctl(fDevice, TEGRA_DC_GET_HDMI_STATUS, &hdmi,
++			sizeof(hdmi)) != 0) {
++		status = "No HDMI output";
++	} else if (!hdmi.plugged)
++		status = "No screen plugged in";
++	else if (!hdmi.active)
++		status = "Screen plugged in, output off";
++	else {
++		status = hdmi.screen_name[0] != '\0' ? hdmi.screen_name : "Screen";
++		status << ": " << hdmi.width << "x" << hdmi.height
++			<< (hdmi.dvi ? ", DVI" : ", HDMI with sound");
++	}
++
++	BParameterWeb* web = new BParameterWeb();
++	BParameterGroup* group = web->MakeGroup("HDMI");
++	group->MakeNullParameter(PARAMETER_STATUS, B_MEDIA_RAW_VIDEO, status,
++		B_GENERIC);
++	group->MakeDiscreteParameter(PARAMETER_OUTPUT, B_MEDIA_RAW_VIDEO,
++		"HDMI output", B_ENABLE);
++	BDiscreteParameter* mode = group->MakeDiscreteParameter(PARAMETER_MODE,
++		B_MEDIA_RAW_VIDEO, "Resolution", B_RESOLUTION);
++	mode->AddItem(0, "Automatic (sharpest for the panel picture)");
++	mode->AddItem(1, "Screen's preferred mode");
++	mode->AddItem(2, "1280x720");
++	group->MakeDiscreteParameter(PARAMETER_DVI, B_MEDIA_RAW_VIDEO,
++		"Plain DVI signal (no sound)", B_ENABLE);
++	group->MakeDiscreteParameter(PARAMETER_SIGNAL, B_MEDIA_RAW_VIDEO,
++		"Stronger signal (long cables)", B_ENABLE);
++	SetParameterWeb(web);
++}
++
++
++status_t
++HDMINode::GetParameterValue(int32 id, bigtime_t* _lastChange, void* value,
++	size_t* _size)
++{
++	if (*_size < sizeof(int32))
++		return B_NO_MEMORY;
++
++	DriverSettings settings;
++	int32 result;
++	switch (id) {
++		case PARAMETER_OUTPUT:
++			result = settings.GetBool("hdmi_output", true);
++			break;
++		case PARAMETER_MODE:
++		{
++			BString mode = settings.Get("hdmi_mode");
++			result = 0;
++			for (int32 i = 1; i < (int32)B_COUNT_OF(kModeValues); i++) {
++				if (mode == kModeValues[i])
++					result = i;
++			}
++			break;
++		}
++		case PARAMETER_DVI:
++			result = settings.GetBool("hdmi_dvi", false);
++			break;
++		case PARAMETER_SIGNAL:
++			result = atoi(settings.Get("hdmi_drive_current").String()) > 15;
++			break;
++		default:
++			return B_BAD_VALUE;
++	}
++
++	*(int32*)value = result;
++	*_size = sizeof(int32);
++	*_lastChange = fLastChange;
++	return B_OK;
++}
++
++
++void
++HDMINode::SetParameterValue(int32 id, bigtime_t when, const void* value,
++	size_t size)
++{
++	if (size < sizeof(int32))
++		return;
++	int32 newValue = *(const int32*)value;
++
++	DriverSettings settings;
++	switch (id) {
++		case PARAMETER_OUTPUT:
++			settings.Set("hdmi_output", newValue != 0 ? NULL : "false");
++			break;
++		case PARAMETER_MODE:
++			settings.Set("hdmi_mode", newValue > 0
++					&& newValue < (int32)B_COUNT_OF(kModeValues)
++				? kModeValues[newValue] : NULL);
++			break;
++		case PARAMETER_DVI:
++			settings.Set("hdmi_dvi", newValue != 0 ? "true" : NULL);
++			break;
++		case PARAMETER_SIGNAL:
++			settings.Set("hdmi_drive_current", newValue != 0 ? "31" : NULL);
++			break;
++		default:
++			return;
++	}
++	_Apply(settings);
++
++	fLastChange = when;
++	BroadcastNewParameterValue(when, id, (void*)value, sizeof(int32));
++}
++
++
++/*!	Saves the settings and restarts the HDMI output with them; the status
++	line follows a moment later, once the screen answered.
++*/
++void
++HDMINode::_Apply(DriverSettings& settings)
++{
++	if (settings.Save() == B_OK && fDevice >= 0)
++		ioctl(fDevice, TEGRA_DC_RECONNECT_HDMI, NULL, 0);
++	_UpdateWeb();
++}
++
++
++//	#pragma mark - add-on
++
++
++class HDMIAddOn : public BMediaAddOn {
++public:
++	HDMIAddOn(image_id image)
++		:
++		BMediaAddOn(image)
++	{
++		fFormat.type = B_MEDIA_RAW_VIDEO;
++		fFormat.u.raw_video = media_raw_video_format::wildcard;
++
++		fInfo.internal_id = 0;
++		fInfo.name = strdup("HDMI");
++		fInfo.info = strdup("The HDMI port of the Tegra 2: video sent here "
++			"fills the HDMI screen.");
++		fInfo.kinds = B_BUFFER_CONSUMER | B_CONTROLLABLE | B_PHYSICAL_OUTPUT;
++		fInfo.flavor_flags = 0;
++		fInfo.possible_count = 1;
++		fInfo.in_format_count = 1;
++		fInfo.in_format_flags = 0;
++		fInfo.in_formats = &fFormat;
++		fInfo.out_format_count = 0;
++		fInfo.out_format_flags = 0;
++		fInfo.out_formats = NULL;
++	}
++
++	virtual ~HDMIAddOn()
++	{
++		free((char*)fInfo.name);
++		free((char*)fInfo.info);
++	}
++
++	virtual status_t InitCheck(const char** _failureText)
++	{
++		// only where the display driver has an HDMI output
++		if (access(kDevice, F_OK) != 0) {
++			*_failureText = "no tegra_dc display driver";
++			return B_ERROR;
++		}
++		return B_OK;
++	}
++
++	virtual int32 CountFlavors()
++	{
++		return access(kDevice, F_OK) == 0 ? 1 : 0;
++	}
++
++	virtual status_t GetFlavorAt(int32 index, const flavor_info** _info)
++	{
++		if (index != 0 || access(kDevice, F_OK) != 0)
++			return B_BAD_INDEX;
++		*_info = &fInfo;
++		return B_OK;
++	}
++
++	virtual BMediaNode* InstantiateNodeFor(const flavor_info* info,
++		BMessage* config, status_t* _error)
++	{
++		*_error = B_OK;
++		return new HDMINode(this, info->internal_id);
++	}
++
++	virtual bool WantsAutoStart()
++	{
++		return false;
++	}
++
++private:
++	flavor_info			fInfo;
++	media_format		fFormat;
++};
++
++
++extern "C" BMediaAddOn*
++make_media_addon(image_id image)
++{
++	return new HDMIAddOn(image);
++}
+diff --git a/src/add-ons/media/media-add-ons/hdmi/Jamfile b/src/add-ons/media/media-add-ons/hdmi/Jamfile
+new file mode 100644
+index 0000000000..27a07870d6
+--- /dev/null
++++ b/src/add-ons/media/media-add-ons/hdmi/Jamfile
+@@ -0,0 +1,9 @@
++SubDir HAIKU_TOP src add-ons media media-add-ons hdmi ;
++
++UsePrivateHeaders graphics [ FDirName graphics tegra_dc ]
++	[ FDirName graphics common ] ;
++
++Addon hdmi.media_addon :
++	HDMIAddOn.cpp
++	: be media [ TargetLibsupc++ ]
++;
+diff --git a/src/preferences/Jamfile b/src/preferences/Jamfile
+index 5fe156a652..b913663c89 100644
+--- a/src/preferences/Jamfile
++++ b/src/preferences/Jamfile
+@@ -6,7 +6,6 @@ SubInclude HAIKU_TOP src preferences bluetooth ;
+ SubInclude HAIKU_TOP src preferences datatranslations ;
+ SubInclude HAIKU_TOP src preferences deskbar ;
+ SubInclude HAIKU_TOP src preferences filetypes ;
+-SubInclude HAIKU_TOP src preferences hdmi ;
+ SubInclude HAIKU_TOP src preferences input ;
+ SubInclude HAIKU_TOP src preferences joysticks ;
+ SubInclude HAIKU_TOP src preferences keymap ;

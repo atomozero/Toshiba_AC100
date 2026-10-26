@@ -1,7 +1,7 @@
-From 38448c3fb9e8242cc436dd8375e0e836cd83b8d3 Mon Sep 17 00:00:00 2001
+From 0aeefe5caebb93818c6c1f3e8f003cbb37b264cd Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 10:57:50 +0200
-Subject: [PATCH 076/203] ARM: keep the system time offset, read the NVIDIA
+Subject: [PATCH 076/270] ARM: keep the system time offset, read the NVIDIA
  Tegra real time clock
 
 arch_rtc_set_system_time_offset() did nothing and the offset was always

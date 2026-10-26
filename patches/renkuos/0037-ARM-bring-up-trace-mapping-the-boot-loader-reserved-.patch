@@ -1,7 +1,7 @@
-From 2d65d0d8bc0bf0bf942ac3366efa6bb1af94c901 Mon Sep 17 00:00:00 2001
+From 8ffc65dfa2ab3e4da876668dae1d82d5433ea030 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 19:12:57 +0200
-Subject: [PATCH 037/203] ARM bring-up: trace mapping the boot loader reserved
+Subject: [PATCH 037/270] ARM bring-up: trace mapping the boot loader reserved
  areas (not for merging)
 
 ---

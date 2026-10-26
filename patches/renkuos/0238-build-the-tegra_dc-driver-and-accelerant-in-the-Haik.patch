@@ -1,0 +1,31 @@
+From 4f737d03ecf6c97fe865b43b934dba7176036632 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 25 Oct 2026 22:06:18 +0100
+Subject: [PATCH 238/270] build: the tegra_dc driver and accelerant in the
+ Haiku package on ARM
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ build/jam/packages/Haiku | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index b44b05ef78..ba6e888cf8 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -191,6 +191,7 @@ AddDriversToPackage dvb :
+ 	;
+ AddDriversToPackage graphics
+ 	: $(SYSTEM_ADD_ONS_DRIVERS_GRAPHICS) ;
++AddDriversToPackage graphics : tegra_dc@arm ;
+ AddDriversToPackage input :
+ 	ps2_hid
+ 	usb_hid
+@@ -387,6 +388,7 @@ AddBootModuleSymlinksToPackage
+ # add-ons
+ AddFilesToPackage add-ons accelerants :
+ 	framebuffer.accelerant
++	tegra_dc.accelerant@arm
+ 	virtio_gpu.accelerant
+ 	$(SYSTEM_ADD_ONS_ACCELERANTS) ;
+ AddFilesToPackage add-ons locale catalogs :

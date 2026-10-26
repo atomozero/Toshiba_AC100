@@ -1,7 +1,7 @@
-From d5ce952101cb18648b40e5433071e2a1adb51b02 Mon Sep 17 00:00:00 2001
+From c5681ad66e6bec21e076260f8740f84e7dd969d9 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Tue, 20 Oct 2026 00:25:19 +0200
-Subject: [PATCH 156/203] mmc_bus: keep asking an MMC device for its operating
+Subject: [PATCH 156/270] mmc_bus: keep asking an MMC device for its operating
  conditions
 
 The first CMD1 after power up can get no reply, as with the eMMC of the

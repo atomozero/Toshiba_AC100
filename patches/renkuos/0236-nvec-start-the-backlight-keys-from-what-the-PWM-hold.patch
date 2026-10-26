@@ -1,0 +1,80 @@
+From ed4a30468d2dde6215c67f16a1e9a53ab706787f Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 25 Oct 2026 22:06:18 +0100
+Subject: [PATCH 236/270] nvec: start the backlight keys from what the PWM
+ holds
+
+The display driver sets the backlight too: the brightness of the Screen
+preferences, and the backlight off while the screen sleeps. The backlight
+keys now start from the PWM setting instead of the level they last set,
+and the lid restores the setting it found when it closed.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/add-ons/kernel/busses/i2c/nvec/nvec.cpp | 25 ++++++++++++++-------
+ 1 file changed, 17 insertions(+), 8 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+index 073805b3e5..487eec3a32 100644
+--- a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
++++ b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+@@ -175,6 +175,7 @@ struct nvec_device {
+ 	volatile uint32*	pwm;			// backlight, if its clock runs
+ 	int32				backlightLevel;	// 1 - BACKLIGHT_LEVELS
+ 	bool				lidClosed;		// the backlight is off meanwhile
++	uint32				lidPwm;			// the PWM setting before the lid closed
+ 	volatile uint8*		gpio;
+ 	uint32				requestGPIO;
+ 	bool				requestActiveLow;
+@@ -787,24 +788,30 @@ put_key(nvec_device* device, uint32 keycode, bool down)
+ 
+ 
+ /*!	The backlight keys (Fn + F4 and F5) change the duty cycle of the PWM
+-	driving the backlight, if the firmware left it running.
++	driving the backlight, if the firmware left it running. The display
++	driver sets it too (the brightness of the Screen preferences, and the
++	backlight off while the screen sleeps), so the keys start from what the
++	PWM holds, not from the level they last set.
+ */
+ static void
+ change_backlight(nvec_device* device, int32 delta)
+ {
+-	if (device->pwm == NULL)
++	if (device->pwm == NULL || device->lidClosed)
+ 		return;
+ 
++	uint32 pwm = *device->pwm;
++	uint32 duty = (pwm & TEGRA_PWM_DUTY_MASK) >> TEGRA_PWM_DUTY_SHIFT;
++	if ((pwm & TEGRA_PWM_ENABLE) != 0 && duty != 0)
++		device->backlightLevel = (duty * BACKLIGHT_LEVELS + 128) / 256;
++
+ 	int32 level = device->backlightLevel + delta;
+ 	if (level < 1)
+ 		level = 1;
+ 	if (level > BACKLIGHT_LEVELS)
+ 		level = BACKLIGHT_LEVELS;
+ 	device->backlightLevel = level;
+-	if (device->lidClosed)
+-		return;
+ 
+-	uint32 duty = level * 256 / BACKLIGHT_LEVELS;
++	duty = level * 256 / BACKLIGHT_LEVELS;
+ 	*device->pwm = (*device->pwm & ~TEGRA_PWM_DUTY_MASK) | TEGRA_PWM_ENABLE
+ 		| (duty << TEGRA_PWM_DUTY_SHIFT);
+ 	TRACE_ALWAYS("backlight level %" B_PRId32 ", PWM %#" B_PRIx32 "\n", level,
+@@ -823,10 +830,12 @@ set_lid_closed(nvec_device* device, bool closed)
+ 
+ 	if (device->pwm == NULL)
+ 		return;
+-	if (closed)
++	// Leave the backlight as the lid found it, whoever set it
++	if (closed) {
++		device->lidPwm = *device->pwm;
+ 		*device->pwm &= ~(TEGRA_PWM_DUTY_MASK | TEGRA_PWM_ENABLE);
+-	else
+-		change_backlight(device, 0);
++	} else
++		*device->pwm = device->lidPwm;
+ }
+ 
+ 

@@ -1,0 +1,71 @@
+From 2ab83edd9cfd6ad45add2f6dccb7d5d0de0a9f90 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 25 Oct 2026 22:21:24 +0100
+Subject: [PATCH 239/270] nvec: enable the input again after 30 seconds without
+ events
+
+The embedded controller of the AC100 sometimes stops sending keyboard and
+touchpad events while it still answers requests. Enabling the events,
+the keyboard and the touchpad again, as at start, brings them back (tried
+by hand). These requests change nothing when the input works, so they
+are sent whenever no event came for about 30 seconds.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/add-ons/kernel/busses/i2c/nvec/nvec.cpp | 34 +++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+index 487eec3a32..7f741c1534 100644
+--- a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
++++ b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+@@ -1141,6 +1141,26 @@ check_lost_interrupt(nvec_device* device)
+ }
+ 
+ 
++/*!	The EC sometimes stops sending keyboard and touchpad events, while it
++	still answers requests (seen on the AC100, after a minute or after
++	hours). Enabling the events, the keyboard and the touchpad again, as at
++	start, brings them back. These requests change nothing when the input
++	already works, so they are simply sent after a while without events.
++*/
++static void
++enable_input_again(nvec_device* device)
++{
++	static const uint8 kGlobalEvents[] = { NVEC_SLEEP, GLOBAL_EVENTS, 1 };
++	static const uint8 kKeyboardEnable[] = { NVEC_KBD, KBD_ENABLE };
++
++	nvec_write(device, kGlobalEvents, sizeof(kGlobalEvents));
++	snooze(50000);
++	nvec_write(device, kKeyboardEnable, sizeof(kKeyboardEnable));
++	snooze(50000);
++	nvec_write(device, kMouseEnable, sizeof(kMouseEnable));
++}
++
++
+ /*!	Asks for the power supply and one battery value every 5 seconds, in turn:
+ 	all at once seems to overload the EC (as in Linux).
+ */
+@@ -1151,8 +1171,22 @@ poll_thread(void* data)
+ 	static const uint8 kBatteryValues[] = { BAT_SLOT_STATUS, BAT_VOLTAGE,
+ 		BAT_CURRENT, BAT_CAPACITY_REMAINING };
+ 	uint32 next = 0;
++	uint32 lastEvents = 0;
++	int32 quietRounds = 0;
++	int32 reenabled = 0;
+ 
+ 	while (!device->stopping) {
++		// About 30 seconds without any event: wake the input up again
++		if (device->events != lastEvents) {
++			lastEvents = device->events;
++			quietRounds = 0;
++		} else if (++quietRounds >= 6) {
++			quietRounds = 0;
++			if (reenabled++ < 20)
++				TRACE_ALWAYS("no events for 30 s, enabling the input again\n");
++			enable_input_again(device);
++		}
++
+ 		static const uint8 kSystemStatus[] = { NVEC_SYS, GET_SYSTEM_STATUS };
+ 		nvec_write(device, kSystemStatus, sizeof(kSystemStatus));
+ 		snooze(100000);

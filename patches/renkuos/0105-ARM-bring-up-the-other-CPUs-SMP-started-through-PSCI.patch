@@ -1,7 +1,7 @@
-From 311f858807a6f7ca309cac16e5005dd658f2fd8d Mon Sep 17 00:00:00 2001
+From 72ed0e5bbe332db3aba763293e4248d2da6474ba Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 17:22:28 +0200
-Subject: [PATCH 105/203] ARM: bring up the other CPUs (SMP), started through
+Subject: [PATCH 105/270] ARM: bring up the other CPUs (SMP), started through
  PSCI
 
 Loader: the CPUs whose enable-method is PSCI are started on a second entry

@@ -1,7 +1,7 @@
-From 2b6eca43ddecaa0766b04104342d41d63b01d79e Mon Sep 17 00:00:00 2001
+From c9a831a63f74e9f72403ab7fbbadbb05969f2ecb Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?Przemys=C5=82aw=20Buczkowski?= <prem@prem.moe>
 Date: Thu, 10 Sep 2026 22:01:44 +0900
-Subject: [PATCH 159/203] kernel/arm64: read CPU ID and report vendor/model
+Subject: [PATCH 159/270] kernel/arm64: read CPU ID and report vendor/model
 
 Change-Id: Ie5b1c84eedafea05382d5d1ad52d768b28031063
 Reviewed-on: https://review.haiku-os.org/c/haiku/+/11725

@@ -1,7 +1,7 @@
-From a5587e29f882bf646b7f8e638f93c4d36622078d Mon Sep 17 00:00:00 2001
+From 3a8f212a61f41b727e6b520830001a13d59cfac4 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 23:19:21 +0200
-Subject: [PATCH 060/203] ARM bring-up: finer EHCI start traces (not for
+Subject: [PATCH 060/270] ARM bring-up: finer EHCI start traces (not for
  merging)
 
 ---

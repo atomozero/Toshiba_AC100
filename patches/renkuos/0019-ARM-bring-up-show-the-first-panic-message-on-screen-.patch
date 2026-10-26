@@ -1,7 +1,7 @@
-From 6c75aae3f9e803b3b35e56591e087dfe215a468d Mon Sep 17 00:00:00 2001
+From 9f78ea3f08aea87637edd53dd90e72f6007c73ea Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 16:38:25 +0200
-Subject: [PATCH 019/203] ARM bring-up: show the first panic message on screen
+Subject: [PATCH 019/270] ARM bring-up: show the first panic message on screen
  and halt (not for merging)
 
 ---

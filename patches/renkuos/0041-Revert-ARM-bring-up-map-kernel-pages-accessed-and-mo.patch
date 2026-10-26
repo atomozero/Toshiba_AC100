@@ -1,7 +1,7 @@
-From ed4e6b80a92cbbbf3737f62e885eee8c052b4d3d Mon Sep 17 00:00:00 2001
+From 9758d30f5b1433bf6e1e8728163c44f1e770c5d3 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 19:36:34 +0200
-Subject: [PATCH 041/203] Revert "ARM bring-up: map kernel pages accessed and
+Subject: [PATCH 041/270] Revert "ARM bring-up: map kernel pages accessed and
  modified (experiment, not for merging)"
 
 This reverts commit 5302adcf4bab21c10658476706a095d16ef4644f.

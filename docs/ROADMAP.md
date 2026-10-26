@@ -116,6 +116,96 @@ In ordine di valore: SMP (CPU1 via flow controller, §6.5) · retroilluminazione
 eMMC come disco di sistema · audio ALC5632 + I2S · Wi-Fi USB · HDMI · DVFS e
 temperatura.
 
+## Fase 7: prestazioni e sviluppo nativo
+
+- [x] Tensioni nominali per 1 GHz (25/10): la CPU girava a 1,0 V invece di 1,1 V.
+      `tegra_nominal_voltages true` le alza all'avvio; driver `tegra_dvfs` per leggerle.
+- [x] **gcc nativo per ARMv7-A** (25/10): `gcc_bootstrap` compilava per default per ARMv4T
+      (codice lento, niente atomiche a 64 bit, serviva `libatomic`). Il file `specs` della
+      revisione 3 non bastava: i default di configure si applicano prima. Revisione 4 nel
+      devel-kit, con driver e compilatori ricompilati con `--with-arch=armv7-a
+      --with-tune=cortex-a9 --with-fpu=vfpv3-d16`; stessi flag nella ricetta di `haikuports.cross`.
+- [~] **Bluetooth**: il modulo USB `0db0:a871` è un CSR BlueCore4. All'immagine `minimum`
+      mancavano `bluetooth_server`, lo stack HCI/L2CAP e il driver `h2generic`: aggiunti
+      (25/10, hrev 428). Il modulo va online e risponde (indirizzo e nome letti). Il server
+      parte su richiesta della preferenza Bluetooth. Da provare: ricerca e abbinamento di un
+      dispositivo; poi eventualmente il profilo HID dei GSoC (Gerrit 11406 + 11688).
+- [ ] `hzram` (swap compresso in RAM): il core (allocatore + LZ4) passa i test sull'AC100,
+      LZ4 scrive 33–65 MB/s e legge 80–125 MB/s (30–120 µs a pagina). L'integrazione nel
+      kernel non è ancora utilizzabile: il loro `VMAnonymousCache.cpp` non sostituisce quello
+      di Haiku e il pool è tutto memoria bloccata.
+- [ ] Sensore ADT7461: il canale remoto (CPU) resta fermo a 48,5 °C.
+- [ ] cpufreq e SCLK oltre 72 MHz, con le tabelle OPP di Linux.
+- [x] Traduttore JPEG nell'immagine (25/10, hrev 430), con la correzione di `__swap_float`
+      e `__swap_double` in libroot: con l'ABI hard-float non scambiavano nulla.
+- [x] Rapporti di crash (25/10, hrev 431): Debugger non esiste per ARM, quindi "Salva
+      rapporto" non salvava nulla. Ora, se Debugger manca, debug_server scrive da sé sulla
+      Scrivania un rapporto di testo (motivo, registri, stack di tutti i thread, librerie).
+- [ ] Crash occasionali: `campiello_daemon` all'avvio (in `BApplication`, lettura a 0x4 in
+      `BTokenSpace`), preferenza Bluetooth e NetSurf (`double free`).
+- [ ] `hey`: SIGBUS (accesso non allineato) stampando un `double`.
+- [ ] Applicazioni di atomozero: **Pippo** (server MCP nativo) e **Pluto** (client AI con
+      CLI, GUI e add-on di Tracker), compilate sull'AC100 e incluse nell'immagine.
+- [ ] HaikuBench: patch per i 32 bit (`fCommandPool` come `uint64`, `-march=armv7-a`).
+
+## Fase 8: driver video nativo (controller video del Tegra 2)
+
+Codice MIT; Linux (GPL) solo come documentazione, grate/opentegra (MIT) riutilizzabili.
+app_server non usa più le funzioni 2D degli accelerant (dal 2024): il guadagno viene
+dal controller video (32 bit, overlay, cursore), il motore 2D serve solo con modifiche
+ad app_server.
+
+- [x] **Fase 0, misure** (25/10). Strumenti: `tegra_dc_diag` (driver di sola lettura,
+      `/dev/misc/tegra_dc_diag`) e `tests/fbbench`.
+      - DC A da PLL_P, divisore 6 = 54 MHz; tempi da EDID: H sync 32, bp 330, fp 48;
+        V sync 6, bp 21, fp 3 (59,8 Hz). Finestra A B5G6R5 a `0x1f800000`, passo 2048.
+        Gli indirizzi per finestra di Linux (0xa00/0xc00/0xe00) **non** sono finestre
+        separate: raggiungono tutti la finestra scelta con `DC_CMD_DISPLAY_WINDOW_HEADER`.
+      - host1x acceso a 150 MHz; 2D, 3D, DC B, HDMI spenti; PLL_D spento.
+      - Memoria `0x1f800000`–`0x1ffd0000` (7,8 MB) riservata e libera; gli ultimi 192 KB
+        sono del kernel ("physical page pool").
+      - Schermata intera: oggi a 16 bit 13,9 ms (conversione come app_server); a 32 bit
+        copia semplice circa 3,5 ms.
+- [x] Fase 1: driver `tegra_dc` e accelerant (25/10). 16/32 bit (B8G8R8A8, "24 bit" nella
+      preferenza Schermo), vsync a 60 Hz, luminosità (PWM, 256 livelli) e DPMS, nel pacchetto
+      `haiku` per ARM. Dithering già attivo da U-Boot (error diffusion, 6 bit). Nessun clock o
+      tempo toccato; ripiego sul framebuffer. GLTeapot circa 110 FPS.
+      - Il semaforo del vsync va assegnato al team che apre il device (come intel_extreme).
+      - nvec: i tasti Fn ripartono dal valore del PWM; il coperchio ripristina ciò che trova;
+        se l'EC non manda eventi per 30 s rimanda l'abilitazione di eventi, tastiera e
+        touchpad (sblocca l'input muto).
+      - Preferenza Schermo: lo slider segue i tasti Fn; frequenza unica arrotondata come quella
+        del modo (mostrava "refresh rate").
+      - Corretto un double free di `BMenuField` alla chiusura delle finestre (patch in
+        `patches/0001-BMenuField-...`).
+- [x] Fase 2: cursore a colori sulla finestra C (25/10, commit `f2eed36425`, `bb84d765d5`).
+      Immagine 64×64 B8G8R8A8 fusa sulla finestra A con l'alfa dei pixel (C in ALPHA_WEIGHT,
+      A in DEPENDENT_WEIGHT); ritaglio ai bordi con gli offset di lettura; finestre scelte
+      con il registro header. `hardware_cursor false` nelle impostazioni del driver
+      `tegra_dc` torna al cursore software. Provato: un solo cursore, trasparenza corretta.
+- [x] Fase 3: overlay video sulla finestra B (25/10, commit `9b3ff7cb28`, `a3ae77c584`,
+  `4bc9f8d9ad`, provata con overlaytest su hrev 534). Buffer contigui WC allocati dal driver e clonati in app_server;
+  finestra B con YCbCr 4:2:2 (UYVY + SWAP2 = YUYV), CSC BT.601, filtri lineari H/V,
+  color key 0 sulla finestra A. app_server passa al client area e offset del buffer:
+  BBitmap::Bits() ne clona l'area (prima il client riceveva un indirizzo valido solo in
+  app_server). Test: `tests/overlay/overlaytest.cpp`, poi MediaPlayer.
+- [~] Fase 4: HDMI (26/10, commit locali `3b8644425c`..`ad3ba92b63`). Specchio funzionante: hotplug
+  (GPIO N7), LDO7/LDO8, EDID su I2C2, PLL_D = 2x pclk, DC B scala il frame buffer (pillarbox),
+  cursore (finestra C) e overlay (finestra B) anche sulla TV; 1080p stabile su TV LG 4K, HDMI e
+  DVI. Audio HDMI **pulito** (26/10, `48efa5ff5b`, `6fcfa4053f`): tegra_audio duplica su S/PDIF e rende
+  un buffer al media server solo quando l'hanno finito sia I2S sia S/PDIF (prima S/PDIF leggeva
+  campioni già sovrascritti: suono metallico); ACR 44,1 kHz, sorgente audio automatica; il mirror
+  usa 720p (a 1080p il collegamento era al limite); altoparlante muto con HDMI collegato.
+  Da fare: solo-esterno/esteso (richiede app_server).
+- [~] Fase 5: host1x e motore 2D (26/10, `3f1389183b`). `tegra_gr2d` (bring-up, /dev/misc):
+  canale host1x 7 + sync point 25, riempimento e copia corretti; 512x300x32: fill 0,29 ms,
+  copia 0,68 ms (CPU 0,78 / 3,1 ms su memoria WC). Trappola: DMAPUT/GET/END sono offset da
+  DMASTART e DMAINITGET copia DMAPUT in DMAGET (con indirizzi assoluti il DMA legge al doppio
+  dell'indirizzo -> decode error MC di host1xdmar). Per usarlo davvero servono buffer visti dalla
+  GPU: o il back buffer di app_server nella carveout (ma la CPU ci disegna male, è WC), o la GART
+  (apertura 32 MB a 0x58000000) per mappare pagine sparse. app_server non ha più hook 2D.
+- [ ] Fase 6: 3D (GR3D): accensione e test, poi driver Gallium (fork di grate).
+
 ---
 
 ## Decisioni aperte

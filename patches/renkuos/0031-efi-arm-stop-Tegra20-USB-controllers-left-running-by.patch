@@ -1,7 +1,7 @@
-From 2a03e15176db415cd68332fd2aba6c7c913a233a Mon Sep 17 00:00:00 2001
+From 57f31d4ab5e2c3c9dc57c75bd8d17e8c2f55e4e4 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 18:22:55 +0200
-Subject: [PATCH 031/203] efi/arm: stop Tegra20 USB controllers left running by
+Subject: [PATCH 031/270] efi/arm: stop Tegra20 USB controllers left running by
  the firmware (bring-up)
 
 ---

@@ -1,0 +1,510 @@
+From 8b83a683fa64cb7e83a1e682637c1f3c075a15b3 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 26 Oct 2026 23:06:16 +0100
+Subject: [PATCH 270/270] tegra_audio: record from the built-in or the headset
+ microphone
+
+The codec's digital microphone (next to the camera) or the headset
+microphone of the jack (MIC1 with its bias), as the PAZ00 routing of
+Linux has them, go through its ADC back over I2S into the second FIFO
+of I2S1, which a third APB DMA channel empties into record buffers
+after the playback ones. The device describes two input channels at
+44.1 kHz, and the mixer gets an input group with the record level, the
+microphone to use and its boost.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../drivers/audio/tegra/tegra_audio.cpp       | 304 ++++++++++++++++--
+ 1 file changed, 277 insertions(+), 27 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp b/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
+index 8477dfd223..1da9e78fcf 100644
+--- a/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
++++ b/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
+@@ -15,6 +15,10 @@
+ 	bus, is a slave that routes its DAC to the speaker (class D amplifier) and
+ 	the headphones.
+ 
++	Recording: the codec's digital microphone (next to the camera) or the
++	headset microphone of the jack (MIC1) go through its ADC back over the
++	same I2S link, into the second FIFO of I2S1 and a third DMA channel.
++
+ 	The same buffers also go to the S/PDIF controller, through a second DMA
+ 	channel: the HDMI block takes its audio from there (TRM 27.3). Its clock,
+ 	128 fs = 5.6448 MHz, is PLL A out 0 divided by 4, so both outputs run at
+@@ -151,6 +155,9 @@ struct tegra_audio_diag {
+ #define APBDMA_CHANNEL				1
+ #define APBDMA_CHANNEL_OFFSET		(0x1000 + APBDMA_CHANNEL * 0x20)
+ #define APBDMA_CHANNEL_IRQ			(32 + 104 + APBDMA_CHANNEL)
++#define RECORD_DMA_CHANNEL			3
++#define RECORD_DMA_CHANNEL_OFFSET	(0x1000 + RECORD_DMA_CHANNEL * 0x20)
++#define RECORD_DMA_CHANNEL_IRQ		(32 + 104 + RECORD_DMA_CHANNEL)
+ #define SPDIF_DMA_CHANNEL			2
+ #define SPDIF_DMA_CHANNEL_OFFSET	(0x1000 + SPDIF_DMA_CHANNEL * 0x20)
+ #define SPDIF_DMA_CHANNEL_IRQ		(32 + 104 + SPDIF_DMA_CHANNEL)
+@@ -192,6 +199,12 @@ struct tegra_audio_diag {
+ #define ALC5632_SPK_OUT_VOL			0x02
+ #define ALC5632_HP_OUT_VOL			0x04
+ #define ALC5632_STEREO_DAC_IN_VOL	0x0c
++#define ALC5632_MIC_VOL				0x0e
++#define ALC5632_ADC_REC_GAIN		0x12	// left 12-8, right 4-0
++#define ALC5632_ADC_REC_MIXER		0x14	// mutes: MIC1 bits 14 and 6
++#define ALC5632_I2S_OUT_CTL			0x1a	// bit 5: 0 = the stereo ADC
++#define ALC5632_MIC_CTRL			0x22	// MIC1 boost bits 11-10
++#define ALC5632_DIGI_BOOST_CTRL		0x24	// digital microphone
+ #define ALC5632_MIC_ROUTING_CTRL	0x10
+ #define ALC5632_OUTPUT_MIXER_CTRL	0x1c
+ #define ALC5632_PWR_DOWN_CTRL_STATUS	0x26
+@@ -266,6 +279,14 @@ struct tegra_audio {
+ 
+ 	// the mixer controls (Media preferences, Cortex): attenuation of the
+ 	// left and right channel in 1.5 dB steps (0 - 31), mute by the user
++	uint8					recordLevel[2];		// ADC gain, -16.5 dB + 1.5 dB n
++	uint8					micBoost;			// in steps of 6 dB (0 - 7)
++	int32					inputSource;		// 0 digital, 1 headset microphone
++	volatile uint8*			recordChannel;
++	bool					recordInterruptInstalled;
++	int32					recording;			// the buffer the DMA fills
++	int64					framesRecorded;
++	bigtime_t				recordTime;
+ 	uint8					speakerLevel[2];
+ 	uint8					headphoneLevel[2];
+ 	bool					speakerMuted;
+@@ -429,6 +450,51 @@ codec_init(tegra_audio* audio)
+ }
+ 
+ 
++/*!	The ADC records the digital microphone or the headset one (MIC1, with
++	its bias), as the PAZ00 routing of Linux has them; its gain is the
++	record level. Called with the lock held.
++*/
++static void
++set_input(tegra_audio* audio)
++{
++	bool digital = audio->inputSource == 0;
++	uint8 boost = audio->micBoost & 7;
++
++	// the gain of the ADC: 5 bits per channel
++	uint16 gain;
++	if (codec_read(audio, ALC5632_ADC_REC_GAIN, &gain) == B_OK) {
++		gain = (gain & ~0x1f1f) | ((audio->recordLevel[0] & 0x1f) << 8)
++			| (audio->recordLevel[1] & 0x1f);
++		codec_write(audio, ALC5632_ADC_REC_GAIN, gain);
++	}
++	// the stereo ADC on the I2S output
++	codec_update(audio, ALC5632_I2S_OUT_CTL, 1U << 5, 0);
++
++	if (digital) {
++		// digital microphone on, into both ADC channels (the routing bits
++		// mute when set), its boost in steps of 6 dB
++		codec_write(audio, ALC5632_DIGI_BOOST_CTRL, (1U << 15) | boost);
++		codec_write(audio, ALC5632_ADC_REC_MIXER, 0x7f7f);
++		codec_update(audio, ALC5632_PWR_MANAG_ADD1, 1U << 3, 0);
++		codec_update(audio, ALC5632_PWR_MANAG_ADD2, 0x00c3, 0x00c0);
++		codec_update(audio, ALC5632_PWR_MANAG_ADD3, 1U << 3, 0);
++	} else {
++		// MIC1 with its bias and boost (0, 20, 30 or 40 dB) into the record
++		// mixers
++		uint16 micBoost = boost == 0 ? 0 : boost <= 3 ? 1 : boost <= 5 ? 2 : 3;
++		codec_write(audio, ALC5632_DIGI_BOOST_CTRL, 0x00c0);
++		codec_update(audio, ALC5632_MIC_CTRL, 3U << 10, micBoost << 10);
++		codec_write(audio, ALC5632_ADC_REC_MIXER,
++			0x7f7f & ~((1U << 14) | (1U << 6)));
++		codec_update(audio, ALC5632_PWR_MANAG_ADD1, 1U << 3, 1U << 3);
++		codec_update(audio, ALC5632_PWR_MANAG_ADD2, 0x00c3, 0x00c3);
++		codec_update(audio, ALC5632_PWR_MANAG_ADD3, 0x000a, 0x000a);
++	}
++	TRACE_ALWAYS("recording the %s microphone, gain %u, boost %u\n",
++		digital ? "built-in" : "headset", audio->recordLevel[0], boost);
++}
++
++
+ /*!	A volume register of the ALC5632: attenuation of the left channel in
+ 	bits 12-8 and of the right one in bits 4-0, mutes in bits 15 and 7.
+ */
+@@ -671,6 +737,34 @@ buffer_physical(tegra_audio* audio, int32 index)
+ }
+ 
+ 
++/*!	The record buffers follow the playback ones in the same area. */
++static inline phys_addr_t
++record_physical(tegra_audio* audio, int32 index)
++{
++	return buffer_physical(audio, audio->bufferCount + index);
++}
++
++
++static int32
++record_dma_interrupt(void* data)
++{
++	tegra_audio* audio = (tegra_audio*)data;
++	uint32 status = read32(audio->recordChannel, DMA_STATUS);
++	if ((status & DMA_STATUS_EOC) == 0)
++		return B_UNHANDLED_INTERRUPT;
++	write32(audio->recordChannel, DMA_STATUS, status);
++
++	acquire_spinlock(&audio->interruptLock);
++	audio->recording = (audio->recording + 1) % audio->bufferCount;
++	write32(audio->recordChannel, DMA_AHB_PTR, record_physical(audio,
++		(audio->recording + 1) % audio->bufferCount));
++	audio->framesRecorded += audio->bufferFrames;
++	audio->recordTime = system_time();
++	release_spinlock(&audio->interruptLock);
++	return B_HANDLED_INTERRUPT;
++}
++
++
+ static int32
+ dma_interrupt(void* data)
+ {
+@@ -791,8 +885,32 @@ start_playback(tegra_audio* audio)
+ 	if (audio->spdifEnabled)
+ 		start_spdif_dma(audio);
+ 
+-	write32(audio->i2s, I2S_FIFO_SCR,
+-		I2S_FIFO_SCR_ATN_FOUR_SLOTS | I2S_FIFO_SCR_FIFO1_CLR);
++	// recording, from the I2S1 receive FIFO into the record buffers
++	if (audio->recordInterruptInstalled) {
++		audio->recording = 0;
++		audio->framesRecorded = 0;
++		audio->recordTime = system_time();
++		write32(audio->dma, APBDMA_IRQ_MASK_SET, 1U << RECORD_DMA_CHANNEL);
++		volatile uint8* channel = audio->recordChannel;
++		uint32 recordCsr = DMA_CSR_FLOW | DMA_CSR_IE_EOC
++			| (I2S_DMA_REQUEST << DMA_CSR_REQ_SEL_SHIFT)
++			| ((audio->bufferFrames * FRAME_SIZE - 4) & 0xfffc);
++			// direction: from the device
++		write32(channel, DMA_CSR, recordCsr);
++		write32(channel, DMA_STATUS, read32(channel, DMA_STATUS));
++		write32(channel, DMA_APB_SEQ,
++			DMA_APB_SEQ_BUS_WIDTH_32 | DMA_APB_SEQ_WRAP_WORD_1);
++		write32(channel, DMA_APB_PTR, I2S1_BASE + I2S_FIFO2);
++		write32(channel, DMA_AHB_SEQ, DMA_AHB_SEQ_INTR_ENABLE
++			| DMA_AHB_SEQ_BUS_WIDTH_32 | DMA_AHB_SEQ_BURST_4);
++		write32(channel, DMA_AHB_PTR, record_physical(audio, 0));
++		write32(channel, DMA_CSR, recordCsr | DMA_CSR_ENABLE);
++		write32(channel, DMA_AHB_PTR,
++			record_physical(audio, 1 % audio->bufferCount));
++	}
++
++	write32(audio->i2s, I2S_FIFO_SCR, I2S_FIFO_SCR_ATN_FOUR_SLOTS
++		| I2S_FIFO_SCR_FIFO1_CLR | I2S_FIFO_SCR_FIFO2_CLR);
+ 	if (audio->spdifEnabled) {
+ 		// the DMA fills the S/PDIF FIFO first (TRM 27.3.3.7)
+ 		spin(20);
+@@ -800,8 +918,9 @@ start_playback(tegra_audio* audio)
+ 		write32(audio->spdif, SPDIF_CTRL,
+ 			read32(audio->spdif, SPDIF_CTRL) | SPDIF_CTRL_TX_EN);
+ 	}
+-	write32(audio->i2s, I2S_CTRL,
+-		read32(audio->i2s, I2S_CTRL) | I2S_CTRL_FIFO1_ENABLE);
++	write32(audio->i2s, I2S_CTRL, read32(audio->i2s, I2S_CTRL)
++		| I2S_CTRL_FIFO1_ENABLE
++		| (audio->recordInterruptInstalled ? I2S_CTRL_FIFO2_ENABLE : 0));
+ 
+ 	audio->running = true;
+ }
+@@ -813,8 +932,15 @@ stop_playback(tegra_audio* audio)
+ 	if (!audio->running)
+ 		return;
+ 
+-	write32(audio->i2s, I2S_CTRL,
+-		read32(audio->i2s, I2S_CTRL) & ~I2S_CTRL_FIFO1_ENABLE);
++	write32(audio->i2s, I2S_CTRL, read32(audio->i2s, I2S_CTRL)
++		& ~(I2S_CTRL_FIFO1_ENABLE | I2S_CTRL_FIFO2_ENABLE));
++	if (audio->recordInterruptInstalled) {
++		write32(audio->recordChannel, DMA_CSR,
++			read32(audio->recordChannel, DMA_CSR)
++				& ~(DMA_CSR_ENABLE | DMA_CSR_IE_EOC));
++		write32(audio->recordChannel, DMA_STATUS,
++			read32(audio->recordChannel, DMA_STATUS));
++	}
+ 	write32(audio->channel, DMA_CSR, read32(audio->channel, DMA_CSR)
+ 		& ~(DMA_CSR_ENABLE | DMA_CSR_IE_EOC));
+ 	write32(audio->channel, DMA_STATUS, read32(audio->channel, DMA_STATUS));
+@@ -841,7 +967,8 @@ create_buffers(tegra_audio* audio, uint32 frames, uint32 count)
+ 		audio->bufferArea = -1;
+ 	}
+ 
+-	size_t size = ROUNDUP(frames * FRAME_SIZE * count, B_PAGE_SIZE);
++	// playback buffers, then as many record buffers
++	size_t size = ROUNDUP(frames * FRAME_SIZE * count * 2, B_PAGE_SIZE);
+ 	void* address;
+ 	audio->bufferArea = create_area("tegra audio buffers", &address,
+ 		B_ANY_KERNEL_ADDRESS, size, B_32_BIT_CONTIGUOUS,
+@@ -1081,9 +1208,15 @@ self_test(tegra_audio* audio)
+ static multi_channel_info sChannels[] = {
+ 	{ 0, B_MULTI_OUTPUT_CHANNEL, B_CHANNEL_LEFT | B_CHANNEL_STEREO_BUS, 0 },
+ 	{ 1, B_MULTI_OUTPUT_CHANNEL, B_CHANNEL_RIGHT | B_CHANNEL_STEREO_BUS, 0 },
+-	{ 2, B_MULTI_OUTPUT_BUS, B_CHANNEL_LEFT | B_CHANNEL_STEREO_BUS,
++	{ 2, B_MULTI_INPUT_CHANNEL, B_CHANNEL_LEFT | B_CHANNEL_STEREO_BUS, 0 },
++	{ 3, B_MULTI_INPUT_CHANNEL, B_CHANNEL_RIGHT | B_CHANNEL_STEREO_BUS, 0 },
++	{ 4, B_MULTI_OUTPUT_BUS, B_CHANNEL_LEFT | B_CHANNEL_STEREO_BUS,
+ 		B_CHANNEL_MINI_JACK_STEREO },
+-	{ 3, B_MULTI_OUTPUT_BUS, B_CHANNEL_RIGHT | B_CHANNEL_STEREO_BUS,
++	{ 5, B_MULTI_OUTPUT_BUS, B_CHANNEL_RIGHT | B_CHANNEL_STEREO_BUS,
++		B_CHANNEL_MINI_JACK_STEREO },
++	{ 6, B_MULTI_INPUT_BUS, B_CHANNEL_LEFT | B_CHANNEL_STEREO_BUS,
++		B_CHANNEL_MINI_JACK_STEREO },
++	{ 7, B_MULTI_INPUT_BUS, B_CHANNEL_RIGHT | B_CHANNEL_STEREO_BUS,
+ 		B_CHANNEL_MINI_JACK_STEREO },
+ };
+ 
+@@ -1103,19 +1236,20 @@ get_description(tegra_audio* audio, multi_description* data)
+ 		sizeof(description.vendor_info));
+ 
+ 	description.output_channel_count = 2;
+-	description.input_channel_count = 0;
++	description.input_channel_count = 2;
+ 	description.output_bus_channel_count = 2;
+-	description.input_bus_channel_count = 0;
++	description.input_bus_channel_count = 2;
+ 	description.aux_bus_channel_count = 0;
+ 	description.output_rates = B_SR_44100;
+-	description.input_rates = 0;
++	description.input_rates = B_SR_44100;
+ 	description.max_cvsr_rate = 0;
+ 	description.min_cvsr_rate = 0;
+ 	description.output_formats = B_FMT_16BIT;
+-	description.input_formats = 0;
++	description.input_formats = B_FMT_16BIT;
+ 	description.lock_sources = B_MULTI_LOCK_INTERNAL;
+ 	description.timecode_sources = 0;
+-	description.interface_flags = B_MULTI_INTERFACE_PLAYBACK;
++	description.interface_flags = B_MULTI_INTERFACE_PLAYBACK
++		| B_MULTI_INTERFACE_RECORD;
+ 	description.start_latency = 30000;
+ 	description.control_panel[0] = '\0';
+ 
+@@ -1138,7 +1272,7 @@ get_enabled_channels(tegra_audio* audio, multi_channel_enable* data)
+ 	if (user_memcpy(&enable, data, sizeof(enable)) != B_OK)
+ 		return B_BAD_ADDRESS;
+ 	if (enable.enable_bits != NULL) {
+-		uchar bits = 0x3;
++		uchar bits = 0xf;
+ 		if (user_memcpy(enable.enable_bits, &bits, 1) != B_OK)
+ 			return B_BAD_ADDRESS;
+ 	}
+@@ -1191,9 +1325,21 @@ enum {
+ 	MIX_HDMI,
+ 	MIX_HDMI_SOUND,
+ 	MIX_HDMI_MUTES_SPEAKER,
+-	MIX_CONTROL_COUNT = MIX_HDMI_MUTES_SPEAKER
++	MIX_INPUT,
++	MIX_RECORD,
++	MIX_RECORD_LEFT,
++	MIX_RECORD_RIGHT,
++	MIX_SOURCE,
++	MIX_SOURCE_BUILT_IN,
++	MIX_SOURCE_HEADSET,
++	MIX_BOOST,
++	MIX_CONTROL_COUNT = MIX_BOOST
+ };
+ 
++#define ALC5632_RECORD_BASE_DB	-16.5f
++#define ALC5632_RECORD_MAX		31	// +30 dB
++#define ALC5632_BOOST_STEP_DB	6.0f
++
+ #define ALC5632_STEP_DB			1.5f
+ #define ALC5632_MAX_LEVEL		31
+ 
+@@ -1255,6 +1401,32 @@ list_mix_controls(tegra_audio* audio, multi_mix_control_info* data)
+ 	make_control(controls[i++], MIX_HDMI_MUTES_SPEAKER, B_MULTI_MIX_ENABLE,
+ 		MIX_HDMI, S_null, "Speaker off while a screen is plugged in");
+ 
++	make_control(controls[i++], MIX_INPUT, B_MULTI_MIX_GROUP, 0, S_INPUT, "");
++	make_control(controls[i++], MIX_RECORD, B_MULTI_MIX_GROUP, MIX_INPUT,
++		S_null, "Recording");
++	make_control(controls[i++], MIX_RECORD_LEFT, B_MULTI_MIX_GAIN,
++		MIX_RECORD, S_null, "");
++	make_control(controls[i++], MIX_RECORD_RIGHT, B_MULTI_MIX_GAIN,
++		MIX_RECORD, S_null, "", MIX_RECORD_LEFT);
++	for (int32 c = i - 2; c < i; c++) {
++		controls[c].gain.min_gain = ALC5632_RECORD_BASE_DB;
++		controls[c].gain.max_gain = ALC5632_RECORD_BASE_DB
++			+ ALC5632_STEP_DB * ALC5632_RECORD_MAX;
++	}
++	make_control(controls[i++], MIX_SOURCE, B_MULTI_MIX_MUX, MIX_RECORD,
++		S_null, "Microphone");
++	make_control(controls[i++], MIX_SOURCE_BUILT_IN, B_MULTI_MIX_MUX_VALUE,
++		MIX_SOURCE, S_null, "Built-in");
++	make_control(controls[i++], MIX_SOURCE_HEADSET, B_MULTI_MIX_MUX_VALUE,
++		MIX_SOURCE, S_null, "Headset");
++	make_control(controls[i++], MIX_BOOST, B_MULTI_MIX_GROUP, MIX_INPUT,
++		S_null, "Boost");
++	controls[i - 1].flags = B_MULTI_MIX_GAIN;
++	controls[i - 1].parent = MIX_RECORD;
++	controls[i - 1].gain.min_gain = 0;
++	controls[i - 1].gain.max_gain = ALC5632_BOOST_STEP_DB * 7;
++	controls[i - 1].gain.granularity = ALC5632_BOOST_STEP_DB;
++
+ 	int32 count = min_c(info.control_count, (int32)B_COUNT_OF(controls));
+ 	if (count < 0 || (count > 0 && !IS_USER_ADDRESS(info.controls))
+ 		|| user_memcpy(info.controls, controls,
+@@ -1277,7 +1449,7 @@ mix_values(tegra_audio* audio, multi_mix_value_info* data, bool set)
+ 	}
+ 
+ 	MutexLocker locker(audio->lock);
+-
++	bool changedInput = false;
+ 	for (int32 i = 0; i < info.item_count; i++) {
+ 		multi_mix_value value;
+ 		if (user_memcpy(&value, &info.values[i], sizeof(value)) != B_OK)
+@@ -1285,6 +1457,49 @@ mix_values(tegra_audio* audio, multi_mix_value_info* data, bool set)
+ 
+ 		uint8* level = NULL;
+ 		bool* flag = NULL;
++		bool input = false;
++		switch (value.id) {
++			case MIX_RECORD_LEFT:
++			case MIX_RECORD_RIGHT:
++			{
++				uint8& record = audio->recordLevel[value.id - MIX_RECORD_LEFT];
++				if (set) {
++					int32 steps = (int32)((value.gain - ALC5632_RECORD_BASE_DB)
++						/ ALC5632_STEP_DB + 0.5f);
++					record = max_c(0, min_c(steps, ALC5632_RECORD_MAX));
++				} else {
++					value.gain = ALC5632_RECORD_BASE_DB
++						+ ALC5632_STEP_DB * record;
++				}
++				input = true;
++				break;
++			}
++			case MIX_SOURCE:
++				if (set)
++					audio->inputSource = value.mux == 1 ? 1 : 0;
++				else
++					value.mux = audio->inputSource;
++				input = true;
++				break;
++			case MIX_BOOST:
++				if (set) {
++					int32 steps = (int32)(value.gain / ALC5632_BOOST_STEP_DB
++						+ 0.5f);
++					audio->micBoost = max_c(0, min_c(steps, 7));
++				} else
++					value.gain = ALC5632_BOOST_STEP_DB * audio->micBoost;
++				input = true;
++				break;
++		}
++		if (input) {
++			if (set)
++				changedInput = true;
++			else if (user_memcpy(&info.values[i], &value, sizeof(value))
++					!= B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			continue;
++		}
+ 		switch (value.id) {
+ 			case MIX_SPEAKER_LEFT:
+ 			case MIX_SPEAKER_RIGHT:
+@@ -1338,6 +1553,8 @@ mix_values(tegra_audio* audio, multi_mix_value_info* data, bool set)
+ 
+ 	if (set)
+ 		set_outputs(audio);
++	if (changedInput)
++		set_input(audio);
+ 	return B_OK;
+ }
+ 
+@@ -1361,23 +1578,27 @@ get_buffers(tegra_audio* audio, multi_buffer_list* data)
+ 	if (status != B_OK)
+ 		return status;
+ 
+-	list.flags = B_MULTI_BUFFER_PLAYBACK;
++	bool record = audio->recordInterruptInstalled;
++	list.flags = B_MULTI_BUFFER_PLAYBACK | (record ? B_MULTI_BUFFER_RECORD : 0);
+ 	list.return_playback_buffers = BUFFER_COUNT;
+ 	list.return_playback_channels = 2;
+ 	list.return_playback_buffer_size = frames;
+-	list.return_record_buffers = 0;
+-	list.return_record_channels = 0;
+-	list.return_record_buffer_size = 0;
++	list.return_record_buffers = record ? BUFFER_COUNT : 0;
++	list.return_record_channels = record ? 2 : 0;
++	list.return_record_buffer_size = record ? frames : 0;
+ 
+-	for (int32 i = 0; i < BUFFER_COUNT; i++) {
++	// the record buffers follow the playback ones
++	for (int32 i = 0; i < BUFFER_COUNT * (record ? 2 : 1); i++) {
+ 		buffer_desc descs[2];
+ 		for (int32 channel = 0; channel < 2; channel++) {
+ 			descs[channel].base = (char*)audio->buffers
+ 				+ i * frames * FRAME_SIZE + channel * 2;
+ 			descs[channel].stride = FRAME_SIZE;
+ 		}
++		buffer_desc** buffers = i < BUFFER_COUNT
++			? list.playback_buffers : list.record_buffers;
+ 		buffer_desc* userDescs;
+-		if (user_memcpy(&userDescs, &list.playback_buffers[i],
++		if (user_memcpy(&userDescs, &buffers[i % BUFFER_COUNT],
+ 				sizeof(userDescs)) != B_OK
+ 			|| !IS_USER_ADDRESS(userDescs)
+ 			|| user_memcpy(userDescs, descs, sizeof(descs)) != B_OK) {
+@@ -1426,10 +1647,23 @@ buffer_exchange(tegra_audio* audio, multi_buffer_info* data)
+ 	release_spinlock(&audio->interruptLock);
+ 	restore_interrupts(state);
+ 
+-	info.record_buffer_cycle = 0;
+-	info.recorded_real_time = 0;
+-	info.recorded_frames_count = 0;
+-	info.flags = B_MULTI_BUFFER_PLAYBACK;
++	if (audio->recordInterruptInstalled) {
++		state = disable_interrupts();
++		acquire_spinlock(&audio->interruptLock);
++		// the buffer the DMA just filled
++		info.record_buffer_cycle = (audio->recording + audio->bufferCount - 1)
++			% audio->bufferCount;
++		info.recorded_real_time = audio->recordTime;
++		info.recorded_frames_count = audio->framesRecorded;
++		release_spinlock(&audio->interruptLock);
++		restore_interrupts(state);
++		info.flags = B_MULTI_BUFFER_PLAYBACK | B_MULTI_BUFFER_RECORD;
++	} else {
++		info.record_buffer_cycle = 0;
++		info.recorded_real_time = 0;
++		info.recorded_frames_count = 0;
++		info.flags = B_MULTI_BUFFER_PLAYBACK;
++	}
+ 
+ 	return user_memcpy(data, &info, sizeof(info));
+ }
+@@ -1748,6 +1982,10 @@ tegra_audio_free_resources(tegra_audio* audio)
+ 		remove_io_interrupt_handler(SPDIF_DMA_CHANNEL_IRQ,
+ 			spdif_dma_interrupt, audio);
+ 	}
++	if (audio->recordInterruptInstalled) {
++		remove_io_interrupt_handler(RECORD_DMA_CHANNEL_IRQ,
++			record_dma_interrupt, audio);
++	}
+ 	if (audio->bufferArea >= B_OK)
+ 		delete_area(audio->bufferArea);
+ 	if (audio->bufferReadySem >= B_OK)
+@@ -1808,6 +2046,7 @@ tegra_audio_init_driver(device_node* node, void** _cookie)
+ 	audio->dma = (volatile uint8*)dmaBase;
+ 	audio->channel = audio->dma + APBDMA_CHANNEL_OFFSET;
+ 	audio->spdifChannel = audio->dma + SPDIF_DMA_CHANNEL_OFFSET;
++	audio->recordChannel = audio->dma + RECORD_DMA_CHANNEL_OFFSET;
+ 	audio->spdif = audio->i2s + (SPDIF_BASE & (B_PAGE_SIZE - 1));
+ 	audio->i2s += I2S1_BASE & (B_PAGE_SIZE - 1);
+ 
+@@ -1854,6 +2093,17 @@ tegra_audio_init_driver(device_node* node, void** _cookie)
+ 	audio->spdifEnabled = spdif && audio->spdifInterruptInstalled;
+ 	TRACE_ALWAYS("S/PDIF: %s\n", audio->spdifEnabled ? "on" : "off");
+ 
++	// recording: the built-in microphone, 0 dB, no boost
++	audio->recordLevel[0] = audio->recordLevel[1] = 11;
++	audio->micBoost = 2;
++	audio->inputSource = 0;
++	audio->recordInterruptInstalled = install_io_interrupt_handler(
++		RECORD_DMA_CHANNEL_IRQ, record_dma_interrupt, audio, 0) == B_OK;
++	if (audio->recordInterruptInstalled) {
++		MutexLocker locker(audio->lock);
++		set_input(audio);
++	}
++
+ 	// the volumes codec_init() set
+ 	uint16 volume;
+ 	if (codec_read(audio, ALC5632_SPK_OUT_VOL, &volume) == B_OK) {

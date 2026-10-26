@@ -1,0 +1,115 @@
+From a94b6c10f66048c85e0e51906b0bd188a5221cbe Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 26 Oct 2026 22:49:31 +0100
+Subject: [PATCH 269/270] Media: video nodes under the video settings, no empty
+ input frequency
+
+MediaListItem: the comparators of the list items did not order video
+nodes consistently, so a video output node (the HDMI one) showed up
+among the audio devices. Sort by section (audio settings, mixer, audio
+nodes, MIDI, video settings, video nodes), then by label.
+
+multi_audio: a device without inputs gets no input frequency control,
+which showed as a lone check box.
+
+hdmi.media_addon: its parameters in one column, with clearer labels.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../media/media-add-ons/hdmi/HDMIAddOn.cpp    |  7 ++---
+ .../multi_audio/MultiAudioNode.cpp            |  7 +++--
+ src/preferences/media/MediaListItem.cpp       | 27 ++++++++++++++++++-
+ 3 files changed, 35 insertions(+), 6 deletions(-)
+
+diff --git a/src/add-ons/media/media-add-ons/hdmi/HDMIAddOn.cpp b/src/add-ons/media/media-add-ons/hdmi/HDMIAddOn.cpp
+index eab97efb3d..4b4e9ac80c 100644
+--- a/src/add-ons/media/media-add-ons/hdmi/HDMIAddOn.cpp
++++ b/src/add-ons/media/media-add-ons/hdmi/HDMIAddOn.cpp
+@@ -517,21 +517,22 @@ HDMINode::_UpdateWeb()
+ 			<< (hdmi.dvi ? ", DVI" : ", HDMI with sound");
+ 	}
+ 
++	// one column: the media theme puts sub-groups side by side
+ 	BParameterWeb* web = new BParameterWeb();
+ 	BParameterGroup* group = web->MakeGroup("HDMI");
+ 	group->MakeNullParameter(PARAMETER_STATUS, B_MEDIA_RAW_VIDEO, status,
+ 		B_GENERIC);
+ 	group->MakeDiscreteParameter(PARAMETER_OUTPUT, B_MEDIA_RAW_VIDEO,
+-		"HDMI output", B_ENABLE);
++		"Turn the HDMI output on", B_ENABLE);
+ 	BDiscreteParameter* mode = group->MakeDiscreteParameter(PARAMETER_MODE,
+-		B_MEDIA_RAW_VIDEO, "Resolution", B_RESOLUTION);
++		B_MEDIA_RAW_VIDEO, "Resolution:", B_RESOLUTION);
+ 	mode->AddItem(0, "Automatic (sharpest for the panel picture)");
+ 	mode->AddItem(1, "Screen's preferred mode");
+ 	mode->AddItem(2, "1280x720");
+ 	group->MakeDiscreteParameter(PARAMETER_DVI, B_MEDIA_RAW_VIDEO,
+ 		"Plain DVI signal (no sound)", B_ENABLE);
+ 	group->MakeDiscreteParameter(PARAMETER_SIGNAL, B_MEDIA_RAW_VIDEO,
+-		"Stronger signal (long cables)", B_ENABLE);
++		"Stronger signal (for long cables)", B_ENABLE);
+ 	SetParameterWeb(web);
+ }
+ 
+diff --git a/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp b/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp
+index f6339c90d1..d71e9095e1 100644
+--- a/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp
++++ b/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp
+@@ -1658,8 +1658,11 @@ MultiAudioNode::MakeParameterWeb()
+ 			B_TRANSLATE("Input & Output"), PARAMETER_ID_INPUT_FREQUENCY,
+ 			description.input_rates);
+ 	} else {
+-		_CreateFrequencyParameterGroup(generalGroup, B_TRANSLATE("Input"),
+-			PARAMETER_ID_INPUT_FREQUENCY, description.input_rates);
++		// a device without inputs (playback only) gets no input frequency
++		if (description.input_rates != 0) {
++			_CreateFrequencyParameterGroup(generalGroup, B_TRANSLATE("Input"),
++				PARAMETER_ID_INPUT_FREQUENCY, description.input_rates);
++		}
+ 		_CreateFrequencyParameterGroup(generalGroup, B_TRANSLATE("Output"),
+ 			PARAMETER_ID_OUTPUT_FREQUENCY, description.output_rates);
+ 	}
+diff --git a/src/preferences/media/MediaListItem.cpp b/src/preferences/media/MediaListItem.cpp
+index d98ca91b03..586eebd1fa 100644
+--- a/src/preferences/media/MediaListItem.cpp
++++ b/src/preferences/media/MediaListItem.cpp
+@@ -183,13 +183,38 @@ MediaListItem::DrawItem(BView* owner, BRect frame, bool complete)
+ }
+ 
+ 
++/*!	Where an item goes: the audio settings, the audio mixer, the audio
++	nodes, MIDI, then the video settings and the video nodes.
++*/
++static int32
++sort_rank(MediaListItem* item)
++{
++	if (dynamic_cast<AudioMixerListItem*>(item) != NULL)
++		return 1;
++	if (dynamic_cast<MidiListItem*>(item) != NULL)
++		return 3;
++
++	if (NodeListItem* node = dynamic_cast<NodeListItem*>(item))
++		return node->Type() == MediaListItem::VIDEO_TYPE ? 6 : 2;
++	if (DeviceListItem* device = dynamic_cast<DeviceListItem*>(item))
++		return device->Type() == MediaListItem::VIDEO_TYPE ? 4 : 0;
++	return 0;
++}
++
++
+ int
+ MediaListItem::Compare(const void* itemOne, const void* itemTwo)
+ {
+ 	MediaListItem* firstItem = *(MediaListItem**)itemOne;
+ 	MediaListItem* secondItem = *(MediaListItem**)itemTwo;
+ 
+-	return firstItem->CompareWith(secondItem);
++	// The comparators of the items do not order video nodes consistently
++	// (they ended up among the audio ones): sort by section, then by label
++	int32 firstRank = sort_rank(firstItem);
++	int32 secondRank = sort_rank(secondItem);
++	if (firstRank != secondRank)
++		return firstRank - secondRank;
++	return strcmp(firstItem->Label(), secondItem->Label());
+ }
+ 
+ 

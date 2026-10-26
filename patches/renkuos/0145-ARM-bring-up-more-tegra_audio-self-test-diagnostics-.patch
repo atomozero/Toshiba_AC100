@@ -1,7 +1,7 @@
-From a0c53a2c8ed189a3ff50727eab84ce41f7da404b Mon Sep 17 00:00:00 2001
+From 9f61c73bf693b39dfe0820836f532fb6e2a131ba Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Mon, 19 Oct 2026 22:07:31 +0200
-Subject: [PATCH 145/203] ARM bring-up: more tegra_audio self test diagnostics,
+Subject: [PATCH 145/270] ARM bring-up: more tegra_audio self test diagnostics,
  retry with clk_m (not for merging)
 
 ---

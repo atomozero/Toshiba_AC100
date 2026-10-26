@@ -1,7 +1,7 @@
-From 256b6e6835defabe1a158e710e015c4a1f81d804 Mon Sep 17 00:00:00 2001
+From c21b158ba4203d185378629a9e4528c8c42887a4 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 19:25:24 +0200
-Subject: [PATCH 038/203] ARM bring-up: map kept boot ranges per physical run,
+Subject: [PATCH 038/270] ARM bring-up: map kept boot ranges per physical run,
  with logging (not for merging)
 
 ---

@@ -1,7 +1,7 @@
-From 17df4a0603ccc9193695567b1357e3d41ef89d11 Mon Sep 17 00:00:00 2001
+From 1a5f6e7a12a17b585e63da39a046ed52d52dfe59 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 00:01:01 +0200
-Subject: [PATCH 065/203] ARM bring-up: write the syslog to ac100log.txt on the
+Subject: [PATCH 065/270] ARM bring-up: write the syslog to ac100log.txt on the
  EFI system partition (not for merging)
 
 ---

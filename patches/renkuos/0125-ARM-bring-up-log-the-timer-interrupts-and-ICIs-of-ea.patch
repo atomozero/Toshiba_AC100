@@ -1,7 +1,7 @@
-From 051180238f95568b532d63fae62aa76619ebac56 Mon Sep 17 00:00:00 2001
+From cca7769c13b3842f375885387652e97ca911fab9 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 23:21:38 +0200
-Subject: [PATCH 125/203] ARM bring-up: log the timer interrupts and ICIs of
+Subject: [PATCH 125/270] ARM bring-up: log the timer interrupts and ICIs of
  each CPU
 
 On the AC100 the second CPU stops running anything after a minute or two.

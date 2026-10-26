@@ -10,18 +10,20 @@ FPU and no NEON, 512 MB of RAM, 16 GB eMMC.
 
 | Componente | Stato |
 |---|---|
-| Avvio da microSD (U-Boot caricato via USB/RCM, loader EFI di Haiku) | funziona |
+| Avvio da microSD o da eMMC (U-Boot nell'eMMC, tasto di accensione; o via USB/RCM), loader EFI di Haiku | funziona |
 | Due CPU (SMP), cache L2 (opzionale, `arm_l2_cache true`) | funziona |
-| Schermo 1024x600 (framebuffer di U-Boot, 16 bit) | funziona, senza accelerazione |
+| Schermo 1024x600: driver nativo `tegra_dc` a 32 bit, cursore hardware, overlay video | funziona |
+| Uscita HDMI (copia dello schermo a 720p, audio, cursore, video a schermo intero) | funziona |
 | Tastiera e touchpad (EC via NVEC), batteria, tasto di accensione, coperchio, luminosità | funziona |
 | microSD ed eMMC (SDHCI, ADMA2 scatter-gather) | funziona |
 | USB (EHCI, PHY UTMI e ULPI) | funziona |
 | Wi-Fi Ralink RT3070 (`ralinkwifi`), WPA2 | funziona |
-| Audio (ALC5632 su I2S): casse, cuffie con rilevamento | funziona |
+| Audio (ALC5632 su I2S): casse, cuffie con rilevamento, microfono interno e delle cuffie, controlli nelle preferenze Media | funziona |
 | Orologio con batteria tampone (TPS6586x) | funziona |
 | Spegnimento | funziona |
 | Riavvio | richiede U-Boot sull'eMMC |
-| Microfono, Bluetooth, HDMI, webcam, GPU, sospensione | da fare |
+| GPU 2D (GR2D via host1x) | prime prove, non ancora usata dal sistema |
+| Bluetooth, webcam, GPU 3D, sospensione | da fare |
 
 Dettagli in [docs/STATUS.md](docs/STATUS.md) e [docs/ROADMAP.md](docs/ROADMAP.md).
 

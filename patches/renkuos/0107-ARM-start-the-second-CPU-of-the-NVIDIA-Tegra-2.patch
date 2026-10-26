@@ -1,7 +1,7 @@
-From b8092c24c3080377d2c56f6afb57e54e5e857170 Mon Sep 17 00:00:00 2001
+From 5be1a528be31babb8950da6039f628409bf421ef Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 17:40:34 +0200
-Subject: [PATCH 107/203] ARM: start the second CPU of the NVIDIA Tegra 2
+Subject: [PATCH 107/270] ARM: start the second CPU of the NVIDIA Tegra 2
 
 As Linux does: enable the snoop control unit of the Cortex-A9 MPCore, point
 the EVP reset vector to the trampoline, then hold the CPU in reset, let the

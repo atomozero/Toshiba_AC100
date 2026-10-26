@@ -1,7 +1,7 @@
-From c2f0fe91cb6e5c37c49c6e76de7867e26ac3b0a6 Mon Sep 17 00:00:00 2001
+From a8fcec74a84ac0f2b93726bf7b30bef4df65a4fa Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Tue, 20 Oct 2026 00:22:46 +0200
-Subject: [PATCH 152/203] sdhci: give the command line some time to become free
+Subject: [PATCH 152/270] sdhci: give the command line some time to become free
 
 On NVIDIA Tegra the command inhibit bit can stay set for a moment after a
 command completed, before the next one and right after the response of a

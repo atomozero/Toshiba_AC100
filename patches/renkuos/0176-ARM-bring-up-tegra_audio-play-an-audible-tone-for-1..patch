@@ -1,7 +1,7 @@
-From 98542c070fafda826ee06d13d792052365e9648c Mon Sep 17 00:00:00 2001
+From 045bc4945006d5ea385a924456bacb327c17c861 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Tue, 20 Oct 2026 21:56:17 +0200
-Subject: [PATCH 176/203] ARM bring-up: tegra_audio: play an audible tone for
+Subject: [PATCH 176/270] ARM bring-up: tegra_audio: play an audible tone for
  1.5 s at boot (not for merging)
 
 ---

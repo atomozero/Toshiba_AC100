@@ -1,7 +1,7 @@
-From beff11f124b94073ec6b04fd4ad94fff24cdd8d8 Mon Sep 17 00:00:00 2001
+From 943721df1830d64d04189c80362e8c283cbfeefb Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Tue, 20 Oct 2026 23:03:15 +0200
-Subject: [PATCH 178/203] usb_serial: deselect also when the device has been
+Subject: [PATCH 178/270] usb_serial: deselect also when the device has been
  removed
 
 DeSelect() returned early once the device was gone, leaving the entry

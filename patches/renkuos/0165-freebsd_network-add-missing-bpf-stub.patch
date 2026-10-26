@@ -1,7 +1,7 @@
-From 96e6e170ce8f9ad0392b47fdf32847162855a298 Mon Sep 17 00:00:00 2001
+From 09d82a6c998e8bf39edfd74dd1edc9d36888a5dc Mon Sep 17 00:00:00 2001
 From: PulkoMandy <pulkomandy@pulkomandy.tk>
 Date: Fri, 16 Oct 2026 22:12:40 +0200
-Subject: [PATCH 165/203] freebsd_network: add missing bpf stub
+Subject: [PATCH 165/270] freebsd_network: add missing bpf stub
 
 Needed by allwinner sun8i_emac driver
 

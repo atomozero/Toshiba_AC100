@@ -1,7 +1,7 @@
-From 64f32a406931ea4950cf95bd74de35095648f3b0 Mon Sep 17 00:00:00 2001
+From 4e03103a5ab16c53065854538b32b512c61258cc Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?Przemys=C5=82aw=20Buczkowski?= <prem@prem.moe>
 Date: Thu, 10 Sep 2026 21:59:24 +0900
-Subject: [PATCH 090/203] arm64: move MIDR definitions to arch_cpu_type.h and
+Subject: [PATCH 090/270] arm64: move MIDR definitions to arch_cpu_type.h and
  sync with FreeBSD
 
 They seem to have originally came from there, so they are properly

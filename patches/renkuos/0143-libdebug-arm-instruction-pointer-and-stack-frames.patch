@@ -1,7 +1,7 @@
-From 8719b2b25612f1599faa59d7bf4921ecc76ae8cd Mon Sep 17 00:00:00 2001
+From 073ab698c8278854d666cdd29499148b87e3f7fa Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Mon, 19 Oct 2026 22:07:31 +0200
-Subject: [PATCH 143/203] libdebug/arm: instruction pointer and stack frames
+Subject: [PATCH 143/270] libdebug/arm: instruction pointer and stack frames
 
 The stack is scanned for return addresses (words in executable areas just
 behind a BL or BLX), since ARM code is usually built without frame pointers.

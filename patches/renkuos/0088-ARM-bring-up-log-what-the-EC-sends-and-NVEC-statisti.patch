@@ -1,7 +1,7 @@
-From 4f3211a5694392c6eaf11a8e74da0b976fc22805 Mon Sep 17 00:00:00 2001
+From 447a6c8d3d975306cd5555fe7e060d53c893d4a1 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 14:01:55 +0200
-Subject: [PATCH 088/203] ARM bring-up: log what the EC sends and NVEC
+Subject: [PATCH 088/270] ARM bring-up: log what the EC sends and NVEC
  statistics (not for merging)
 
 ---

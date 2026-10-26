@@ -1,7 +1,7 @@
-From df467c2471e64300b05a06bc5c6384eb88c5ec83 Mon Sep 17 00:00:00 2001
+From dc6cc71266b18a37f43b07ba8e8b3c1f75c58113 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 16:49:17 +0200
-Subject: [PATCH 104/203] i2c: add a driver for the NVIDIA Tegra 2 I2C master
+Subject: [PATCH 104/270] i2c: add a driver for the NVIDIA Tegra 2 I2C master
  controllers
 
 Packet mode, polled: clocks the controller from PLLP at 8 times the bus
@@ -22,7 +22,7 @@ probe the audio codec and the panel DDC.
  create mode 100644 src/add-ons/kernel/busses/i2c/tegra/tegra_i2c.cpp
 
 diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
-index 8b0ef3aa5e..32d294c55c 100644
+index bc562e278b..1fa5492acb 100644
 --- a/build/jam/images/definitions/minimum
 +++ b/build/jam/images/definitions/minimum
 @@ -37,6 +37,7 @@ SYSTEM_BIN = [ FFilterByBuildFeatures
@@ -43,7 +43,7 @@ index 8b0ef3aa5e..32d294c55c 100644
  	mmc
  	scsi
 diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
-index 5af32d1f88..0b70bed42e 100644
+index 4cd5c854cc..b2392b104e 100644
 --- a/build/jam/packages/Haiku
 +++ b/build/jam/packages/Haiku
 @@ -38,6 +38,7 @@ AddFilesToPackage add-ons kernel busses ata :

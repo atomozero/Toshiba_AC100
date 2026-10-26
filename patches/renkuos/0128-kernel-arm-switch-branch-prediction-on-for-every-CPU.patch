@@ -1,7 +1,7 @@
-From 54c57d7023713f8b7852e8924eaf80b07c3fe009 Mon Sep 17 00:00:00 2001
+From 7c54c6e5517b6a707e14d195600d5597f3274b0d Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Mon, 19 Oct 2026 07:45:43 +0200
-Subject: [PATCH 128/203] kernel/arm: switch branch prediction on for every CPU
+Subject: [PATCH 128/270] kernel/arm: switch branch prediction on for every CPU
 
 The firmware switches branch prediction on for the boot CPU only; the other
 CPUs come out of reset without it (SCTLR.Z clear), and a busy loop ran about

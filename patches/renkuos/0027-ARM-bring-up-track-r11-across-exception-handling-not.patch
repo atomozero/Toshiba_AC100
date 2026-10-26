@@ -1,7 +1,7 @@
-From dacdbedd8d212c0a16f2a68c2124b6cdf4da07be Mon Sep 17 00:00:00 2001
+From 2bd6fe28dad9a96071c454e1591917b115d59c80 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 17:52:44 +0200
-Subject: [PATCH 027/203] ARM bring-up: track r11 across exception handling
+Subject: [PATCH 027/270] ARM bring-up: track r11 across exception handling
  (not for merging)
 
 ---

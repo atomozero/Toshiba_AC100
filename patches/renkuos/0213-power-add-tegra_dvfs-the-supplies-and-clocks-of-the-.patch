@@ -1,0 +1,651 @@
+From ce3253c03ea13fb71d085bc69c1d3f2fcd58fe33 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 24 Oct 2026 22:48:44 +0200
+Subject: [PATCH 213/270] power: add tegra_dvfs, the supplies and clocks of the
+ AC100
+
+/dev/power/tegra_dvfs reports the core, CPU and RTC supplies of the
+TPS6586x, the PLL, CPU and system bus clocks, and the speedo fuses
+that tell which voltages this chip needs.
+
+Writing "core <mV>", "cpu <mV>" or "rtc <mV>" moves a supply in
+steps of 25 mV, within the limits of the AC100 device tree and keeping
+the core 120 mV above the CPU and within 170 mV of the RTC domain, as
+Linux does. U-Boot leaves the CPU at 1 GHz with 1.0 V, while the
+Tegra 2 tables ask for 1.1 V at that rate.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ build/jam/packages/Haiku                      |   3 +
+ src/add-ons/kernel/drivers/power/Jamfile      |   3 +
+ .../kernel/drivers/power/tegra_dvfs/Jamfile   |   7 +
+ .../drivers/power/tegra_dvfs/tegra_dvfs.cpp   | 581 ++++++++++++++++++
+ 4 files changed, 594 insertions(+)
+ create mode 100644 src/add-ons/kernel/drivers/power/tegra_dvfs/Jamfile
+ create mode 100644 src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp
+
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index 44f9a2f19c..535d1030dd 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -204,6 +204,9 @@ AddDriversToPackage misc :
+ AddDriversToPackage sensor :
+ 	adt7461@arm
+ 	;
++AddDriversToPackage power :
++	tegra_dvfs@arm
++	;
+ AddDriversToPackage net
+ 	: $(SYSTEM_ADD_ONS_DRIVERS_NET) ;
+ AddDriversToPackage ports :
+diff --git a/src/add-ons/kernel/drivers/power/Jamfile b/src/add-ons/kernel/drivers/power/Jamfile
+index b929cd9759..e00dd63945 100644
+--- a/src/add-ons/kernel/drivers/power/Jamfile
++++ b/src/add-ons/kernel/drivers/power/Jamfile
+@@ -7,3 +7,6 @@ SubInclude HAIKU_TOP src add-ons kernel drivers power acpi_lid ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers power acpi_thermal ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers power amd_thermal ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers power pch_thermal ;
++if $(TARGET_ARCH) = arm {
++	SubInclude HAIKU_TOP src add-ons kernel drivers power tegra_dvfs ;
++}
+diff --git a/src/add-ons/kernel/drivers/power/tegra_dvfs/Jamfile b/src/add-ons/kernel/drivers/power/tegra_dvfs/Jamfile
+new file mode 100644
+index 0000000000..eeac90d3e6
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/power/tegra_dvfs/Jamfile
+@@ -0,0 +1,7 @@
++SubDir HAIKU_TOP src add-ons kernel drivers power tegra_dvfs ;
++
++UsePrivateKernelHeaders ;
++
++KernelAddon tegra_dvfs :
++	tegra_dvfs.cpp
++	;
+diff --git a/src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp b/src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp
+new file mode 100644
+index 0000000000..85c7b70d18
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp
+@@ -0,0 +1,581 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++/*!	Voltages and clocks of the Toshiba AC100 (Tegra 2 with a TPS6586x power
++	management IC), as a first step towards scaling them.
++	/dev/power/tegra_dvfs shows the supplies of the core, the CPU and the RTC
++	domain, and the rates of the PLLs, the CPU and the system bus. Writing
++	"core <mV>", "cpu <mV>" or "rtc <mV>" moves a supply in steps of 25 mV,
++	within the limits of the AC100 and keeping the core 120 mV above the CPU
++	and within 170 mV of the RTC domain, as Linux does.
++*/
++
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <Drivers.h>
++#include <KernelExport.h>
++#include <lock.h>
++#include <util/AutoLock.h>
++
++
++#define TPS6586X_ADDRESS			0x34
++#define TPS6586X_SUPPLYENA			0x10
++#define TPS6586X_SUPPLYENB			0x11
++#define TPS6586X_VCC1				0x20
++#define TPS6586X_VCC2				0x21
++#define TPS6586X_SM1V1				0x23
++#define TPS6586X_SM1V2				0x24
++#define TPS6586X_SM1SL				0x25
++#define TPS6586X_SM0V1				0x26
++#define TPS6586X_SM0V2				0x27
++#define TPS6586X_SM0SL				0x28
++#define TPS6586X_LDO2BV1			0x2f
++#define TPS6586X_LDO2BV2			0x30
++#define TPS6586X_VERSIONCRC			0xcd
++
++#define TPS6586X_VCC1_SM1_GO		(1 << 0)
++#define TPS6586X_VCC1_SM1_V2		(1 << 1)
++#define TPS6586X_VCC1_SM0_GO		(1 << 2)
++#define TPS6586X_VCC1_SM0_V2		(1 << 3)
++#define TPS6586X_VCC2_LDO2_GO		(1 << 6)
++#define TPS6586X_VCC2_LDO2_V2		(1 << 7)
++
++#define DVM_STEP_MV					25
++#define CORE_MIN_MV					1200
++#define CORE_MAX_MV					1275
++#define CPU_MIN_MV					1000
++#define CPU_MAX_MV					1100
++#define RTC_MIN_MV					1200
++#define RTC_MAX_MV					1275
++#define CORE_OVER_CPU_MV			120
++#define CORE_RTC_SPREAD_MV			170
++
++#define TEGRA20_CAR_BASE			0x60006000
++#define CAR_CCLK_BURST_POLICY		0x20
++#define CAR_SUPER_CCLK_DIVIDER		0x24
++#define CAR_SCLK_BURST_POLICY		0x28
++#define CAR_SUPER_SCLK_DIVIDER		0x2c
++#define CAR_CLK_SYSTEM_RATE			0x30
++#define CAR_PLLC_BASE				0x80
++#define CAR_PLLM_BASE				0x90
++#define CAR_PLLP_BASE				0xa0
++#define CAR_PLLX_BASE				0xe0
++#define CAR_CLK_SOURCE_EMC			0x19c
++#define CAR_CLK_OUT_ENB_H			0x14
++#define CAR_CLK_ENB_FUSE			(1 << 7)
++
++#define TEGRA20_APB_MISC_BASE		0x70000000
++#define APB_MISC_GP_HIDREV			0x804
++
++#define TEGRA20_FUSE_BASE			0x7000f000
++	// the fuse registers start at 0x7000f800, past the first page
++#define FUSE_SKU_INFO				0x910
++#define FUSE_SPARE_BIT				0xa00
++
++#define OSCILLATOR_KHZ				12000
++
++#define TRACE_ALWAYS(x...)			dprintf("tegra_dvfs: " x)
++
++
++extern "C" status_t arm_dvc_i2c_read(uint8 address, uint8 reg, uint8* data,
++	uint32 length);
++extern "C" status_t arm_dvc_i2c_write(uint8 address, uint8 reg,
++	const uint8* data, uint32 length);
++
++
++static const char* sDeviceNames[] = { "power/tegra_dvfs", NULL };
++
++int32 api_version = B_CUR_DRIVER_API_VERSION;
++
++static mutex sLock = MUTEX_INITIALIZER("tegra_dvfs");
++
++struct supply {
++	const char*	name;
++	uint8		voltageRegister;
++	uint8		controlRegister;
++	uint8		goBit;
++	uint8		v2Bit;
++	uint32		minMillivolts;
++	uint32		maxMillivolts;
++};
++
++enum {
++	SUPPLY_CORE = 0,
++	SUPPLY_CPU,
++	SUPPLY_RTC,
++	SUPPLY_COUNT
++};
++
++static const supply kSupplies[SUPPLY_COUNT] = {
++	{ "core", TPS6586X_SM0V1, TPS6586X_VCC1, TPS6586X_VCC1_SM0_GO,
++		TPS6586X_VCC1_SM0_V2, CORE_MIN_MV, CORE_MAX_MV },
++	{ "cpu", TPS6586X_SM1V1, TPS6586X_VCC1, TPS6586X_VCC1_SM1_GO,
++		TPS6586X_VCC1_SM1_V2, CPU_MIN_MV, CPU_MAX_MV },
++	{ "rtc", TPS6586X_LDO2BV1, TPS6586X_VCC2, TPS6586X_VCC2_LDO2_GO,
++		TPS6586X_VCC2_LDO2_V2, RTC_MIN_MV, RTC_MAX_MV },
++};
++
++
++/*!	SM0, SM1 and LDO2: 725 mV and steps of 25 mV in the low 5 bits. */
++static uint32
++dvm_millivolts(uint8 value)
++{
++	return 725 + (value & 0x1f) * 25;
++}
++
++
++/*!	The output of a PLL in kHz: oscillator * N / (M * 2^P), or nothing when
++	it is off.
++*/
++static uint32
++pll_khz(uint32 base)
++{
++	if ((base & (1U << 30)) == 0)
++		return 0;
++	if ((base & (1U << 31)) != 0)
++		return OSCILLATOR_KHZ;
++	uint32 m = base & 0x1f;
++	uint32 n = (base >> 8) & 0x3ff;
++	uint32 p = (base >> 20) & 0x7;
++	if (m == 0)
++		return 0;
++	return (uint64)OSCILLATOR_KHZ * n / m >> p;
++}
++
++
++static size_t
++append(char* buffer, size_t size, size_t length, const char* format, ...)
++{
++	if (length >= size)
++		return length;
++	va_list args;
++	va_start(args, format);
++	length += vsnprintf(buffer + length, size - length, format, args);
++	va_end(args);
++	return length;
++}
++
++
++static size_t
++report_pmic(char* buffer, size_t size, size_t length)
++{
++	static const uint8 kRegisters[] = { TPS6586X_SUPPLYENA,
++		TPS6586X_SUPPLYENB, TPS6586X_VCC1, TPS6586X_VCC2, TPS6586X_SM1V1,
++		TPS6586X_SM1V2, TPS6586X_SM1SL, TPS6586X_SM0V1, TPS6586X_SM0V2,
++		TPS6586X_SM0SL, TPS6586X_LDO2BV1, TPS6586X_LDO2BV2,
++		TPS6586X_VERSIONCRC };
++	uint8 values[B_COUNT_OF(kRegisters)];
++	for (size_t i = 0; i < B_COUNT_OF(kRegisters); i++) {
++		status_t status = arm_dvc_i2c_read(TPS6586X_ADDRESS, kRegisters[i],
++			&values[i], 1);
++		if (status != B_OK) {
++			return append(buffer, size, length, "tps6586x: register %#x: "
++				"%s\n", kRegisters[i], strerror(status));
++		}
++	}
++
++	length = append(buffer, size, length, "tps6586x version %#04x\n",
++		values[12]);
++	length = append(buffer, size, length, "vdd_core (sm0) %" B_PRIu32
++		" mV (v2 %" B_PRIu32 " mV, slew %#04x)\n", dvm_millivolts(values[7]),
++		dvm_millivolts(values[8]), values[9]);
++	length = append(buffer, size, length, "vdd_cpu (sm1) %" B_PRIu32
++		" mV (v2 %" B_PRIu32 " mV, slew %#04x)\n", dvm_millivolts(values[4]),
++		dvm_millivolts(values[5]), values[6]);
++	length = append(buffer, size, length, "vdd_rtc (ldo2) %" B_PRIu32
++		" mV (v2 %" B_PRIu32 " mV)\n", dvm_millivolts(values[10]),
++		dvm_millivolts(values[11]));
++	length = append(buffer, size, length, "supplyena %#04x supplyenb %#04x "
++		"vcc1 %#04x vcc2 %#04x\n", values[0], values[1], values[2],
++		values[3]);
++	return length;
++}
++
++
++static size_t
++report_clocks(char* buffer, size_t size, size_t length)
++{
++	void* address;
++	area_id area = map_physical_memory("tegra car", TEGRA20_CAR_BASE,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA, &address);
++	if (area < B_OK) {
++		return append(buffer, size, length, "clocks: %s\n",
++			strerror(area));
++	}
++	volatile uint32* car = (volatile uint32*)address;
++	uint32 cclk = car[CAR_CCLK_BURST_POLICY / 4];
++	uint32 cclkDivider = car[CAR_SUPER_CCLK_DIVIDER / 4];
++	uint32 sclk = car[CAR_SCLK_BURST_POLICY / 4];
++	uint32 sclkDivider = car[CAR_SUPER_SCLK_DIVIDER / 4];
++	uint32 systemRate = car[CAR_CLK_SYSTEM_RATE / 4];
++	uint32 pllc = car[CAR_PLLC_BASE / 4];
++	uint32 pllm = car[CAR_PLLM_BASE / 4];
++	uint32 pllp = car[CAR_PLLP_BASE / 4];
++	uint32 pllx = car[CAR_PLLX_BASE / 4];
++	uint32 emc = car[CAR_CLK_SOURCE_EMC / 4];
++	delete_area(area);
++
++	length = append(buffer, size, length, "pllx %" B_PRIu32 " kHz (%#010"
++		B_PRIx32 ")\npllc %" B_PRIu32 " kHz (%#010" B_PRIx32 ")\npllm %"
++		B_PRIu32 " kHz (%#010" B_PRIx32 ")\npllp %" B_PRIu32 " kHz (%#010"
++		B_PRIx32 ")\n", pll_khz(pllx), pllx, pll_khz(pllc), pllc,
++		pll_khz(pllm), pllm, pll_khz(pllp), pllp);
++	length = append(buffer, size, length, "cclk policy %#010" B_PRIx32
++		" divider %#010" B_PRIx32 "\nsclk policy %#010" B_PRIx32
++		" divider %#010" B_PRIx32 " system rate %#010" B_PRIx32 "\nemc "
++		"source %#010" B_PRIx32 "\n", cclk, cclkDivider, sclk, sclkDivider,
++		systemRate, emc);
++	return length;
++}
++
++
++/*!	A run of spare fuse bits, the most significant first, ORed with its
++	redundant copy, as Linux reads the speedo values.
++*/
++static uint32
++read_speedo(volatile uint32* spare, int32 msb, int32 lsb, int32 redundant)
++{
++	uint32 value = 0;
++	for (int32 i = msb; i >= lsb; i--)
++		value = (value << 1) | ((spare[i] | spare[i + redundant]) & 1);
++	return value * 4;
++}
++
++
++/*!	The chip revision, the SKU and the speedo values in the fuses tell which
++	voltages this particular chip needs, as in Linux' speedo-tegra20.c.
++*/
++static size_t
++report_fuses(char* buffer, size_t size, size_t length)
++{
++	void* address;
++	area_id carArea = map_physical_memory("tegra car", TEGRA20_CAR_BASE,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA, &address);
++	if (carArea < B_OK)
++		return length;
++	uint32 enable = ((volatile uint32*)address)[CAR_CLK_OUT_ENB_H / 4];
++	delete_area(carArea);
++	if ((enable & CAR_CLK_ENB_FUSE) == 0) {
++		return append(buffer, size, length, "fuses: clock off (%#010"
++			B_PRIx32 "), not read\n", enable);
++	}
++
++	area_id miscArea = map_physical_memory("tegra apb misc",
++		TEGRA20_APB_MISC_BASE, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA, &address);
++	if (miscArea < B_OK)
++		return length;
++	uint32 chipID = ((volatile uint32*)address)[APB_MISC_GP_HIDREV / 4];
++	delete_area(miscArea);
++
++	area_id fuseArea = map_physical_memory("tegra fuse", TEGRA20_FUSE_BASE,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA, &address);
++	if (fuseArea < B_OK)
++		return length;
++	volatile uint32* fuse = (volatile uint32*)address;
++	uint32 sku = fuse[FUSE_SKU_INFO / 4];
++	volatile uint32* spare = fuse + FUSE_SPARE_BIT / 4;
++	uint32 cpuSpeedo = read_speedo(spare, 29, 20, 10);
++	uint32 socSpeedo = read_speedo(spare, 47, 40, 8);
++	bool a03p = (spare[18] | spare[19]) & 1;
++	delete_area(fuseArea);
++
++	// Linux' revisions: 1 = A01, 2 = A02, 3 = A03, 4 = A03p, 5 = A04
++	uint32 minor = (chipID >> 16) & 0xf;
++	uint32 revision = minor <= 2 ? minor : minor == 3 ? (a03p ? 4 : 3) : 5;
++	uint32 speedoID;
++	if (revision <= 2)
++		speedoID = 0;
++	else if (sku != 20 && sku != 23 && sku != 24 && sku != 27 && sku != 28)
++		speedoID = 1;
++	else
++		speedoID = 2;
++
++	static const uint32 kCPUProcessSpeedos[3][3] = {
++		{ 315, 366, 420 }, { 303, 368, 419 }, { 316, 331, 383 } };
++	static const uint32 kSoCProcessSpeedos[3][3] = {
++		{ 165, 195, 224 }, { 165, 195, 224 }, { 165, 195, 224 } };
++	uint32 cpuProcess = 0;
++	while (cpuProcess < 3
++		&& cpuSpeedo > kCPUProcessSpeedos[speedoID][cpuProcess]) {
++		cpuProcess++;
++	}
++	uint32 socProcess = 0;
++	while (socProcess < 3
++		&& socSpeedo > kSoCProcessSpeedos[speedoID][socProcess]) {
++		socProcess++;
++	}
++
++	return append(buffer, size, length, "chip id %#010" B_PRIx32 " (revision "
++		"%" B_PRIu32 "), sku %" B_PRIu32 "\nspeedo id %" B_PRIu32 ", cpu "
++		"speedo %" B_PRIu32 " (process %" B_PRIu32 "), soc speedo %" B_PRIu32
++		" (process %" B_PRIu32 ")\n", chipID, revision, sku, speedoID,
++		cpuSpeedo, cpuProcess, socSpeedo, socProcess);
++}
++
++
++//	#pragma mark - voltages
++
++
++static status_t
++read_pmic(uint8 reg, uint8* _value)
++{
++	return arm_dvc_i2c_read(TPS6586X_ADDRESS, reg, _value, 1);
++}
++
++
++static status_t
++write_pmic(uint8 reg, uint8 value)
++{
++	return arm_dvc_i2c_write(TPS6586X_ADDRESS, reg, &value, 1);
++}
++
++
++/*!	The voltage a supply is set to. It must be running from its V1 register,
++	the only one changed here.
++*/
++static status_t
++read_supply(const supply& supply, uint32* _millivolts)
++{
++	uint8 control, value;
++	status_t status = read_pmic(supply.controlRegister, &control);
++	if (status == B_OK)
++		status = read_pmic(supply.voltageRegister, &value);
++	if (status != B_OK)
++		return status;
++	if ((control & supply.v2Bit) != 0)
++		return B_NOT_SUPPORTED;
++
++	*_millivolts = dvm_millivolts(value);
++	return B_OK;
++}
++
++
++static bool
++supplies_valid(const uint32* millivolts)
++{
++	uint32 core = millivolts[SUPPLY_CORE];
++	uint32 rtc = millivolts[SUPPLY_RTC];
++	return core >= millivolts[SUPPLY_CPU] + CORE_OVER_CPU_MV
++		&& (core > rtc ? core - rtc : rtc - core) <= CORE_RTC_SPREAD_MV;
++}
++
++
++/*!	Moves a supply one step of 25 mV, through its V1 register and the go
++	bit that makes the regulator ramp to it, and reads it back.
++*/
++static status_t
++step_supply(const supply& supply, uint32 millivolts)
++{
++	uint8 value;
++	status_t status = read_pmic(supply.voltageRegister, &value);
++	if (status != B_OK)
++		return status;
++
++	value = (value & ~0x1f) | ((millivolts - 725) / DVM_STEP_MV);
++	status = write_pmic(supply.voltageRegister, value);
++	if (status == B_OK)
++		status = write_pmic(supply.controlRegister, supply.goBit);
++	if (status != B_OK)
++		return status;
++
++	// even at the slowest slew rate, 25 mV take well under a millisecond
++	snooze(2000);
++
++	uint32 actual;
++	status = read_supply(supply, &actual);
++	if (status != B_OK)
++		return status;
++	return actual == millivolts ? B_OK : B_ERROR;
++}
++
++
++static status_t
++set_supply(int32 index, uint32 target)
++{
++	const supply& supply = kSupplies[index];
++	if (target < supply.minMillivolts || target > supply.maxMillivolts
++		|| (target - 725) % DVM_STEP_MV != 0) {
++		return B_BAD_VALUE;
++	}
++
++	MutexLocker locker(sLock);
++
++	uint32 millivolts[SUPPLY_COUNT];
++	for (int32 i = 0; i < SUPPLY_COUNT; i++) {
++		status_t status = read_supply(kSupplies[i], &millivolts[i]);
++		if (status != B_OK)
++			return status;
++	}
++
++	uint32 wanted[SUPPLY_COUNT];
++	memcpy(wanted, millivolts, sizeof(wanted));
++	wanted[index] = target;
++	if (!supplies_valid(wanted)) {
++		TRACE_ALWAYS("%s %" B_PRIu32 " mV refused: core %" B_PRIu32 ", cpu %"
++			B_PRIu32 ", rtc %" B_PRIu32 " mV\n", supply.name, target,
++			millivolts[SUPPLY_CORE], millivolts[SUPPLY_CPU],
++			millivolts[SUPPLY_RTC]);
++		return B_NOT_ALLOWED;
++	}
++
++	while (millivolts[index] != target) {
++		uint32 next = millivolts[index] < target
++			? millivolts[index] + DVM_STEP_MV : millivolts[index] - DVM_STEP_MV;
++		millivolts[index] = next;
++		if (!supplies_valid(millivolts))
++			return B_NOT_ALLOWED;
++
++		status_t status = step_supply(supply, next);
++		TRACE_ALWAYS("%s %" B_PRIu32 " mV: %s\n", supply.name, next,
++			strerror(status));
++		if (status != B_OK)
++			return status;
++	}
++	return B_OK;
++}
++
++
++//	#pragma mark - device hooks
++
++
++static status_t
++tegra_dvfs_open(const char* name, uint32 flags, void** _cookie)
++{
++	*_cookie = NULL;
++	return B_OK;
++}
++
++
++static status_t
++tegra_dvfs_close(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++tegra_dvfs_free(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++tegra_dvfs_control(void* cookie, uint32 op, void* arg, size_t length)
++{
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++static status_t
++tegra_dvfs_read(void* cookie, off_t position, void* buffer, size_t* _length)
++{
++	char text[1536];
++	size_t textLength = report_pmic(text, sizeof(text), 0);
++	textLength = report_clocks(text, sizeof(text), textLength);
++	textLength = report_fuses(text, sizeof(text), textLength);
++	if (textLength >= sizeof(text))
++		textLength = sizeof(text) - 1;
++
++	if (position < 0 || (size_t)position >= textLength) {
++		*_length = 0;
++		return B_OK;
++	}
++	size_t length = min_c(*_length, textLength - (size_t)position);
++	if (user_memcpy(buffer, text + position, length) != B_OK)
++		return B_BAD_ADDRESS;
++	*_length = length;
++	return B_OK;
++}
++
++
++static status_t
++tegra_dvfs_write(void* cookie, off_t position, const void* buffer,
++	size_t* _length)
++{
++	char command[32];
++	size_t length = min_c(*_length, sizeof(command) - 1);
++	if (user_memcpy(command, buffer, length) != B_OK)
++		return B_BAD_ADDRESS;
++	command[length] = '\0';
++
++	char* value = strchr(command, ' ');
++	if (value == NULL) {
++		*_length = 0;
++		return B_BAD_VALUE;
++	}
++	*value++ = '\0';
++
++	for (int32 i = 0; i < SUPPLY_COUNT; i++) {
++		if (strcmp(command, kSupplies[i].name) != 0)
++			continue;
++
++		status_t status = set_supply(i, strtoul(value, NULL, 10));
++		if (status != B_OK)
++			*_length = 0;
++		return status;
++	}
++	*_length = 0;
++	return B_BAD_VALUE;
++}
++
++
++static device_hooks sDeviceHooks = {
++	tegra_dvfs_open,
++	tegra_dvfs_close,
++	tegra_dvfs_free,
++	tegra_dvfs_control,
++	tegra_dvfs_read,
++	tegra_dvfs_write,
++};
++
++
++//	#pragma mark - driver
++
++
++status_t
++init_hardware(void)
++{
++	uint8 version;
++	status_t status = arm_dvc_i2c_read(TPS6586X_ADDRESS, TPS6586X_VERSIONCRC,
++		&version, 1);
++	if (status != B_OK)
++		return status;
++	TRACE_ALWAYS("TPS6586x version %#x\n", version);
++	return B_OK;
++}
++
++
++status_t
++init_driver(void)
++{
++	return B_OK;
++}
++
++
++void
++uninit_driver(void)
++{
++}
++
++
++const char**
++publish_devices(void)
++{
++	return sDeviceNames;
++}
++
++
++device_hooks*
++find_device(const char* name)
++{
++	return &sDeviceHooks;
++}

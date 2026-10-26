@@ -1,0 +1,81 @@
+From 50f640b0c4d776a5cb80c29bfa3562e4a3eb09e3 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 25 Oct 2026 20:10:32 +0100
+Subject: [PATCH 228/270] Revert "sdhci: do not probe an empty Tegra slot"
+
+This reverts commit 9393b24054. Since then, the AC100 mostly failed to
+find its boot volume on the eMMC when the SD slot was empty: the eMMC
+reads returned the data of the previous read. Probe the empty slot
+again, as before, until this is understood.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/add-ons/kernel/busses/mmc/sdhci.cpp     |  4 +---
+ src/add-ons/kernel/busses/mmc/sdhci.h       |  3 ---
+ src/add-ons/kernel/busses/mmc/sdhci_fdt.cpp | 11 +++--------
+ 3 files changed, 4 insertions(+), 14 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/mmc/sdhci.cpp b/src/add-ons/kernel/busses/mmc/sdhci.cpp
+index 136734151e..417548da8e 100644
+--- a/src/add-ons/kernel/busses/mmc/sdhci.cpp
++++ b/src/add-ons/kernel/busses/mmc/sdhci.cpp
+@@ -725,8 +725,6 @@ SdhciBus::_IsEmbeddedSlot()
+ bool
+ SdhciBus::_IsCardPresent()
+ {
+-	if (fQuirks.cardAbsent)
+-		return false;
+ 	return _IsEmbeddedSlot() || fRegisters->present_state.IsCardInserted();
+ }
+ 
+@@ -1827,7 +1825,7 @@ SdhciBus::SetScanSemaphore(sem_id sem)
+ 	// We can now enable the card insertion interrupt for next time a card
+ 	// is inserted. Not for an embedded slot: insertion and removal events
+ 	// mean nothing there, and acting on them only disturbs the device.
+-	if (!_IsEmbeddedSlot() && !fQuirks.cardAbsent)
++	if (!_IsEmbeddedSlot())
+ 		EnableInterrupts(SDHCI_INT_CARD_INS);
+ }
+ 
+diff --git a/src/add-ons/kernel/busses/mmc/sdhci.h b/src/add-ons/kernel/busses/mmc/sdhci.h
+index cf48d510b0..735866590a 100644
+--- a/src/add-ons/kernel/busses/mmc/sdhci.h
++++ b/src/add-ons/kernel/busses/mmc/sdhci.h
+@@ -74,9 +74,6 @@ struct SdhciQuirks {
+ 	// the controller's card detect line is not used (card detect through a
+ 	// GPIO, or non removable device): take the card as always present
+ 	bool	forceCardPresent;
+-	// the card detect (a GPIO) said the slot is empty when the controller
+-	// was set up: do not probe it, which only times out
+-	bool	cardAbsent;
+ 	// the transfer mode and command registers must be written together, in
+ 	// one 32 bit access
+ 	bool	combinedCommandWrite;
+diff --git a/src/add-ons/kernel/busses/mmc/sdhci_fdt.cpp b/src/add-ons/kernel/busses/mmc/sdhci_fdt.cpp
+index f113ace83c..f6ca39c8d7 100644
+--- a/src/add-ons/kernel/busses/mmc/sdhci_fdt.cpp
++++ b/src/add-ons/kernel/busses/mmc/sdhci_fdt.cpp
+@@ -247,20 +247,15 @@ tegra20_init(fdt_device_module_info* module, fdt_device* dev,
+ 	quirks.noHighSpeedBit = true;
+ 
+ 	// Card detection is done through a GPIO on Tegra, not by the controller.
+-	// An empty slot is not probed, which only times out and costs the boot a
+-	// second or two. The controller is still set up: failing here would also
+-	// stop the device manager from probing the controllers after it, among
+-	// them the eMMC. Insertion is not watched, so a card put in later is only
+-	// seen after a reboot.
+-	// TODO: use the "cd-gpios" GPIO for insertion and removal.
+-	quirks.forceCardPresent = true;
++	// TODO: use the "cd-gpios" GPIO for insertion and removal instead of
++	// assuming a card is present.
+ 	bool cardPresent;
+ 	if (tegra20_gpio(module, dev, "cd-gpios", false, false, &cardPresent)
+ 			== B_OK) {
+ 		TRACE_ALWAYS("Tegra %#" B_PRIx64 ": card detect says %s\n", regBase,
+ 			cardPresent ? "inserted" : "not inserted");
+-		quirks.cardAbsent = !cardPresent;
+ 	}
++	quirks.forceCardPresent = true;
+ 	return B_OK;
+ }
+ 

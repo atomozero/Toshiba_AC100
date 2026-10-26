@@ -1,7 +1,7 @@
-From 0329cfcae59313dbf85f9b2c60824c2efd15ac00 Mon Sep 17 00:00:00 2001
+From 4e389377c60e548b759915475462163eb53810e4 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 12:50:28 +0200
-Subject: [PATCH 083/203] ARM bring-up: log unhandled user faults with their
+Subject: [PATCH 083/270] ARM bring-up: log unhandled user faults with their
  area, keep the faulting PC/LR, list the images of all teams in the last dump
  (not for merging)
 

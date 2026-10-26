@@ -1,7 +1,7 @@
-From 7525a7219e1b28ab97cd5cb2865b4fc504f183b8 Mon Sep 17 00:00:00 2001
+From fd76de6942adcf41bbdf118f6b0cd5f2e00e2485 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 09:43:26 +0200
-Subject: [PATCH 071/203] ehci: Tegra 2 transceiver settings, TX FIFO threshold
+Subject: [PATCH 071/270] ehci: Tegra 2 transceiver settings, TX FIFO threshold
  and integrated TT port
 
 - The controller reset in the UTMI PHY bring-up put the transceiver

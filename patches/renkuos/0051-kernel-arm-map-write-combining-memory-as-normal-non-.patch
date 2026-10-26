@@ -1,7 +1,7 @@
-From 475cf7fcec229c303f82e02f2060e5cfaed08cdf Mon Sep 17 00:00:00 2001
+From d475225f8f3e2305924f942993c09e4ca6eac1bf Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 22:35:39 +0200
-Subject: [PATCH 051/203] kernel/arm: map write combining memory as normal
+Subject: [PATCH 051/270] kernel/arm: map write combining memory as normal
  non-cacheable
 
 B_WRITE_COMBINING_MEMORY was mapped as shareable device memory, which

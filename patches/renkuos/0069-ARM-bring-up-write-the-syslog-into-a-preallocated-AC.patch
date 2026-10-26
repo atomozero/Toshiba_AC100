@@ -1,7 +1,7 @@
-From c2c1ce5a5ca10793d9969a6e1b53e6c757a7fb7f Mon Sep 17 00:00:00 2001
+From 391fd3acb83d2adb73b79d3d6d91f8ccdaa63789 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 09:09:25 +0200
-Subject: [PATCH 069/203] ARM bring-up: write the syslog into a preallocated
+Subject: [PATCH 069/270] ARM bring-up: write the syslog into a preallocated
  AC100LOG.TXT every 10 lines (not for merging)
 
 Mounting the EFI system partition again and again to write the log did

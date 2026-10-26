@@ -1,7 +1,7 @@
-From 0d7a9dea779704740f3e02bba0301d6bdd6e7031 Mon Sep 17 00:00:00 2001
+From 054ba8a9aba19cae8d13b60859b2c3af29a20bc3 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 20:04:26 +0200
-Subject: [PATCH 044/203] ARM bring-up: keep the marker frame buffer free of
+Subject: [PATCH 044/270] ARM bring-up: keep the marker frame buffer free of
  access/dirty faults (not for merging)
 
 ---

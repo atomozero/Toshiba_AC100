@@ -1,7 +1,7 @@
-From e305b40dd5182b60edea6335576918b491e9afdd Mon Sep 17 00:00:00 2001
+From ba64130292294679e566430986de5e50f4e4bda8 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Mon, 19 Oct 2026 22:07:31 +0200
-Subject: [PATCH 142/203] kernel/arm: give debuggers the userland registers of
+Subject: [PATCH 142/270] kernel/arm: give debuggers the userland registers of
  a thread
 
 arch_get_debug_cpu_state() and arch_get_thread_debug_cpu_state() did not

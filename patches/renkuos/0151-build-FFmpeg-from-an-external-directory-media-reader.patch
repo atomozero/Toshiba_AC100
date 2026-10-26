@@ -1,7 +1,7 @@
-From 7de0eba87bc339c247aa7a610467e030ee1504fb Mon Sep 17 00:00:00 2001
+From cd350d8203a64bcd26588aadc8ed7daa931d7663 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Mon, 19 Oct 2026 23:57:34 +0200
-Subject: [PATCH 151/203] build: FFmpeg from an external directory; media
+Subject: [PATCH 151/270] build: FFmpeg from an external directory; media
  reader plugins in the ARM image
 
 Without the FFmpeg plugin MediaPlayer could not open any file. Like the GL
@@ -40,10 +40,10 @@ index 44e57854cf..2327c944ba 100644
  		libavutil.so libswresample.so ;
  
 diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
-index 9f437c9b6f..637d16279c 100644
+index 1d234d9259..c0906032b1 100644
 --- a/build/jam/images/definitions/minimum
 +++ b/build/jam/images/definitions/minimum
-@@ -594,6 +594,8 @@ if arm in $(HAIKU_PACKAGING_ARCHS) {
+@@ -606,6 +606,8 @@ if arm in $(HAIKU_PACKAGING_ARCHS) {
  	] ;
  
  	SYSTEM_ADD_ONS_MEDIA_PLUGINS += [ FFilterByBuildFeatures

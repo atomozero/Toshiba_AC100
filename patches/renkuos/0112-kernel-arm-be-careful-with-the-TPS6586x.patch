@@ -1,7 +1,7 @@
-From e03e6c6c63a7202edd11e0f2737462d1eeb83787 Mon Sep 17 00:00:00 2001
+From a8fe905ad94f29ccc1e1f194dde2e1c49e2a0de8 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 20:09:50 +0200
-Subject: [PATCH 112/203] kernel/arm: be careful with the TPS6586x
+Subject: [PATCH 112/270] kernel/arm: be careful with the TPS6586x
 
 Its registers survive a power off: only write it after a successful read
 and never while booting, and let "tps6586x_clock false" in the kernel

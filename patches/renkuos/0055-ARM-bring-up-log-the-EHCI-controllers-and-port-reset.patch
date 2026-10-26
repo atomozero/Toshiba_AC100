@@ -1,7 +1,7 @@
-From 6ba1c9d07dec7f5c8100751fa2acc01dfe13b802 Mon Sep 17 00:00:00 2001
+From 06ef9761155363659032ea9c4cc47e397fae4b52 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 22:35:56 +0200
-Subject: [PATCH 055/203] ARM bring-up: log the EHCI controllers and port
+Subject: [PATCH 055/270] ARM bring-up: log the EHCI controllers and port
  resets, fix USBMODE offset in the loader dump (not for merging)
 
 ---

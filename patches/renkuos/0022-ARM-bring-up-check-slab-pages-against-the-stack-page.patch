@@ -1,7 +1,7 @@
-From d82c79ad3301f08fab824878edd9127f4e250fe3 Mon Sep 17 00:00:00 2001
+From 1aada42055feb508cf1f76490ae36d649e8dd0bb Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 17:03:38 +0200
-Subject: [PATCH 022/203] ARM bring-up: check slab pages against the stack page
+Subject: [PATCH 022/270] ARM bring-up: check slab pages against the stack page
  (not for merging)
 
 ---

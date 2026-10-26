@@ -1,7 +1,7 @@
-From 34885f76d35bc192496ef4efed099df602a915b1 Mon Sep 17 00:00:00 2001
+From e3aac2d083840bbe322ce811c6047bfbed3b6d3d Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 10:59:42 +0200
-Subject: [PATCH 077/203] nvec: report the battery and the power supply
+Subject: [PATCH 077/270] nvec: report the battery and the power supply
 
 Poll the power supply and one battery value every 5 seconds, as Linux
 does, and publish the battery with the interface of the ACPI battery

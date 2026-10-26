@@ -1,7 +1,7 @@
-From d83ada926c6fcb554598ffd7f2f4a9c8e8dbf293 Mon Sep 17 00:00:00 2001
+From 6e173d95b587f6d73ea936a3cc7cb79d03e0696c Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 16:51:07 +0200
-Subject: [PATCH 021/203] ARM bring-up: print the frame buffer location (not
+Subject: [PATCH 021/270] ARM bring-up: print the frame buffer location (not
  for merging)
 
 ---

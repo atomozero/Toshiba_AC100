@@ -1,7 +1,7 @@
-From 59df70278aa920786cca4e5e75647a24bef841d9 Mon Sep 17 00:00:00 2001
+From 6db8f64f5484be45fb153b06ab24f422dd8f5288 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 11:31:19 +0200
-Subject: [PATCH 078/203] ARM bring-up: name the team that entered the
+Subject: [PATCH 078/270] ARM bring-up: name the team that entered the
  debugger, say why there is no stack trace (not for merging)
 
 ---

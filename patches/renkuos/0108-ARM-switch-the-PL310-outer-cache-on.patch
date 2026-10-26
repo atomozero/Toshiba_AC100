@@ -1,7 +1,7 @@
-From cff3634826e96835650040a358c019fc62d1495a Mon Sep 17 00:00:00 2001
+From 7b84a805d15965ea86aaf4b7a947073865e403c6 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 19:17:33 +0200
-Subject: [PATCH 108/203] ARM: switch the PL310 outer cache on
+Subject: [PATCH 108/270] ARM: switch the PL310 outer cache on
 
 The firmware of the Toshiba AC100 leaves the 1 MB L2 cache of the Tegra 2
 off, and nothing switched it on. Do so at boot, with the latencies of the

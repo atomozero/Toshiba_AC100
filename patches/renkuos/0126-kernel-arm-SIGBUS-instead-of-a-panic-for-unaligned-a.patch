@@ -1,7 +1,7 @@
-From 3e134698cb75cfb13b5e84e43c49eded8eca3cd5 Mon Sep 17 00:00:00 2001
+From 7ba59eaf76468adb9fd596b9218e2acc071e42e2 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Mon, 19 Oct 2026 00:10:16 +0200
-Subject: [PATCH 126/203] kernel/arm: SIGBUS instead of a panic for unaligned
+Subject: [PATCH 126/270] kernel/arm: SIGBUS instead of a panic for unaligned
  accesses in userland
 
 An unaligned floating point load in an application (a BPoint in a message

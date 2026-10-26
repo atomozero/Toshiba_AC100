@@ -1,7 +1,7 @@
-From 62152b6300239d61060788eb0ad7fc5e580e4bb3 Mon Sep 17 00:00:00 2001
+From d88bda00b774ae93aca9b3e022bc638d9514f31a Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 24 Oct 2026 12:06:33 +0200
-Subject: [PATCH 203/203] Revert "efi/arm: run the Tegra20 system clock at 200
+Subject: [PATCH 203/270] Revert "efi/arm: run the Tegra20 system clock at 200
  MHz on the AC100"
 
 This reverts commit 6b934e98f6.

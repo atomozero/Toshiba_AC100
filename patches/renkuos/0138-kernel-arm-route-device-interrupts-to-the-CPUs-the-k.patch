@@ -1,7 +1,7 @@
-From cd122700f42e79e4b1d6a5259416c50d34f03d36 Mon Sep 17 00:00:00 2001
+From 7bf106e457b2d39002528511fffe921871a529eb Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Mon, 19 Oct 2026 20:50:53 +0200
-Subject: [PATCH 138/203] kernel/arm: route device interrupts to the CPUs the
+Subject: [PATCH 138/270] kernel/arm: route device interrupts to the CPUs the
  kernel assigns them to
 
 All shared peripheral interrupts went to the boot CPU, so its load included

@@ -1,7 +1,7 @@
-From 045c16e177211a49cb0f2dbff265a7f368e12edb Mon Sep 17 00:00:00 2001
+From 543f95cdb84a6e9b4520cfe8d703419d42035064 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Mon, 19 Oct 2026 12:59:49 +0200
-Subject: [PATCH 133/203] build: GL kit and GLU from an external directory; GL
+Subject: [PATCH 133/270] build: GL kit and GLU from an external directory; GL
  demos in the ARM image
 
 There are no mesa and glu packages for ARM in the repositories. With
@@ -44,7 +44,7 @@ index 0f2fce8265..44e57854cf 100644
  		file: base mesa
  			runtime: lib
 diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
-index 8fded281fb..89e77006e4 100644
+index 2117eed1c1..c496ca39f5 100644
 --- a/build/jam/images/definitions/minimum
 +++ b/build/jam/images/definitions/minimum
 @@ -216,6 +216,7 @@ rule HaikuImageGetSystemLibs
@@ -55,7 +55,7 @@ index 8fded281fb..89e77006e4 100644
  			libgnu.so
  			libmail.so@arm
  			libmedia.so@arm
-@@ -495,6 +496,7 @@ if arm in $(HAIKU_PACKAGING_ARCHS) {
+@@ -507,6 +508,7 @@ if arm in $(HAIKU_PACKAGING_ARCHS) {
  	SYSTEM_APPS += [ FFilterByBuildFeatures
  		AutoRaise
  		CodyCam
@@ -63,7 +63,7 @@ index 8fded281fb..89e77006e4 100644
  		HaikuDepot
  		Icon-O-Matic@expat
  		LaunchBox
-@@ -544,6 +546,8 @@ if arm in $(HAIKU_PACKAGING_ARCHS) {
+@@ -556,6 +558,8 @@ if arm in $(HAIKU_PACKAGING_ARCHS) {
  
  	SYSTEM_DEMOS += [ FFilterByBuildFeatures
  		Cortex@expat
@@ -72,7 +72,7 @@ index 8fded281fb..89e77006e4 100644
  		OverlayImage
  	] ;
  
-@@ -610,6 +614,9 @@ if arm in $(HAIKU_PACKAGING_ARCHS) {
+@@ -622,6 +626,9 @@ if arm in $(HAIKU_PACKAGING_ARCHS) {
  	SYSTEM_ADD_ONS_SCREENSAVERS += [ FFilterByBuildFeatures
  		Butterfly
  		DebugNow

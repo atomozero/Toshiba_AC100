@@ -1,7 +1,7 @@
-From be7d47049202e74b11af0482e1368225a15b101b Mon Sep 17 00:00:00 2001
+From 30a6b0ae14fd4bed2f82880b2060538c7e43a2d8 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?Przemys=C5=82aw=20Buczkowski?= <prem@prem.moe>
 Date: Thu, 10 Sep 2026 22:04:40 +0900
-Subject: [PATCH 091/203] cpu_type.h: split per arch and add arm64
+Subject: [PATCH 091/270] cpu_type.h: split per arch and add arm64
  identification
 
 Previously it supported only x86(-64) using #ifdef.

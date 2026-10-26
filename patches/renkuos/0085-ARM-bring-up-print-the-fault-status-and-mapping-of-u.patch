@@ -1,7 +1,7 @@
-From 6c8edf106e766762f352cd73af423b76d9fb5536 Mon Sep 17 00:00:00 2001
+From b2dad1665c7f700649fc2453f8b49f9fd27751c9 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 13:19:14 +0200
-Subject: [PATCH 085/203] ARM bring-up: print the fault status and mapping of
+Subject: [PATCH 085/270] ARM bring-up: print the fault status and mapping of
  unhandled user faults (not for merging)
 
 ---

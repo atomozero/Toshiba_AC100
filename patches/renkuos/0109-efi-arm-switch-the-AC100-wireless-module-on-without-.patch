@@ -1,7 +1,7 @@
-From 69e4a6ec0889fd4ce8a2a16e3c43971071f87ac2 Mon Sep 17 00:00:00 2001
+From d196092d78cf0f71105adad59b47660c1fdcad27 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 19:46:00 +0200
-Subject: [PATCH 109/203] efi/arm: switch the AC100 wireless module on without
+Subject: [PATCH 109/270] efi/arm: switch the AC100 wireless module on without
  an rfkill node
 
 U-Boot passes its own device tree of the Toshiba AC100, which has no rfkill

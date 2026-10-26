@@ -1,7 +1,7 @@
-From 539613898f9c3f878ef3f0340deb6b087e328502 Mon Sep 17 00:00:00 2001
+From 3cc079b3e42b7ad8f6899b7dda4108558434b247 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 15:17:29 +0200
-Subject: [PATCH 012/203] ARM: boot stage markers on the frame buffer (bring-up
+Subject: [PATCH 012/270] ARM: boot stage markers on the frame buffer (bring-up
  aid, not for merging)
 
 ---

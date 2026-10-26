@@ -1,7 +1,7 @@
-From 398f504c45b933cba5eaa89d7d227dea35de8c38 Mon Sep 17 00:00:00 2001
+From 5f40f899b42edea9b3ac81f991b4e94800f94ce0 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 17:44:16 +0200
-Subject: [PATCH 026/203] ARM bring-up: show the last exceptions on panic (not
+Subject: [PATCH 026/270] ARM bring-up: show the last exceptions on panic (not
  for merging)
 
 ---

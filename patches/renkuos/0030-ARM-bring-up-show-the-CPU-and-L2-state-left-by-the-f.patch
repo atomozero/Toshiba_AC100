@@ -1,7 +1,7 @@
-From b75cb036fa1ad31f9767dc8e8c8162a0269fe5f7 Mon Sep 17 00:00:00 2001
+From 85862ca6c0b06b544de13cd2a598c8ccfc79cb1b Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 18:14:57 +0200
-Subject: [PATCH 030/203] ARM bring-up: show the CPU and L2 state left by the
+Subject: [PATCH 030/270] ARM bring-up: show the CPU and L2 state left by the
  firmware, keep the first panic (not for merging)
 
 ---

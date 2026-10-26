@@ -1,0 +1,194 @@
+From f56703ffc9584fabb492cbf43ca995193c783560 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 26 Oct 2026 08:04:40 +0100
+Subject: [PATCH 249/270] tegra_dc: HDMI output tunables, DVI by default, EDID
+ retries
+
+Without audio clock regeneration packets a television kept losing the
+picture in HDMI mode, while plain DVI was stable: use DVI unless
+'hdmi_dvi false' is set, with full range RGB. The TMDS pre-emphasis,
+drive current and VCO capacitor can be set in the driver settings,
+read again at each hot plug. The screen gets 100 ms before each of
+three EDID attempts, failures are logged in detail, and the monitor
+name comes from its descriptor.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../kernel/drivers/graphics/tegra_dc/hdmi.cpp | 92 ++++++++++++++++---
+ 1 file changed, 78 insertions(+), 14 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
+index 5bf6f19bb7..b2a8b6a664 100644
+--- a/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
+@@ -20,6 +20,7 @@
+ #include "hdmi.h"
+ 
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include <KernelExport.h>
+@@ -266,6 +267,16 @@ static const hdmi_mode k720p = {
+ };
+ 
+ 
++// TMDS output settings; the driver settings can change them for screens or
++// cables that need it (they are read again at each hot plug)
++struct tmds_settings {
++	bool	force_dvi;
++	uint32	pre_emphasis;	// PE_CURRENT units of 0.5 mA, 0 = off
++	uint32	drive_current;	// DRIVE_CURRENT code, 1.5 mA + n * 0.375 mA
++	uint32	vco_cap;
++};
++
++
+ static struct {
+ 	mutex			lock;
+ 	thread_id		thread;
+@@ -291,6 +302,7 @@ static struct {
+ 
+ 	bool			active;
+ 	hdmi_mode		mode;
++	tmds_settings	tmds;
+ } sHdmi;
+ 
+ 
+@@ -534,12 +546,18 @@ read_edid(uint8* edid, uint32* _size)
+ 		uint8 start = offset;
+ 		status_t status = ddc_transfer(DDC_EDID_ADDRESS, &start, 1, false,
+ 			true);
+-		if (status == B_OK) {
++		bool wrote = status == B_OK;
++		if (wrote) {
+ 			status = ddc_transfer(DDC_EDID_ADDRESS, edid + offset, 32, true,
+ 				false);
+ 		}
+-		if (status != B_OK)
++		if (status != B_OK) {
++			ERROR("DDC %s at offset %" B_PRIu32 ": %s, interrupt status %#"
++				B_PRIx32 ", FIFO status %#" B_PRIx32 "\n",
++				wrote ? "read" : "write", offset, strerror(status),
++				sHdmi.i2c[I2C_INT_STATUS / 4], sHdmi.i2c[I2C_FIFO_STATUS / 4]);
+ 			return status;
++		}
+ 		if (offset == 96 && edid[126] > 0)
+ 			size = EDID_SIZE;
+ 	}
+@@ -874,8 +892,9 @@ start_hdmi(bool hdmiSink)
+ 
+ 	write_hdmi(HDMI_VSYNC_WINDOW, VSYNC_WINDOW_ENABLE | VSYNC_WINDOW_START(0x200)
+ 		| VSYNC_WINDOW_END(0x210));
++	// CEA modes on HDMI sinks have limited range RGB, DVI full range
+ 	write_hdmi(HDMI_INPUT_CONTROL, HDMI_SOURCE_DISPLAY_B
+-		| (mode.vic > 1 ? HDMI_VIDEO_RANGE_LIMITED : 0));
++		| (hdmiSink && mode.vic > 1 ? HDMI_VIDEO_RANGE_LIMITED : 0));
+ 
+ 	// Reference clock in quarters of MHz
+ 	uint32 quarters = mode.pixel_clock / 1000 * 4;
+@@ -894,16 +913,17 @@ start_hdmi(bool hdmiSink)
+ 		write_hdmi(HDMI_AVI_INFOFRAME_CTRL, 0);
+ 
+ 	// TMDS settings of the Tegra 2: pre-emphasis above 27 MHz
++	const tmds_settings& tmds = sHdmi.tmds;
+ 	bool slow = mode.pixel_clock <= 27000;
++	uint32 preEmphasis = slow ? 0 : tmds.pre_emphasis;
+ 	write_hdmi(HDMI_SOR_PLL0, SOR_PLL_BG_V17_S(3) | SOR_PLL_ICHPMP(1)
+-		| SOR_PLL_RESISTORSEL | SOR_PLL_VCOCAP(slow ? 0 : 1)
++		| SOR_PLL_RESISTORSEL | SOR_PLL_VCOCAP(slow ? 0 : tmds.vco_cap)
+ 		| SOR_PLL_TX_REG_LOAD(3));
+ 	write_hdmi(HDMI_SOR_PLL1, SOR_PLL_TMDS_TERM_ENABLE
+-		| (slow ? 0 : SOR_PLL_PE_EN));
+-	write_hdmi(HDMI_PE_CURRENT, slow ? 0 : PE_CURRENT_ALL(PE_CURRENT_6_MA));
++		| (preEmphasis != 0 ? SOR_PLL_PE_EN : 0));
++	write_hdmi(HDMI_PE_CURRENT, PE_CURRENT_ALL(preEmphasis));
+ 	write_hdmi(HDMI_SOR_LANE_DRIVE_CURRENT,
+-		DRIVE_CURRENT_ALL(DRIVE_CURRENT_7_125_MA)
+-			| DRIVE_CURRENT_FUSE_OVERRIDE);
++		DRIVE_CURRENT_ALL(tmds.drive_current) | DRIVE_CURRENT_FUSE_OVERRIDE);
+ 
+ 	write_hdmi(HDMI_SOR_SEQ_CTL, SOR_SEQ_PD_PC(8) | SOR_SEQ_PD_PC_ALT(8));
+ 	uint32 instruction = SOR_SEQ_INST_WAIT_TIME(1) | SOR_SEQ_INST_WAIT_VSYNC
+@@ -990,10 +1010,32 @@ connect()
+ 		return;
+ 	}
+ 
++	void* settings = load_driver_settings("tegra_dc");
++	tmds_settings& tmds = sHdmi.tmds;
++	// Without audio clock regeneration packets, which the driver does not
++	// send yet, HDMI sinks may keep losing the picture: DVI unless asked
++	tmds.force_dvi = get_driver_boolean_parameter(settings, "hdmi_dvi", true,
++		true);
++	tmds.pre_emphasis = min_c(strtoul(get_driver_parameter(settings,
++		"hdmi_pre_emphasis", "6", "6"), NULL, 0), 0xfu);
++	tmds.drive_current = min_c(strtoul(get_driver_parameter(settings,
++		"hdmi_drive_current", "15", "15"), NULL, 0), 0x3fu);
++	tmds.vco_cap = min_c(strtoul(get_driver_parameter(settings,
++		"hdmi_vco_cap", "1", "1"), NULL, 0), 0xfu);
++	unload_driver_settings(settings);
++
++	// The screen may need a moment after the hot plug line rises
+ 	uint8 edid[EDID_SIZE];
+ 	uint32 edidSize = 0;
+ 	setup_ddc();
+-	status = read_edid(edid, &edidSize);
++	for (int32 attempt = 0; attempt < 3; attempt++) {
++		snooze(100000);
++		status = read_edid(edid, &edidSize);
++		if (status == B_OK)
++			break;
++		ERROR("EDID attempt %" B_PRId32 ": %s, I2C status %#" B_PRIx32 "\n",
++			attempt, strerror(status), sHdmi.i2c[I2C_INT_STATUS / 4]);
++	}
+ 
+ 	bool hdmiSink = true;
+ 	sHdmi.mode = k720p;
+@@ -1002,11 +1044,31 @@ connect()
+ 		hdmi_mode preferred;
+ 		if (parse_detailed_timing(edid + 0x36, preferred))
+ 			sHdmi.mode = preferred;
+-		dprintf("tegra_dc: hdmi: EDID of \"%.13s\", %s sink\n",
+-			(const char*)edid + 0x5f, hdmiSink ? "HDMI" : "DVI");
++		char name[14] = "unknown";
++		for (uint32 offset = 0x36; offset < 0x7e; offset += 18) {
++			const uint8* descriptor = edid + offset;
++			if (descriptor[0] == 0 && descriptor[1] == 0
++				&& descriptor[3] == 0xfc) {
++				for (int32 i = 0; i < 13; i++) {
++					char c = descriptor[5 + i];
++					name[i] = c == '\n' ? '\0' : c;
++					if (c == '\n')
++						break;
++				}
++				name[13] = '\0';
++			}
++		}
++		dprintf("tegra_dc: hdmi: EDID of \"%s\", %s sink, preferred %s\n",
++			name, hdmiSink ? "HDMI" : "DVI",
++			sHdmi.mode.h_display != k720p.h_display
++				|| sHdmi.mode.pixel_clock != k720p.pixel_clock
++				? "mode taken" : "mode 1280x720 (or unusable)");
+ 	} else
+ 		ERROR("no EDID (%s), trying 1280x720\n", strerror(status));
+ 
++	if (tmds.force_dvi)
++		hdmiSink = false;
++
+ 	const hdmi_mode& mode = sHdmi.mode;
+ 	status = set_pll_d(mode.pixel_clock);
+ 	if (status != B_OK) {
+@@ -1022,9 +1084,11 @@ connect()
+ 		return;
+ 	}
+ 
+-	dprintf("tegra_dc: hdmi: %ux%u, %" B_PRIu32 " kHz, totals %ux%u, VIC %u\n",
+-		mode.h_display, mode.v_display, mode.pixel_clock, mode.h_total,
+-		mode.v_total, mode.vic);
++	dprintf("tegra_dc: hdmi: %ux%u, %" B_PRIu32 " kHz, totals %ux%u, VIC %u, "
++		"%s, pre-emphasis %" B_PRIu32 ", drive %" B_PRIu32 ", VCO cap %"
++		B_PRIu32 "\n", mode.h_display, mode.v_display, mode.pixel_clock,
++		mode.h_total, mode.v_total, mode.vic, hdmiSink ? "HDMI" : "DVI",
++		tmds.pre_emphasis, tmds.drive_current, tmds.vco_cap);
+ }
+ 
+ 

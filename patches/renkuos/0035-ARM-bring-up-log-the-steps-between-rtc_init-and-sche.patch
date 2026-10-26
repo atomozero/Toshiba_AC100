@@ -1,7 +1,7 @@
-From 3fd8d522ed78d57ad83ed652b85f85188a3f9315 Mon Sep 17 00:00:00 2001
+From f6c4bf3d8c4fb56a186d36dfdbee1d01fb157515 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 18:56:18 +0200
-Subject: [PATCH 035/203] ARM bring-up: log the steps between rtc_init and
+Subject: [PATCH 035/270] ARM bring-up: log the steps between rtc_init and
  scheduler_init (not for merging)
 
 ---

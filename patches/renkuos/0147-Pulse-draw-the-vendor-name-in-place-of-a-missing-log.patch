@@ -1,7 +1,7 @@
-From 59909ce5f563375d78072ae7d96417c8054343ed Mon Sep 17 00:00:00 2001
+From 3694bc786b011c7cc56c3b2ef6a3c7c6d421b18e Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Mon, 19 Oct 2026 22:53:18 +0200
-Subject: [PATCH 147/203] Pulse: draw the vendor name in place of a missing
+Subject: [PATCH 147/270] Pulse: draw the vendor name in place of a missing
  logo
 
 Without a logo (ARM, for example) the name was drawn small near the top of

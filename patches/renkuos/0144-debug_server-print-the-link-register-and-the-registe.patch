@@ -1,7 +1,7 @@
-From 4f1d30945fc7fc7e22761337b4caa95a35eac121 Mon Sep 17 00:00:00 2001
+From 37e30f7e6b0cd8ec8911b92742958fd8c8430fed Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Mon, 19 Oct 2026 22:07:31 +0200
-Subject: [PATCH 144/203] debug_server: print the link register and the
+Subject: [PATCH 144/270] debug_server: print the link register and the
  registers on ARM
 
 The scan of the stack does not see the caller of a function that keeps its

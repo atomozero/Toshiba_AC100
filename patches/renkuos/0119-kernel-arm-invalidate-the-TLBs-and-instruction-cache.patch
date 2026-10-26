@@ -1,7 +1,7 @@
-From d74ef12b3c5d67e58edee5794f9ebca9c44864c5 Mon Sep 17 00:00:00 2001
+From 96ef4757bded2dec666c61ef4720c6f250897eb8 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 22:27:42 +0200
-Subject: [PATCH 119/203] kernel/arm: invalidate the TLBs and instruction
+Subject: [PATCH 119/270] kernel/arm: invalidate the TLBs and instruction
  caches of all CPUs
 
 The kernel invalidated only the TLB of the current CPU when kernel

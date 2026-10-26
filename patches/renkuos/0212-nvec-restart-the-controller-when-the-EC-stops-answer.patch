@@ -1,0 +1,130 @@
+From c6e914f5385ae38c18d3f17a517e5d270d9df997 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 24 Oct 2026 20:49:20 +0200
+Subject: [PATCH 212/270] nvec: restart the controller when the EC stops
+ answering
+
+After a spurious interrupt the EC was also seen to stop in the middle of
+a message it sent, with no interrupt pending: the driver waited in state
+4 and the EC answered nothing anymore. After two timeouts in a row the
+controller is now reset and set up again, as at boot.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/add-ons/kernel/busses/i2c/nvec/nvec.cpp | 68 ++++++++++++++++++---
+ 1 file changed, 60 insertions(+), 8 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+index 6744bee519..073805b3e5 100644
+--- a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
++++ b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+@@ -197,6 +197,8 @@ struct nvec_device {
+ 	uint32				protocolErrors;
+ 	uint32				interrupts;		// bring-up statistics
+ 	uint32				lostInterrupts;
++	uint32				restarts;
++	int32				timeouts;	// in a row, by tx_thread
+ 	// check_lost_interrupt(): the interrupt count when it found one pending
+ 	uint32				pendingInterrupts;
+ 	int32				pendingChecks;
+@@ -363,6 +365,18 @@ map_registers(const char* name, phys_addr_t physical, area_id* _area,
+ }
+ 
+ 
++static void
++setup_slave(nvec_device* device)
++{
++	write_reg(device, I2C_CNFG, I2C_CNFG_NEW_MASTER_SFM
++		| I2C_CNFG_PACKET_MODE_EN | (2 << I2C_CNFG_DEBOUNCE_CNT_SHIFT));
++	write_reg(device, I2C_SL_CNFG, I2C_SL_NEWSL);
++	write_reg(device, I2C_SL_DELAY_COUNT, 0x1e);
++	write_reg(device, I2C_SL_ADDR1, device->slaveAddress >> 1);
++	write_reg(device, I2C_SL_ADDR2, 0);
++}
++
++
+ /*!	Clocks the controller, routes its pins and sets the request line up. The
+ 	firmware does not use the EC, so nothing of this can be taken for granted.
+ */
+@@ -430,16 +444,45 @@ setup_hardware(nvec_device* device)
+ 	TRACE_ALWAYS("GPIO PJ7 (wakeup) %s at start\n",
+ 		device->wakeupGPIOLevel != 0 ? "high" : "low");
+ 
+-	write_reg(device, I2C_CNFG, I2C_CNFG_NEW_MASTER_SFM
+-		| I2C_CNFG_PACKET_MODE_EN | (2 << I2C_CNFG_DEBOUNCE_CNT_SHIFT));
+-	write_reg(device, I2C_SL_CNFG, I2C_SL_NEWSL);
+-	write_reg(device, I2C_SL_DELAY_COUNT, 0x1e);
+-	write_reg(device, I2C_SL_ADDR1, device->slaveAddress >> 1);
+-	write_reg(device, I2C_SL_ADDR2, 0);
++	setup_slave(device);
+ 	return B_OK;
+ }
+ 
+ 
++/*!	The EC has been seen to stop talking in the middle of a message it sent
++	(state 4, no interrupt pending), keyboard and touchpad included. Starts
++	the controller over, as at boot, so that the EC finds an idle bus again.
++*/
++static void
++restart_controller(nvec_device* device)
++{
++	area_id area;
++	volatile uint8* car;
++	if (map_registers("tegra car", TEGRA20_CAR_BASE, &area, &car) != B_OK)
++		return;
++
++	uint32 bank = TEGRA20_CLK_I2C3 / 32;
++	uint32 bit = 1U << (TEGRA20_CLK_I2C3 % 32);
++	volatile uint32* reset = (volatile uint32*)(car
++		+ TEGRA_CAR_RST_DEVICES(bank));
++
++	InterruptsSpinLocker locker(device->lock);
++	TRACE_ALWAYS("the EC does not answer (state %" B_PRId32 ", status %#"
++		B_PRIx32 "), restarting the controller\n", device->state,
++		read_reg(device, I2C_SL_STATUS));
++	*reset |= bit;
++	spin(2);
++	*reset &= ~bit;
++	setup_slave(device);
++	device->state = 0;
++	device->rx = NULL;
++	device->restarts++;
++	locker.Unlock();
++
++	delete_area(area);
++}
++
++
+ //	#pragma mark - transport
+ 
+ 
+@@ -695,6 +738,13 @@ tx_thread(void* data)
+ 			status_t status = acquire_sem_etc(device->transferSem, 1,
+ 				B_RELATIVE_TIMEOUT, 5000000);
+ 
++			if (status == B_OK)
++				device->timeouts = 0;
++			else if (++device->timeouts >= 2) {
++				restart_controller(device);
++				device->timeouts = 0;
++			}
++
+ 			InterruptsSpinLocker locker(device->lock);
+ 			if (status == B_OK || ++tries >= 3) {
+ 				if (status != B_OK) {
+@@ -1122,11 +1172,13 @@ poll_thread(void* data)
+ 			TRACE_ALWAYS("%" B_PRIu32 " interrupts, %" B_PRIu32 " messages (%"
+ 				B_PRIu32 " events: %" B_PRIu32 " keys, %" B_PRIu32 " touchpad "
+ 				"bytes, %" B_PRIu32 " touchpad resets), %" B_PRIu32 " protocol "
+-				"errors, %" B_PRIu32 " lost interrupts, state %" B_PRId32 ", status %#"
++				"errors, %" B_PRIu32 " lost interrupts, %" B_PRIu32
++				" restarts, state %" B_PRId32 ", status %#"
+ 				B_PRIx32 "\n",
+ 				device->interrupts, device->messages, device->events,
+ 				device->keyEvents, device->mouseBytes, device->touchpadResets,
+-				device->protocolErrors, device->lostInterrupts, device->state,
++				device->protocolErrors, device->lostInterrupts, device->restarts,
++				device->state,
+ 				read_reg(device, I2C_SL_STATUS));
+ 
+ 			// bring-up aid: is the second CPU still taking interrupts?

@@ -1,7 +1,7 @@
-From 940de5a2b57c00091406f80ad909f1583fd6418c Mon Sep 17 00:00:00 2001
+From e4bed7f42d6564579f34e85b95e5d112e9feb0da Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Thu, 22 Oct 2026 07:30:36 +0200
-Subject: [PATCH 179/203] build: libpng from an external directory; PNG
+Subject: [PATCH 179/270] build: libpng from an external directory; PNG
  translator in the ARM image
 
 Like FFmpeg, HAIKU_EXTERNAL_LIBPNG_DIR points to a libpng extracted from
@@ -33,11 +33,11 @@ index 2327c944ba..7fc77e1d02 100644
  		file: base libpng16
  			runtime: lib
 diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
-index 0a08b2f9dc..1f3c5e5a54 100644
+index 120492d15b..ed4d76bd16 100644
 --- a/build/jam/images/definitions/minimum
 +++ b/build/jam/images/definitions/minimum
-@@ -476,8 +476,9 @@ for repository in $(HAIKU_REPOSITORIES) {
- 
+@@ -488,8 +488,9 @@ if $(HAIKU_IS_BOOTSTRAP) != 1 {
+ }
  
  # The Toshiba AC100 (ARM) gets the applications of the regular image that can
 -# be built for it: nothing needing OpenGL or ffmpeg, and the image translators
@@ -48,7 +48,7 @@ index 0a08b2f9dc..1f3c5e5a54 100644
  if arm in $(HAIKU_PACKAGING_ARCHS) {
  	SYSTEM_BIN += [ FFilterByBuildFeatures
  		cddb_lookup
-@@ -572,6 +573,7 @@ if arm in $(HAIKU_PACKAGING_ARCHS) {
+@@ -584,6 +585,7 @@ if arm in $(HAIKU_PACKAGING_ARCHS) {
  		HVIFTranslator
  		ICOTranslator
  		PCXTranslator

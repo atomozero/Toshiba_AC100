@@ -1,7 +1,7 @@
-From 05c44a494562605943df6cff343cc0a268c077c9 Mon Sep 17 00:00:00 2001
+From 73f80e42e774442ec22e7c58801646523d84d5cc Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 12:33:53 +0200
-Subject: [PATCH 007/203] libroot/arm: implement fenv on top of the VFP FPSCR
+Subject: [PATCH 007/270] libroot/arm: implement fenv on top of the VFP FPSCR
 
 The ARM fenv.h came from the FPA era: __rfs()/__wfs() were empty unless
 ARM_HARD_FLOAT was defined (it never is), leaving the variables they

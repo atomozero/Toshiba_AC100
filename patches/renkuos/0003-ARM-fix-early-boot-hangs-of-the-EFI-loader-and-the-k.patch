@@ -1,7 +1,7 @@
-From c971f7b6e355f0f4110347f954b04eda20893340 Mon Sep 17 00:00:00 2001
+From 89175d07ea85843d3f9ef5f059c391a05294b2a1 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 11:08:33 +0200
-Subject: [PATCH 003/203] ARM: fix early boot hangs of the EFI loader and the
+Subject: [PATCH 003/270] ARM: fix early boot hangs of the EFI loader and the
  kernel
 
 - efi/arm: do not switch gUART to the kernel's virtual UART address. The

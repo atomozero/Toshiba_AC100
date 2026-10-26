@@ -1,7 +1,7 @@
-From b6379b183c489139f369b4cbaa2e1534cf1a04e6 Mon Sep 17 00:00:00 2001
+From ada163e5f83755ac1373b4b3106436c3c027ae3a Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 16:24:59 +0200
-Subject: [PATCH 100/203] nvec: handle the power button and variable size key
+Subject: [PATCH 100/270] nvec: handle the power button and variable size key
  events
 
 The EC reports the power button as a variable size keyboard event

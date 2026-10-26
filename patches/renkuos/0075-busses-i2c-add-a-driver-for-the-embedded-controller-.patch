@@ -1,7 +1,7 @@
-From 2a8b3d5d5024c048ac1ee999cb876c54b0b1bb63 Mon Sep 17 00:00:00 2001
+From 1a0ea9d2ab963b183610351269ef8d103139ddd4 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 10:37:37 +0200
-Subject: [PATCH 075/203] busses/i2c: add a driver for the embedded controller
+Subject: [PATCH 075/270] busses/i2c: add a driver for the embedded controller
  of the Toshiba AC100
 
 The EC ("nvidia,nvec") is the I2C master and talks to a Tegra 2 I2C
@@ -23,7 +23,7 @@ only looked for there at boot.
  create mode 100644 src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
 
 diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
-index 5de3de80e2..5af32d1f88 100644
+index 3738e66c10..4cd5c854cc 100644
 --- a/build/jam/packages/Haiku
 +++ b/build/jam/packages/Haiku
 @@ -37,6 +37,7 @@ AddFilesToPackage add-ons kernel busses ata :

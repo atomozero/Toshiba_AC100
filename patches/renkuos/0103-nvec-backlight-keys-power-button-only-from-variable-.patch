@@ -1,7 +1,7 @@
-From 886ebb523229185d76537fb68856e69ff83c85aa Mon Sep 17 00:00:00 2001
+From 8f6e71094f6246aa702e6c446e5af0e11c9cba72 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 16:38:33 +0200
-Subject: [PATCH 103/203] nvec: backlight keys, power button only from variable
+Subject: [PATCH 103/270] nvec: backlight keys, power button only from variable
  size events
 
 The backlight up and down keys (e0 39, e0 3a, unmapped in Linux' table)

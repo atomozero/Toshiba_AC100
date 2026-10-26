@@ -1,7 +1,7 @@
-From 46cc71639d87b6969cef20c9f96810207df9d9be Mon Sep 17 00:00:00 2001
+From 8349ebc4546e35ffcd9337aa05e38416602c2855 Mon Sep 17 00:00:00 2001
 From: PulkoMandy <pulkomandy@pulkomandy.tk>
 Date: Fri, 16 Oct 2026 22:11:58 +0200
-Subject: [PATCH 164/203] freebsd_network: use generic bus.h and cpufunc.h for
+Subject: [PATCH 164/270] freebsd_network: use generic bus.h and cpufunc.h for
  all non-x86 architectures
 
 If it works for RISC-V and ARM64, it should work for everyone else?

@@ -1,7 +1,7 @@
-From 31bb95de04384ec02e9d4172726281556d7f1b56 Mon Sep 17 00:00:00 2001
+From ef09901bb770a4156f2b0e555fbca377f4121285 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Fri, 23 Oct 2026 21:50:41 +0200
-Subject: [PATCH 187/203] ehci: bring up Tegra 2 controllers with an external
+Subject: [PATCH 187/270] ehci: bring up Tegra 2 controllers with an external
  ULPI PHY
 
 The USB2 controller of a Tegra 2 talks to an external PHY over ULPI (on the

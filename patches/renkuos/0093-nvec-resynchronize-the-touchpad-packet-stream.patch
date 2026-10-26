@@ -1,7 +1,7 @@
-From dd855566423463d3e605036917b711c8eba64565 Mon Sep 17 00:00:00 2001
+From 66821a3dc94d8f657608d447be3da2e74c19c003 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 14:29:35 +0200
-Subject: [PATCH 093/203] nvec: resynchronize the touchpad packet stream
+Subject: [PATCH 093/270] nvec: resynchronize the touchpad packet stream
 
 ---
  src/add-ons/kernel/busses/i2c/nvec/nvec.cpp | 6 ++++--

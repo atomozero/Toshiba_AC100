@@ -1,7 +1,7 @@
-From 51a986f432d6cbf6454b12405030bae453a5e54e Mon Sep 17 00:00:00 2001
+From 6b3851151c0f3fe7cadff9c2ef01a1514f73acca Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 22:32:20 +0200
-Subject: [PATCH 050/203] ARM bring-up: quieter MMC log, log SIGILL (not for
+Subject: [PATCH 050/270] ARM bring-up: quieter MMC log, log SIGILL (not for
  merging)
 
 ---

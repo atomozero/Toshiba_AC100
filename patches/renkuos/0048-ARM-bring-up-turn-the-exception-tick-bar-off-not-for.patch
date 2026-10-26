@@ -1,7 +1,7 @@
-From 2a68190605750d0b86231621c2482f3b29dbd7c6 Mon Sep 17 00:00:00 2001
+From 7499ece97a916e0d1f4c3c42cad8c0ac54728b06 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 22:11:33 +0200
-Subject: [PATCH 048/203] ARM bring-up: turn the exception tick bar off (not
+Subject: [PATCH 048/270] ARM bring-up: turn the exception tick bar off (not
  for merging)
 
 ---

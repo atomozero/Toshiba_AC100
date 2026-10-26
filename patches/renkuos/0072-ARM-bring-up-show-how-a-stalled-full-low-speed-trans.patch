@@ -1,7 +1,7 @@
-From a9a6ebbb9a0f33c2924a88f27a54d27a66579318 Mon Sep 17 00:00:00 2001
+From b37d85478177a74b4c099c701005b5e9f071bbf3 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 09:43:43 +0200
-Subject: [PATCH 072/203] ARM bring-up: show how a stalled full/low speed
+Subject: [PATCH 072/270] ARM bring-up: show how a stalled full/low speed
  transfer was routed (not for merging)
 
 ---

@@ -1,7 +1,7 @@
-From 433bf9fccdfd4a7b3a6cff28c32c57bcf3de8bdf Mon Sep 17 00:00:00 2001
+From f6366956614b7dd9b6f018a4c86f6f9db3008bbb Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Fri, 23 Oct 2026 22:41:30 +0200
-Subject: [PATCH 190/203] ehci: move the system clock to PLLP_OUT3 before
+Subject: [PATCH 190/270] ehci: move the system clock to PLLP_OUT3 before
  PLLP_OUT4 becomes the ULPI clock
 
 ---

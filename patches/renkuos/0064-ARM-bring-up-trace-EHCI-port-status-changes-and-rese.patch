@@ -1,7 +1,7 @@
-From 7d2c722e2f372cd8cd0479d519c25725e67201a2 Mon Sep 17 00:00:00 2001
+From 4dcf46996585210f9b39b61bb6b4858ac106a24b Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 23:41:39 +0200
-Subject: [PATCH 064/203] ARM bring-up: trace EHCI port status changes and
+Subject: [PATCH 064/270] ARM bring-up: trace EHCI port status changes and
  resets (not for merging)
 
 ---

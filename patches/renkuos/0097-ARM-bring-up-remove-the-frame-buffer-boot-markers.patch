@@ -1,7 +1,7 @@
-From affc3ef33bae29869c189d069f416168e0c806a3 Mon Sep 17 00:00:00 2001
+From d5a2ead01f945e4c52fa81b5d75f2055c08b2d6a Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 15:28:15 +0200
-Subject: [PATCH 097/203] ARM bring-up: remove the frame buffer boot markers
+Subject: [PATCH 097/270] ARM bring-up: remove the frame buffer boot markers
 
 Drop the boot stage markers, the hex values, the exception tick bar, the
 on-screen panic message and the loader output on the EFI console, which

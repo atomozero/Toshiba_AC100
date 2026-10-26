@@ -1,7 +1,7 @@
-From 56f2e9725e0dc97ecf9b38bfc2cef0cd87206cbc Mon Sep 17 00:00:00 2001
+From dc9a2130facae5f781ad10d125d0b5503bec0869 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 21:55:46 +0200
-Subject: [PATCH 047/203] kernel/arm: make newly executable pages coherent with
+Subject: [PATCH 047/270] kernel/arm: make newly executable pages coherent with
  the instruction cache
 
 arch_cpu_sync_icache() only invalidated the instruction cache, without

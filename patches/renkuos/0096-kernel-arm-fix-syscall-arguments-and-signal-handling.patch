@@ -1,7 +1,7 @@
-From b3f4dc1ef41182a9204b492b40f8643b9354012b Mon Sep 17 00:00:00 2001
+From 893afe6e8784d1a40d596910b980c206b319a61a Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 15:20:49 +0200
-Subject: [PATCH 096/203] kernel/arm: fix syscall arguments and signal handling
+Subject: [PATCH 096/270] kernel/arm: fix syscall arguments and signal handling
  on return to userland
 
 - Copy the syscall arguments past the fourth from the user stack with

@@ -1,7 +1,7 @@
-From d2f2a1d43a51c8965b3c677a7f391d6880d235ea Mon Sep 17 00:00:00 2001
+From 99be16b0b3a20f26b2420e7362ffc49161314768 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Tue, 20 Oct 2026 19:16:45 +0200
-Subject: [PATCH 170/203] ARM bring-up: tegra_audio: FIFO, reset and loopback
+Subject: [PATCH 170/270] ARM bring-up: tegra_audio: FIFO, reset and loopback
  tests on both I2S controllers (not for merging)
 
 ---

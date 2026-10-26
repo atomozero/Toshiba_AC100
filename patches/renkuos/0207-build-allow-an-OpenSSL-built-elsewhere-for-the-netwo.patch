@@ -1,0 +1,42 @@
+From 86c554bb1766ca25a93aa280b713d3f6ec45a71a Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 24 Oct 2026 18:04:33 +0200
+Subject: [PATCH 207/270] build: allow an OpenSSL built elsewhere for the
+ network kit
+
+Like HAIKU_EXTERNAL_FFMPEG_DIR and HAIKU_EXTERNAL_LIBPNG_DIR: when the
+repositories have no openssl3_devel for the target (Haiku ARM built for
+VFPv3-D16 uses its own packages), HAIKU_EXTERNAL_OPENSSL_DIR points to an
+extracted OpenSSL package and enables the openssl build feature, so that
+libbnetapi gets BSecureSocket and HTTPS works. Without it every HTTPS
+request of the network services kit failed on the AC100 (Weather showed
+no data). The image must contain the package providing libssl.so.3.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ build/jam/BuildFeatures | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/build/jam/BuildFeatures b/build/jam/BuildFeatures
+index 7fc77e1d02..6e178a59f1 100644
+--- a/build/jam/BuildFeatures
++++ b/build/jam/BuildFeatures
+@@ -19,7 +19,17 @@ if [ IsHaikuImagePackageAdded openssl3 ] {
+ 	HAIKU_BUILD_FEATURE_SSL = 1 ;
+ }
+ 
+-if $(HAIKU_BUILD_FEATURE_SSL) {
++if $(HAIKU_EXTERNAL_OPENSSL_DIR) && ! [ IsPackageAvailable openssl3_devel ] {
++	# An OpenSSL built elsewhere for the target (extracted package), when the
++	# repositories have none for it: the network kit gets HTTPS support, the
++	# image must then contain the package that provides libssl.so.3.
++	SetBuildFeatureAttribute openssl : headers
++		: [ FDirName $(HAIKU_EXTERNAL_OPENSSL_DIR) develop headers ] ;
++	SetBuildFeatureAttribute openssl : libraries
++		: [ FDirName $(HAIKU_EXTERNAL_OPENSSL_DIR) develop lib libcrypto.so ]
++		  [ FDirName $(HAIKU_EXTERNAL_OPENSSL_DIR) develop lib libssl.so ] ;
++	EnableBuildFeatures openssl ;
++} else if $(HAIKU_BUILD_FEATURE_SSL) {
+ 	if [ IsPackageAvailable openssl3_devel ] {
+ 		ExtractBuildFeatureArchives openssl :
+ 			file: base openssl3

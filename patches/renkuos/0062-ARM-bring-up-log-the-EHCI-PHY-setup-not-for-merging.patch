@@ -1,7 +1,7 @@
-From 31877d3c9c8173c590c0e940c0a1669db7fc7c57 Mon Sep 17 00:00:00 2001
+From 1abc568c7ad2bc003895904c68bb7c982bbaf675 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 23:28:11 +0200
-Subject: [PATCH 062/203] ARM bring-up: log the EHCI PHY setup (not for
+Subject: [PATCH 062/270] ARM bring-up: log the EHCI PHY setup (not for
  merging)
 
 ---

@@ -1,7 +1,7 @@
-From c5cd20ee2791eaa4884135e9c4125017805f7f31 Mon Sep 17 00:00:00 2001
+From 3352badeb734de44a9878da528b49611e098a988 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 13:00:49 +0200
-Subject: [PATCH 084/203] ARM bring-up: log the area of an unhandled user fault
+Subject: [PATCH 084/270] ARM bring-up: log the area of an unhandled user fault
  and the frame buffer mapping (not for merging)
 
 ---

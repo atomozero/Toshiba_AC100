@@ -1,7 +1,7 @@
-From a57f214e8c5bb080d16843bddb4d295610565c58 Mon Sep 17 00:00:00 2001
+From 6a0d6d73715cb8182f612bead7801316a3409094 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 18:01:40 +0200
-Subject: [PATCH 028/203] ARM bring-up: compare MMU translations with the page
+Subject: [PATCH 028/270] ARM bring-up: compare MMU translations with the page
  tables in InitSlab (not for merging)
 
 ---

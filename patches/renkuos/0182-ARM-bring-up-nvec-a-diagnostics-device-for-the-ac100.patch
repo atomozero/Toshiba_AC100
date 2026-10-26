@@ -1,7 +1,7 @@
-From d5c24659c1e9c5622746c69b612ee25e00f0d91e Mon Sep 17 00:00:00 2001
+From 40e000ba36943bff62f6f3f7cc80015b03743c5d Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Fri, 23 Oct 2026 17:13:15 +0200
-Subject: [PATCH 182/203] ARM bring-up: nvec: a diagnostics device for the
+Subject: [PATCH 182/270] ARM bring-up: nvec: a diagnostics device for the
  ac100ec tool (not for merging)
 
 /dev/misc/nvec_diag sends one request to the EC and returns the reply

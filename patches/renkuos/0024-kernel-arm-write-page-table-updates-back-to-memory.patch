@@ -1,7 +1,7 @@
-From d68cf7c317fa75bfe371b4c8fd489b355aa490a2 Mon Sep 17 00:00:00 2001
+From 30a352ff34668b7f5f662a3a0a36d0b35c142899 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 17:14:55 +0200
-Subject: [PATCH 024/203] kernel/arm: write page table updates back to memory
+Subject: [PATCH 024/270] kernel/arm: write page table updates back to memory
 
 The translation table walker does not necessarily look into the L1 data
 cache. On a Cortex-A9 that does not take part in SMP coherency it reads

@@ -1,7 +1,7 @@
-From 1178380dbfc8bfcab020dd93363ad1d8745f8fb2 Mon Sep 17 00:00:00 2001
+From b89bce03564434fc4a797743de061fa23b4dee0d Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 15:56:46 +0200
-Subject: [PATCH 015/203] ARM bring-up: markers for panic() and early page
+Subject: [PATCH 015/270] ARM bring-up: markers for panic() and early page
  faults (not for merging)
 
 ---

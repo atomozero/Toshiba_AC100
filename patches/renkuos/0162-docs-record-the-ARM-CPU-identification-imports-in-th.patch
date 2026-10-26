@@ -1,7 +1,7 @@
-From d5e502a7e2a19b8d4cf5eb56888dd5fba9221930 Mon Sep 17 00:00:00 2001
+From 0754a4634fbe7a0f82e5fcc38061e5fbba616592 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Tue, 20 Oct 2026 07:39:32 +0200
-Subject: [PATCH 162/203] docs: record the ARM CPU identification imports in
+Subject: [PATCH 162/270] docs: record the ARM CPU identification imports in
  the ledger
 
 ---

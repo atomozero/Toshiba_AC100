@@ -1,7 +1,7 @@
-From 8c981cd922a268a3a2965ccb3e8be16f3d38b754 Mon Sep 17 00:00:00 2001
+From ef42a3d24e4c74c2354639d1477d51326613e985 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 13:40:19 +0200
-Subject: [PATCH 009/203] efi: translate device tree addresses through all
+Subject: [PATCH 009/270] efi: translate device tree addresses through all
  parent buses
 
 dtb_get_reg() only applied the 'ranges' of the direct parent and mixed

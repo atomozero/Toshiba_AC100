@@ -1,7 +1,7 @@
-From 9c5e15619aa9c2239c81b74735e3b0631527b748 Mon Sep 17 00:00:00 2001
+From 018794ab822a9b51e4cf38ddc288361f7d8cae6e Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 16:29:18 +0200
-Subject: [PATCH 102/203] efi/arm: switch the radios of rfkill-gpio nodes on
+Subject: [PATCH 102/270] efi/arm: switch the radios of rfkill-gpio nodes on
 
 The wireless module of the Toshiba AC100 is held in reset and powered down
 by two GPIOs until they are driven active, as Linux' rfkill-gpio does when

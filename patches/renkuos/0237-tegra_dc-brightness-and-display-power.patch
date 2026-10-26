@@ -1,0 +1,394 @@
+From 5e59f17f8adb7699feee17a35da683f3492fba3a Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 25 Oct 2026 22:06:18 +0100
+Subject: [PATCH 237/270] tegra_dc: brightness and display power
+
+The brightness of the Screen preferences sets the duty cycle of the PWM
+driving the panel backlight (1 to 256), and the DPMS modes switch the
+backlight off and back on as it was. Both only when the firmware left the
+PWM running; the brightness keys of the embedded controller keep working
+alongside.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../private/graphics/tegra_dc/tegra_dc_info.h |   9 ++
+ src/add-ons/accelerants/tegra_dc/Jamfile      |   1 +
+ .../accelerants/tegra_dc/accelerant_protos.h  |   7 +
+ src/add-ons/accelerants/tegra_dc/hooks.cpp    |  12 ++
+ src/add-ons/accelerants/tegra_dc/mode.cpp     |   2 +
+ src/add-ons/accelerants/tegra_dc/power.cpp    |  81 +++++++++++
+ .../drivers/graphics/tegra_dc/tegra_dc.cpp    | 128 ++++++++++++++++++
+ 7 files changed, 240 insertions(+)
+ create mode 100644 src/add-ons/accelerants/tegra_dc/power.cpp
+
+diff --git a/headers/private/graphics/tegra_dc/tegra_dc_info.h b/headers/private/graphics/tegra_dc/tegra_dc_info.h
+index 5aacc49b3a..e69d1a15e0 100644
+--- a/headers/private/graphics/tegra_dc/tegra_dc_info.h
++++ b/headers/private/graphics/tegra_dc/tegra_dc_info.h
+@@ -32,6 +32,9 @@ struct tegra_dc_shared_info {
+ 	sem_id			vblank_sem;
+ 	uint32			vblank_count;		// vertical blank interrupts so far
+ 
++	bool			has_backlight;		// the backlight PWM runs
++	uint32			dpms_mode;			// B_DPMS_*
++
+ 	edid1_info		edid_info;
+ 	bool			has_edid;
+ };
+@@ -46,6 +49,12 @@ enum {
+ 		// area_info of a clone of the scanout memory in the caller
+ 	TEGRA_DC_SET_DISPLAY_MODE,
+ 		// display_mode
++	TEGRA_DC_GET_BRIGHTNESS,
++		// uint32, backlight duty cycle 0 - 256
++	TEGRA_DC_SET_BRIGHTNESS,
++		// uint32, backlight duty cycle 1 - 256
++	TEGRA_DC_SET_DPMS_MODE,
++		// uint32, B_DPMS_*
+ };
+ 
+ 
+diff --git a/src/add-ons/accelerants/tegra_dc/Jamfile b/src/add-ons/accelerants/tegra_dc/Jamfile
+index 2c3b3676e8..e85cb7a31d 100644
+--- a/src/add-ons/accelerants/tegra_dc/Jamfile
++++ b/src/add-ons/accelerants/tegra_dc/Jamfile
+@@ -9,5 +9,6 @@ Addon tegra_dc.accelerant :
+ 	accelerant.cpp
+ 	hooks.cpp
+ 	mode.cpp
++	power.cpp
+ 	: libaccelerantscommon.a
+ ;
+diff --git a/src/add-ons/accelerants/tegra_dc/accelerant_protos.h b/src/add-ons/accelerants/tegra_dc/accelerant_protos.h
+index 14bd171c90..2e5f8db9f5 100644
+--- a/src/add-ons/accelerants/tegra_dc/accelerant_protos.h
++++ b/src/add-ons/accelerants/tegra_dc/accelerant_protos.h
+@@ -35,6 +35,13 @@ status_t tegra_dc_get_frame_buffer_config(frame_buffer_config* config);
+ status_t tegra_dc_get_pixel_clock_limits(display_mode* mode, uint32* _low,
+ 	uint32* _high);
+ 
++// brightness and display power
++status_t tegra_dc_set_brightness(float brightness);
++status_t tegra_dc_get_brightness(float* brightness);
++uint32 tegra_dc_dpms_capabilities(void);
++uint32 tegra_dc_dpms_mode(void);
++status_t tegra_dc_set_dpms_mode(uint32 mode);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/add-ons/accelerants/tegra_dc/hooks.cpp b/src/add-ons/accelerants/tegra_dc/hooks.cpp
+index 60caafa6a2..0a6d7e7c59 100644
+--- a/src/add-ons/accelerants/tegra_dc/hooks.cpp
++++ b/src/add-ons/accelerants/tegra_dc/hooks.cpp
+@@ -46,6 +46,18 @@ get_accelerant_hook(uint32 feature, void* data)
+ 			return (void*)tegra_dc_get_frame_buffer_config;
+ 		case B_GET_PIXEL_CLOCK_LIMITS:
+ 			return (void*)tegra_dc_get_pixel_clock_limits;
++
++		// brightness and display power
++		case B_SET_BRIGHTNESS:
++			return (void*)tegra_dc_set_brightness;
++		case B_GET_BRIGHTNESS:
++			return (void*)tegra_dc_get_brightness;
++		case B_DPMS_CAPABILITIES:
++			return (void*)tegra_dc_dpms_capabilities;
++		case B_DPMS_MODE:
++			return (void*)tegra_dc_dpms_mode;
++		case B_SET_DPMS_MODE:
++			return (void*)tegra_dc_set_dpms_mode;
+ 	}
+ 
+ 	return NULL;
+diff --git a/src/add-ons/accelerants/tegra_dc/mode.cpp b/src/add-ons/accelerants/tegra_dc/mode.cpp
+index 3203eda5c2..5519e3669e 100644
+--- a/src/add-ons/accelerants/tegra_dc/mode.cpp
++++ b/src/add-ons/accelerants/tegra_dc/mode.cpp
+@@ -40,6 +40,8 @@ panel_mode(display_mode& mode, color_space space)
+ 	mode.virtual_width = mode.timing.h_display;
+ 	mode.virtual_height = mode.timing.v_display;
+ 	mode.flags = B_8_BIT_DAC | B_PARALLEL_ACCESS;
++	if (gInfo->shared_info->has_backlight)
++		mode.flags |= B_DPMS;
+ }
+ 
+ 
+diff --git a/src/add-ons/accelerants/tegra_dc/power.cpp b/src/add-ons/accelerants/tegra_dc/power.cpp
+new file mode 100644
+index 0000000000..282cde3523
+--- /dev/null
++++ b/src/add-ons/accelerants/tegra_dc/power.cpp
+@@ -0,0 +1,81 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++/*!	Brightness and display power: the panel backlight, through the kernel
++	driver.
++*/
++
++
++#include "accelerant.h"
++#include "accelerant_protos.h"
++
++#include <errno.h>
++#include <unistd.h>
++
++
++status_t
++tegra_dc_set_brightness(float brightness)
++{
++	if (!gInfo->shared_info->has_backlight)
++		return B_NOT_SUPPORTED;
++
++	// 1 - 256: never fully off, that is what DPMS is for
++	if (brightness < 0)
++		brightness = 0;
++	if (brightness > 1)
++		brightness = 1;
++	uint32 duty = (uint32)(brightness * 255 + 0.5f) + 1;
++	if (ioctl(gInfo->device, TEGRA_DC_SET_BRIGHTNESS, &duty, sizeof(duty))
++			!= 0) {
++		return errno;
++	}
++	return B_OK;
++}
++
++
++status_t
++tegra_dc_get_brightness(float* brightness)
++{
++	if (!gInfo->shared_info->has_backlight)
++		return B_NOT_SUPPORTED;
++
++	uint32 duty;
++	if (ioctl(gInfo->device, TEGRA_DC_GET_BRIGHTNESS, &duty, sizeof(duty))
++			!= 0) {
++		return errno;
++	}
++	*brightness = duty <= 1 ? 0 : (duty - 1) / 255.0f;
++	return B_OK;
++}
++
++
++uint32
++tegra_dc_dpms_capabilities(void)
++{
++	if (!gInfo->shared_info->has_backlight)
++		return B_DPMS_ON;
++	return B_DPMS_ON | B_DPMS_STAND_BY | B_DPMS_SUSPEND | B_DPMS_OFF;
++}
++
++
++uint32
++tegra_dc_dpms_mode(void)
++{
++	return gInfo->shared_info->dpms_mode;
++}
++
++
++status_t
++tegra_dc_set_dpms_mode(uint32 mode)
++{
++	if (!gInfo->shared_info->has_backlight)
++		return mode == B_DPMS_ON ? B_OK : B_NOT_SUPPORTED;
++	if (ioctl(gInfo->device, TEGRA_DC_SET_DPMS_MODE, &mode, sizeof(mode))
++			!= 0) {
++		return errno;
++	}
++	return B_OK;
++}
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp b/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
+index 992f3ed5a0..b029073ed3 100644
+--- a/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
+@@ -54,6 +54,15 @@ extern void* gFDT;
+ #define CAR_RST_DEVICES_L			0x004
+ #define CAR_CLK_OUT_ENB_L			0x010
+ #define CAR_DISP1_BIT				(1u << 27)
++#define CAR_PWM_BIT					(1u << 17)
++
++// The panel backlight: channel 0 of the PWM controller. The embedded
++// controller driver (nvec) changes it too, for the brightness keys and the
++// lid; the register itself is the state both start from.
++#define TEGRA20_PWM_BASE			0x7000a000
++#define PWM_ENABLE					(1u << 31)
++#define PWM_DUTY_SHIFT				16
++#define PWM_DUTY_MASK				(0x1ffu << 16)	// 0 - 256
+ 
+ #define TEGRA20_DC_A_BASE			0x54200000
+ #define TEGRA20_DC_SIZE				0x10000
+@@ -120,6 +129,10 @@ struct tegra_dc_device {
+ 
+ 	area_id				shared_area;
+ 	tegra_dc_shared_info* shared_info;
++
++	area_id				pwm_area;
++	volatile uint32*	pwm;
++	uint32				saved_pwm;		// while the screen sleeps
+ };
+ 
+ 
+@@ -192,6 +205,8 @@ fill_mode(display_mode& mode, color_space space)
+ 	mode.virtual_width = PANEL_WIDTH;
+ 	mode.virtual_height = PANEL_HEIGHT;
+ 	mode.flags = B_8_BIT_DAC | B_PARALLEL_ACCESS;
++	if (sDevice.shared_info->has_backlight)
++		mode.flags |= B_DPMS;
+ }
+ 
+ 
+@@ -285,6 +300,79 @@ program_display_mode(const display_mode& mode)
+ }
+ 
+ 
++//	#pragma mark - backlight
++
++
++static bool
++pwm_running()
++{
++	area_id area;
++	volatile uint32* car = map_registers("tegra car", TEGRA20_CAR_BASE,
++		B_PAGE_SIZE, &area);
++	if (car == NULL)
++		return false;
++	bool running = (car[CAR_CLK_OUT_ENB_L / 4] & CAR_PWM_BIT) != 0
++		&& (car[CAR_RST_DEVICES_L / 4] & CAR_PWM_BIT) == 0;
++	delete_area(area);
++	return running;
++}
++
++
++static uint32
++backlight_duty()
++{
++	uint32 pwm = *sDevice.pwm;
++	if ((pwm & PWM_ENABLE) == 0)
++		return 0;
++	return (pwm & PWM_DUTY_MASK) >> PWM_DUTY_SHIFT;
++}
++
++
++static status_t
++set_backlight_duty(uint32 duty)
++{
++	if (duty < 1 || duty > 256)
++		return B_BAD_VALUE;
++	if (sDevice.shared_info->dpms_mode != B_DPMS_ON) {
++		// takes effect when the screen wakes up
++		sDevice.saved_pwm = (sDevice.saved_pwm & ~PWM_DUTY_MASK) | PWM_ENABLE
++			| (duty << PWM_DUTY_SHIFT);
++		return B_OK;
++	}
++	*sDevice.pwm = (*sDevice.pwm & ~PWM_DUTY_MASK) | PWM_ENABLE
++		| (duty << PWM_DUTY_SHIFT);
++	return B_OK;
++}
++
++
++/*!	The panel has no power saving modes of its own here: all of them switch
++	the backlight off, and on again as it was.
++*/
++static status_t
++set_screen_power(uint32 mode)
++{
++	uint32& current = sDevice.shared_info->dpms_mode;
++	if (mode != B_DPMS_ON && mode != B_DPMS_STAND_BY && mode != B_DPMS_SUSPEND
++		&& mode != B_DPMS_OFF) {
++		return B_BAD_VALUE;
++	}
++	if (mode == current)
++		return B_OK;
++
++	if (current == B_DPMS_ON) {
++		sDevice.saved_pwm = *sDevice.pwm;
++		*sDevice.pwm &= ~(PWM_DUTY_MASK | PWM_ENABLE);
++	} else if (mode == B_DPMS_ON)
++		*sDevice.pwm = sDevice.saved_pwm;
++
++	current = mode;
++	return B_OK;
++}
++
++
++//	#pragma mark - interrupts
++
++
+ static int32
+ vblank_interrupt(void* data)
+ {
+@@ -339,10 +427,13 @@ uninit_device()
+ 			NULL);
+ 		delete_sem(sDevice.shared_info->vblank_sem);
+ 	}
++	delete_area(sDevice.pwm_area);
+ 	delete_area(sDevice.shared_area);
+ 	delete_area(sDevice.scanout_area);
+ 	delete_area(sDevice.registers_area);
+ 	sDevice.shared_area = sDevice.scanout_area = sDevice.registers_area = -1;
++	sDevice.pwm_area = -1;
++	sDevice.pwm = NULL;
+ 	sDevice.shared_info = NULL;
+ 	sDevice.scanout = NULL;
+ 	sDevice.registers = NULL;
+@@ -386,6 +477,15 @@ init_device()
+ 	info.frame_buffer_size = SCANOUT_SIZE;
+ 	read_timing(info.timing);
+ 
++	// The backlight, if the firmware left its PWM running: accessing a device
++	// without its clock hangs the bus
++	info.dpms_mode = B_DPMS_ON;
++	if (pwm_running()) {
++		sDevice.pwm = map_registers("tegra_dc backlight", TEGRA20_PWM_BASE,
++			B_PAGE_SIZE, &sDevice.pwm_area);
++		info.has_backlight = sDevice.pwm != NULL;
++	}
++
+ 	// The mode the firmware left
+ 	bool depth32 = read_dc(WIN_COLOR_DEPTH) == COLOR_DEPTH_B8G8R8A8;
+ 	fill_mode(info.current_mode, depth32 ? B_RGB32 : B_RGB16);
+@@ -497,6 +597,33 @@ tegra_dc_ioctl(void* cookie, uint32 op, void* buffer, size_t length)
+ 			return _user_get_area_info(area, (area_info*)buffer);
+ 		}
+ 
++		case TEGRA_DC_GET_BRIGHTNESS:
++		{
++			if (sDevice.pwm == NULL)
++				return B_NOT_SUPPORTED;
++			uint32 duty = backlight_duty();
++			if (sDevice.shared_info->dpms_mode != B_DPMS_ON) {
++				duty = (sDevice.saved_pwm & PWM_DUTY_MASK) >> PWM_DUTY_SHIFT;
++			}
++			return user_memcpy(buffer, &duty, sizeof(uint32));
++		}
++
++		case TEGRA_DC_SET_BRIGHTNESS:
++		case TEGRA_DC_SET_DPMS_MODE:
++		{
++			if (sDevice.pwm == NULL)
++				return B_NOT_SUPPORTED;
++			uint32 value;
++			if (length < sizeof(uint32)
++				|| user_memcpy(&value, buffer, sizeof(uint32)) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			MutexLocker locker(sDevice.lock);
++			if (op == TEGRA_DC_SET_BRIGHTNESS)
++				return set_backlight_duty(value);
++			return set_screen_power(value);
++		}
++
+ 		case TEGRA_DC_SET_DISPLAY_MODE:
+ 		{
+ 			display_mode mode;
+@@ -594,6 +721,7 @@ init_driver(void)
+ {
+ 	memset(&sDevice, 0, sizeof(sDevice));
+ 	sDevice.registers_area = sDevice.scanout_area = sDevice.shared_area = -1;
++	sDevice.pwm_area = -1;
+ 	mutex_init(&sDevice.lock, "tegra_dc");
+ 	return B_OK;
+ }

@@ -1,7 +1,7 @@
-From 38ff19da312682c09d7d510a495cbb7ad1d25e1c Mon Sep 17 00:00:00 2001
+From d3fc904243911e9914c5914fa9be34ea149c3338 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 19:35:54 +0200
-Subject: [PATCH 039/203] kernel/arm: write all of the SPSR when restoring it
+Subject: [PATCH 039/270] kernel/arm: write all of the SPSR when restoring it
 
 "msr spsr, rN" only writes the control and flags fields of the SPSR
 (SPSR_fc), leaving bits 8-23 as they were. The exception entry and exit

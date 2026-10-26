@@ -1,7 +1,7 @@
-From 6a6857026542378ad50788803ce198d38031ce94 Mon Sep 17 00:00:00 2001
+From 3967e22b3ef95f5cf4a670fea269f6687a41a7f7 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 23:01:49 +0200
-Subject: [PATCH 056/203] kernel/device_manager: look for USB host controllers
+Subject: [PATCH 056/270] kernel/device_manager: look for USB host controllers
  on generic nodes
 
 USB host controllers that are not on a PCI bus, like the EHCI

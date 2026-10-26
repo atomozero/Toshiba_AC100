@@ -1,7 +1,7 @@
-From 80325cfd5c99b290da7853a4bf00d59bc2bacccf Mon Sep 17 00:00:00 2001
+From c276d69494ae1834ad691de5ab6e21da85f65628 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 24 Oct 2026 11:39:00 +0200
-Subject: [PATCH 202/203] libroot/arm: merge aligned words when the memcpy()
+Subject: [PATCH 202/270] libroot/arm: merge aligned words when the memcpy()
  source is misaligned
 
 With the destination aligned and the source not, memcpy() read the

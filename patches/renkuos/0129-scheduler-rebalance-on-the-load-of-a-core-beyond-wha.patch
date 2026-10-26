@@ -1,7 +1,7 @@
-From 244c5da812aef1e14f49092d95c69d90fac64200 Mon Sep 17 00:00:00 2001
+From 92df83215ebdf1e40f81ee505d2c06f6aebe03b3 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Mon, 19 Oct 2026 07:45:43 +0200
-Subject: [PATCH 129/203] scheduler: rebalance on the load of a core beyond
+Subject: [PATCH 129/270] scheduler: rebalance on the load of a core beyond
  what its CPUs can take
 
 rebalance() compared core loads capped at kMaxLoad. With one CPU per core a

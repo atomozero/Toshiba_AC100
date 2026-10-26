@@ -1,7 +1,7 @@
-From 3abd9c73e078e83c24f06cf89d7d44345518889e Mon Sep 17 00:00:00 2001
+From e4fd7bf1e5307caf1a730baf75d7be234479f49a Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 21:56:59 +0200
-Subject: [PATCH 118/203] ARM: faster memory: write-allocate caching, memcpy()
+Subject: [PATCH 118/270] ARM: faster memory: write-allocate caching, memcpy()
  and memset() in assembly
 
 Map normal memory write-back with write-allocate (NMRR type 3), as Linux

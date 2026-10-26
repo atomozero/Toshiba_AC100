@@ -1,0 +1,91 @@
+From 7f47c93e98393aa7b22bfc120c55f295656c5258 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 24 Oct 2026 20:11:20 +0200
+Subject: [PATCH 210/270] nvec: handle an interrupt that stays pending
+
+Once, right after a spurious interrupt of the GIC, the I2C slave kept an
+interrupt pending that never reached the handler, and the EC waited for
+it for good: no keyboard and no touchpad until the next boot. The poll
+thread now handles an interrupt that is still pending after two checks
+without the interrupt count moving, and logs it.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/add-ons/kernel/busses/i2c/nvec/nvec.cpp | 41 ++++++++++++++++++++-
+ 1 file changed, 39 insertions(+), 2 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+index 83e7074192..6744bee519 100644
+--- a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
++++ b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+@@ -196,6 +196,10 @@ struct nvec_device {
+ 	nvec_msg			txNoOp;
+ 	uint32				protocolErrors;
+ 	uint32				interrupts;		// bring-up statistics
++	uint32				lostInterrupts;
++	// check_lost_interrupt(): the interrupt count when it found one pending
++	uint32				pendingInterrupts;
++	int32				pendingChecks;
+ 	uint32				messages;
+ 	uint32				events;
+ 
+@@ -1047,6 +1051,37 @@ handle_battery_message(nvec_device* device, const nvec_msg* message)
+ }
+ 
+ 
++/*!	Seen once on the AC100: right after a spurious interrupt of the GIC the
++	slave controller kept an interrupt pending (status 0x8) that never reached
++	nvec_interrupt(), and the EC waited for us for good, keyboard and touchpad
++	included. An interrupt that stays pending while the counter does not move
++	for two checks (100 ms apart) is handled from here instead.
++*/
++static void
++check_lost_interrupt(nvec_device* device)
++{
++	if ((read_reg(device, I2C_SL_STATUS) & I2C_SL_IRQ) == 0) {
++		device->pendingChecks = 0;
++		return;
++	}
++	if (device->pendingChecks == 0
++		|| device->interrupts != device->pendingInterrupts) {
++		device->pendingChecks = 1;
++		device->pendingInterrupts = device->interrupts;
++		return;
++	}
++	if (++device->pendingChecks < 3)
++		return;
++
++	device->pendingChecks = 0;
++	if (device->lostInterrupts++ < 16) {
++		TRACE_ALWAYS("interrupt pending without being handled (state %"
++			B_PRId32 "), handling it here\n", device->state);
++	}
++	nvec_interrupt(device);
++}
++
++
+ /*!	Asks for the power supply and one battery value every 5 seconds, in turn:
+ 	all at once seems to overload the EC (as in Linux).
+ */
+@@ -1069,6 +1104,7 @@ poll_thread(void* data)
+ 
+ 		for (int32 i = 0; i < 50 && !device->stopping; i++) {
+ 			snooze(100000);
++			check_lost_interrupt(device);
+ 
+ 			// bring-up aid: Linux' device tree has a "Wakeup" key on GPIO
+ 			// PJ7 (79, active low); is it the power button?
+@@ -1086,10 +1122,11 @@ poll_thread(void* data)
+ 			TRACE_ALWAYS("%" B_PRIu32 " interrupts, %" B_PRIu32 " messages (%"
+ 				B_PRIu32 " events: %" B_PRIu32 " keys, %" B_PRIu32 " touchpad "
+ 				"bytes, %" B_PRIu32 " touchpad resets), %" B_PRIu32 " protocol "
+-				"errors, state %" B_PRId32 ", status %#" B_PRIx32 "\n",
++				"errors, %" B_PRIu32 " lost interrupts, state %" B_PRId32 ", status %#"
++				B_PRIx32 "\n",
+ 				device->interrupts, device->messages, device->events,
+ 				device->keyEvents, device->mouseBytes, device->touchpadResets,
+-				device->protocolErrors, device->state,
++				device->protocolErrors, device->lostInterrupts, device->state,
+ 				read_reg(device, I2C_SL_STATUS));
+ 
+ 			// bring-up aid: is the second CPU still taking interrupts?

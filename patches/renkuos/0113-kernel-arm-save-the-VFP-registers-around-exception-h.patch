@@ -1,7 +1,7 @@
-From 6b49df2ec9b86b08f4aebc5f9cb63f89d6311695 Mon Sep 17 00:00:00 2001
+From a55040e8f7a5eb99277d333d3488bc7528e647e1 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 20:49:48 +0200
-Subject: [PATCH 113/203] kernel/arm: save the VFP registers around exception
+Subject: [PATCH 113/270] kernel/arm: save the VFP registers around exception
  handlers
 
 The kernel uses the VFP registers too (the compiler does for 64 bit

@@ -1,7 +1,7 @@
-From d40776c951187fa6167c0cfeb769e66b0e818cfd Mon Sep 17 00:00:00 2001
+From ba1288d7be0fe7fc7aeff04c16c49965c5b81fe9 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 23:11:36 +0200
-Subject: [PATCH 058/203] ARM bring-up: trace EHCI construction, start and
+Subject: [PATCH 058/270] ARM bring-up: trace EHCI construction, start and
  interrupt rate (not for merging)
 
 ---

@@ -1,0 +1,67 @@
+From d7330dcf346af045570d18f2daa05d2060b74fca Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 24 Oct 2026 13:48:28 +0200
+Subject: [PATCH 204/270] kernel/arm: switch the AC100 off instead of resetting
+ it on reboot
+
+The reset through the PMC works, but the Tegra then starts the stock
+bootloader from the eMMC: U-Boot comes over USB (RCM) at every boot, so
+Haiku never comes back and the screen stays on "Restarting...". When the
+embedded controller can switch the machine off, do that instead; with
+"arm_reboot_resets true" in the kernel settings (U-Boot on the eMMC) the
+chip is reset as before.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/system/kernel/arch/arm/arch_cpu.cpp | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/system/kernel/arch/arm/arch_cpu.cpp b/src/system/kernel/arch/arm/arch_cpu.cpp
+index 9df0664e59..8cd3fe9adc 100644
+--- a/src/system/kernel/arch/arm/arch_cpu.cpp
++++ b/src/system/kernel/arch/arm/arch_cpu.cpp
+@@ -11,6 +11,7 @@
+ 
+ 
+ #include <KernelExport.h>
++#include <driver_settings.h>
+ 
+ #include <arch/cpu.h>
+ #include <cpu.h>
+@@ -102,6 +103,11 @@ arch_cpu_init(kernel_args *args)
+ #define TEGRA_PMC_CNTRL_MAIN_RST	(1 << 4)
+ 
+ static volatile uint32* sTegraPMC;
++// After a chip reset the Toshiba AC100 starts its stock bootloader from the
++// eMMC; Haiku only comes back if U-Boot is loaded again over USB (RCM). So a
++// reboot switches the machine off instead, unless "arm_reboot_resets true"
++// is in the kernel settings (for U-Boot installed on the eMMC).
++static bool sRebootResets = true;
+ 
+ // set by the driver that can switch the machine off, like the embedded
+ // controller of the Toshiba AC100
+@@ -118,6 +124,11 @@ arch_cpu_init_post_vm(kernel_args *args)
+ 
+ 	arm_l2_cache_init(args);
+ 
++	void* settings = load_driver_settings("kernel");
++	sRebootResets = get_driver_boolean_parameter(settings, "arm_reboot_resets",
++		false, true);
++	unload_driver_settings(settings);
++
+ 	if (args->arch_args.pmc.start != 0) {
+ 		void* address;
+ 		area_id area = map_physical_memory("tegra pmc",
+@@ -143,6 +154,12 @@ arch_cpu_init_post_modules(kernel_args *args)
+ status_t
+ arch_cpu_shutdown(bool reboot)
+ {
++	if (reboot && !sRebootResets && gArmPowerOffHook != NULL) {
++		dprintf("reboot: switching off instead (\"arm_reboot_resets true\" "
++			"resets the chip)\n");
++		reboot = false;
++	}
++
+ 	if (reboot && sTegraPMC != NULL) {
+ 		disable_interrupts();
+ 		sTegraPMC[TEGRA_PMC_CNTRL / 4] |= TEGRA_PMC_CNTRL_MAIN_RST;

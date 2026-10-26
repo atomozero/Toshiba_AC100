@@ -1,7 +1,7 @@
-From c15c5f94231abbc47aecadc8dc9d73798bc6fb85 Mon Sep 17 00:00:00 2001
+From a4143b4ebfb5915328940cb840be7618fb570dd7 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 15:43:29 +0200
-Subject: [PATCH 013/203] ARM bring-up: finer boot markers in vm_init and main
+Subject: [PATCH 013/270] ARM bring-up: finer boot markers in vm_init and main
  (not for merging)
 
 ---

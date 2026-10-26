@@ -1,7 +1,7 @@
-From e3de3e850de3838e7b3f3de9cef0fc76b446022c Mon Sep 17 00:00:00 2001
+From 83d8a8e486f4096a887f76097abaff3e36bf904f Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Tue, 20 Oct 2026 19:10:26 +0200
-Subject: [PATCH 168/203] usb: enable the bounded port retries on 32-bit ARM
+Subject: [PATCH 168/270] usb: enable the bounded port retries on 32-bit ARM
  too
 
 On the Toshiba AC100 (Tegra 2) the internal camera, behind the SMSC

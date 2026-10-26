@@ -1,7 +1,7 @@
-From 4deea11d9f656b8ebd1f9dc240d2014588f410b0 Mon Sep 17 00:00:00 2001
+From 3d08e66f4fb34ad113c306540c56499be4b90a55 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 20:49:48 +0200
-Subject: [PATCH 114/203] nvec: backlight keys and lid of the AC100
+Subject: [PATCH 114/270] nvec: backlight keys and lid of the AC100
 
 The backlight keys (Fn + the sun keys) come as F6 and F7 on the AC100:
 they change the backlight instead. The lid comes as a system event

@@ -1,7 +1,7 @@
-From c70fd3758ac2c0b3dc9d916b576644a76b7c8935 Mon Sep 17 00:00:00 2001
+From 9bc5e6d2bb0befdff02b93f56a3ed3804cc6f452 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Fri, 23 Oct 2026 20:47:29 +0200
-Subject: [PATCH 186/203] nvec: unmute the speakers at start, as Linux does
+Subject: [PATCH 186/270] nvec: unmute the speakers at start, as Linux does
 
 The EC keeps the TPA6017 speaker amplifier in shutdown (EC_MUTE#) until
 it receives the OEM request 0d 10 59 95. Headphones worked, the internal

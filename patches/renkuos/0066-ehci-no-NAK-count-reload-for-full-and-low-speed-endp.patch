@@ -1,7 +1,7 @@
-From 50fe2860e3cf7dcfddc103560f09ecabfb0b154f Mon Sep 17 00:00:00 2001
+From 0aa9633ea385be0f1f46970851a0d2b864f45e1a Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 00:04:50 +0200
-Subject: [PATCH 066/203] ehci: no NAK count reload for full and low speed
+Subject: [PATCH 066/270] ehci: no NAK count reload for full and low speed
  endpoints
 
 The NAK count reload field of a queue head must be zero for full and

@@ -1,7 +1,7 @@
-From 0decc8967560cb88ec8d26ed1789d0247a9f4136 Mon Sep 17 00:00:00 2001
+From 0190d58ccb75be18c4e16b5b9960a04230ecdd7a Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 22:53:48 +0200
-Subject: [PATCH 121/203] nvec: enable the touchpad again after it reset itself
+Subject: [PATCH 121/270] nvec: enable the touchpad again after it reset itself
 
 On the AC100 the touchpad stopped working after some heavy load: when it
 resets (or the EC resets it) it sends "aa 00" instead of a packet and

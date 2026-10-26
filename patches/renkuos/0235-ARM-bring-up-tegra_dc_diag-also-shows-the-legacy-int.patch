@@ -1,0 +1,57 @@
+From 95978a748cfc71a74c8c4e20ada18e3883876a13 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 25 Oct 2026 21:55:59 +0100
+Subject: [PATCH 235/270] ARM bring-up: tegra_dc_diag also shows the legacy
+ interrupt controllers and some GIC interrupts (not for merging)
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../misc/tegra_dc_diag/tegra_dc_diag.cpp      | 35 +++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+diff --git a/src/add-ons/kernel/drivers/misc/tegra_dc_diag/tegra_dc_diag.cpp b/src/add-ons/kernel/drivers/misc/tegra_dc_diag/tegra_dc_diag.cpp
+index 60b2bce262..3e3f390488 100644
+--- a/src/add-ons/kernel/drivers/misc/tegra_dc_diag/tegra_dc_diag.cpp
++++ b/src/add-ons/kernel/drivers/misc/tegra_dc_diag/tegra_dc_diag.cpp
+@@ -194,6 +194,41 @@ report_clocks(char* buffer, size_t size, size_t length, bool* _dcARunning,
+ 	*_dcBRunning = block_running(car, kBlocks[1]);
+ 	delete_area(area);
+ 
++	// Legacy interrupt controllers, in front of the GIC: CPU_IER at 0x20 of
++	// each of the four (32 interrupts each)
++	volatile uint32* ictlr = map_registers("tegra ictlr", 0x60004000,
++		B_PAGE_SIZE, &area);
++	if (ictlr != NULL) {
++		length = append(buffer, size, length, "ictlr CPU_IER:");
++		for (int i = 0; i < 4; i++) {
++			length = append(buffer, size, length, " %08" B_PRIx32,
++				ictlr[(i * 0x100 + 0x20) / 4]);
++		}
++		length = append(buffer, size, length, " (DC A = #2 bit 9)\n");
++		delete_area(area);
++	}
++
++	// GIC distributor (Cortex-A9 MPCore at 0x50040000): where some device
++	// interrupts go and in which state they are
++	volatile uint32* gicd = map_registers("tegra gicd", 0x50041000,
++		B_PAGE_SIZE, &area);
++	if (gicd != NULL) {
++		static const uint32 kIrqs[] = { 63, 71, 105, 124 };
++		const volatile uint8* targets = (const volatile uint8*)gicd + 0x800;
++		for (size_t i = 0; i < B_COUNT_OF(kIrqs); i++) {
++			uint32 irq = kIrqs[i];
++			uint32 bit = 1u << (irq % 32);
++			length = append(buffer, size, length, "gic irq %" B_PRIu32
++				": target %#x, enabled %d, pending %d, active %d,"
++				" priority %#x\n", irq, targets[irq],
++				(gicd[(0x100 / 4) + irq / 32] & bit) != 0,
++				(gicd[(0x200 / 4) + irq / 32] & bit) != 0,
++				(gicd[(0x300 / 4) + irq / 32] & bit) != 0,
++				((const volatile uint8*)gicd + 0x400)[irq]);
++		}
++		delete_area(area);
++	}
++
+ 	volatile uint32* pmc = map_registers("tegra pmc",
+ 		TEGRA20_PMC_BASE & ~(B_PAGE_SIZE - 1), B_PAGE_SIZE, &area);
+ 	if (pmc != NULL) {

@@ -1,7 +1,7 @@
-From 9b25f8a70bfe909ca88b465f5ae4168e49bc4832 Mon Sep 17 00:00:00 2001
+From 7e7260e94cc3846941e683be2b7888b53eade617 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 15:51:05 +0200
-Subject: [PATCH 014/203] ARM bring-up: loader output on the EFI console,
+Subject: [PATCH 014/270] ARM bring-up: loader output on the EFI console,
  failing addresses as markers (not for merging)
 
 ---

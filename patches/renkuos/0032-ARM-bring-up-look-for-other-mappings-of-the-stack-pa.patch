@@ -1,7 +1,7 @@
-From 5513588ad0cda020a84c153a3183bd6a65f8525c Mon Sep 17 00:00:00 2001
+From b0f6fd8aed99ce166974763d45e8e84d3f382d1f Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 18:29:12 +0200
-Subject: [PATCH 032/203] ARM bring-up: look for other mappings of the stack
+Subject: [PATCH 032/270] ARM bring-up: look for other mappings of the stack
  page on panic, show only the first fault (not for merging)
 
 ---

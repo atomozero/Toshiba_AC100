@@ -1,7 +1,7 @@
-From 8f12d988a3823949316fa016046b7f8eaa3dcad6 Mon Sep 17 00:00:00 2001
+From 50ff3f3fa56a47c669bc0bce9ab403beaa3e28ff Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?Przemys=C5=82aw=20Buczkowski?= <prem@prem.moe>
 Date: Thu, 17 Sep 2026 19:14:00 +0900
-Subject: [PATCH 163/203] freebsd_network: enable on arm64
+Subject: [PATCH 163/270] freebsd_network: enable on arm64
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -22,7 +22,7 @@ Tested-by: Commit checker robot <no-reply+buildbot@haiku-os.org>
  4 files changed, 8 insertions(+), 8 deletions(-)
 
 diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
-index 637d16279c..0a08b2f9dc 100644
+index c0906032b1..120492d15b 100644
 --- a/build/jam/images/definitions/minimum
 +++ b/build/jam/images/definitions/minimum
 @@ -331,7 +331,7 @@ SYSTEM_ADD_ONS_DRIVERS_GRAPHICS = [ FFilterByBuildFeatures

@@ -1,7 +1,7 @@
-From cdd0bc69cff1c895ca7e98ab8d76a0459f761404 Mon Sep 17 00:00:00 2001
+From 768d7b866f8b3930ea4c6afd4c1c0c07c4821c09 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 17:14:55 +0200
-Subject: [PATCH 023/203] efi/arm: let a Cortex-A9 MPCore take part in
+Subject: [PATCH 023/270] efi/arm: let a Cortex-A9 MPCore take part in
  coherency
 
 Set ACTLR.SMP and ACTLR.FW before entering the kernel, as Linux does, so

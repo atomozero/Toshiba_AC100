@@ -1,7 +1,7 @@
-From 9a99f72427da4b8e07a284b4c5af00db972031e9 Mon Sep 17 00:00:00 2001
+From 70dba3b168ff9cb4ed2b1ead95b87f4a1efdfe55 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 09:21:41 +0200
-Subject: [PATCH 070/203] ARM bring-up: stop writing AC100LOG.TXT after a
+Subject: [PATCH 070/270] ARM bring-up: stop writing AC100LOG.TXT after a
  failed write (not for merging)
 
 ---

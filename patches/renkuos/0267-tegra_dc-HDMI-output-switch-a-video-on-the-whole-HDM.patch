@@ -1,0 +1,752 @@
+From 0685ae17c8f3316cfb0d04b5d5a7870adbf58ce8 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 26 Oct 2026 22:32:24 +0100
+Subject: [PATCH 267/270] tegra_dc: HDMI output switch, a video on the whole
+ HDMI screen
+
+'hdmi_output false' in the driver settings leaves the HDMI block off
+even with a screen plugged in; the status reports it.
+
+TEGRA_DC_SET_HDMI_VIDEO shows an overlay buffer on the whole HDMI
+screen, in its proportions, with filtering and the color space
+conversion of window B: the mirrored panel and the cursor leave the
+HDMI screen meanwhile, and come back when it is turned off.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../private/graphics/tegra_dc/tegra_dc_info.h |  14 +
+ .../kernel/drivers/graphics/tegra_dc/hdmi.cpp |  99 ++++-
+ .../kernel/drivers/graphics/tegra_dc/hdmi.h   |  15 +
+ .../drivers/graphics/tegra_dc/tegra_dc.cpp    |  62 ++++
+ src/preferences/hdmi/HDMI.cpp                 | 344 ------------------
+ src/preferences/hdmi/HDMI.rdef                |  37 --
+ src/preferences/hdmi/Jamfile                  |  15 -
+ 7 files changed, 182 insertions(+), 404 deletions(-)
+ delete mode 100644 src/preferences/hdmi/HDMI.cpp
+ delete mode 100644 src/preferences/hdmi/HDMI.rdef
+ delete mode 100644 src/preferences/hdmi/Jamfile
+
+diff --git a/headers/private/graphics/tegra_dc/tegra_dc_info.h b/headers/private/graphics/tegra_dc/tegra_dc_info.h
+index ce8563b0a2..e46891df2d 100644
+--- a/headers/private/graphics/tegra_dc/tegra_dc_info.h
++++ b/headers/private/graphics/tegra_dc/tegra_dc_info.h
+@@ -71,6 +71,18 @@ enum {
+ 		// tegra_dc_hdmi_status
+ 	TEGRA_DC_RECONNECT_HDMI,
+ 		// nothing: the HDMI output reads its driver settings again
++	TEGRA_DC_SET_HDMI_VIDEO,
++		// tegra_dc_hdmi_video: a video on the whole HDMI screen, or not
++};
++
++
++struct tegra_dc_hdmi_video {
++	uint32			enable;
++	area_id			handle;			// an overlay buffer, as allocated
++	uint32			space;			// B_YCbCr422 or B_RGB32
++	uint32			bytes_per_row;
++	uint16			width;
++	uint16			height;
+ };
+ 
+ 
+@@ -80,6 +92,8 @@ struct tegra_dc_hdmi_status {
+ 	bool			has_edid;
+ 	bool			hdmi_sink;		// rather than DVI
+ 	bool			dvi;			// sending DVI
++	bool			enabled;		// not turned off in the settings
++	bool			video;			// showing a video, not the panel
+ 	char			screen_name[16];
+ 	uint16			width;
+ 	uint16			height;
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
+index 4236d3514e..d55c94176a 100644
+--- a/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
+@@ -370,6 +370,8 @@ static struct {
+ 	}				cursor;
+ 
+ 	hdmi_overlay	overlay;
++	hdmi_video		video;
++	bool			output_enabled;	// "hdmi_output false" turns it off
+ 
+ 	bool			plugged;
+ 	bool			has_edid;
+@@ -917,7 +919,7 @@ program_mirror_window()
+ 	write_dc(WINBUF_START_ADDR, sHdmi.physical);
+ 	write_dc(WINBUF_ADDR_H_OFFSET, 0);
+ 	write_dc(WINBUF_ADDR_V_OFFSET, 0);
+-	write_dc(WIN_OPTIONS, WIN_OPTIONS_ENABLE
++	write_dc(WIN_OPTIONS, sHdmi.video.enabled ? 0 : WIN_OPTIONS_ENABLE
+ 		| (bytesPerPixel == 2 ? WIN_OPTIONS_COLOR_EXPAND : 0));
+ 
+ 	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_UPDATE | STATE_WIN_A_UPDATE);
+@@ -935,7 +937,8 @@ program_cursor_window()
+ {
+ 	const auto& cursor = sHdmi.cursor;
+ 	write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_C_SELECT);
+-	if (!cursor.visible || cursor.width == 0 || cursor.height == 0) {
++	if (!cursor.visible || cursor.width == 0 || cursor.height == 0
++		|| sHdmi.video.enabled) {
+ 		write_dc(WIN_OPTIONS, 0);
+ 	} else {
+ 		uint32 x = sHdmi.window_x
+@@ -1023,10 +1026,59 @@ setup_overlay_window()
+ }
+ 
+ 
++/*!	A video on the whole screen, in its proportions: window B alone. */
++static void
++program_video_window()
++{
++	const hdmi_video& video = sHdmi.video;
++	const hdmi_mode& mode = sHdmi.mode;
++	uint32 width = mode.h_display;
++	uint32 height = video.height * width / video.width;
++	if (height > mode.v_display) {
++		height = mode.v_display;
++		width = video.width * height / video.height;
++	}
++	uint32 x = (mode.h_display - width) / 2;
++	uint32 y = (mode.v_display - height) / 2;
++	uint32 hIncrement = dda_increment(video.width, width);
++	uint32 vIncrement = dda_increment(video.height, height);
++
++	write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_B_SELECT);
++	write_dc(WIN_COLOR_DEPTH, video.color_depth);
++	write_dc(WIN_BYTE_SWAP, video.byte_swap);
++	write_dc(WIN_POSITION, (y << 16) | x);
++	write_dc(WIN_SIZE, (height << 16) | width);
++	write_dc(WIN_PRESCALED_SIZE, (video.height << 16)
++		| (video.width * video.bytes_per_pixel));
++	write_dc(WIN_H_INITIAL_DDA, 0);
++	write_dc(WIN_V_INITIAL_DDA, 0);
++	write_dc(WIN_DDA_INCREMENT, (vIncrement << 16) | hIncrement);
++	write_dc(WIN_LINE_STRIDE, video.bytes_per_row);
++	write_dc(WIN_BUF_STRIDE, 0);
++	write_dc(WIN_BUFFER_ADDR_MODE, 0);
++	write_dc(WINBUF_START_ADDR, video.physical);
++	write_dc(WINBUF_ADDR_H_OFFSET, 0);
++	write_dc(WINBUF_ADDR_V_OFFSET, 0);
++	write_dc(WIN_OPTIONS, video.options);
++	write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_A_SELECT);
++
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_UPDATE | STATE_WIN_A_UPDATE
++		| STATE_WIN_B_UPDATE);
++	read_dc(DC_CMD_STATE_CONTROL);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_ACT_REQ
++		| STATE_WIN_A_ACT_REQ | STATE_WIN_B_ACT_REQ);
++}
++
++
+ /*!	The video at the same place of the mirrored picture as on the panel. */
+ static void
+ program_overlay_window()
+ {
++	if (sHdmi.video.enabled) {
++		program_video_window();
++		return;
++	}
++
+ 	const hdmi_overlay& overlay = sHdmi.overlay;
+ 	uint32 x = sHdmi.window_x + overlay.x * sHdmi.window_width / sHdmi.width;
+ 	uint32 y = sHdmi.window_y
+@@ -1390,14 +1442,16 @@ disconnect()
+ static void
+ connect()
+ {
+-	status_t status = set_hdmi_power(true);
+-	if (status != B_OK) {
+-		ERROR("cannot power the HDMI block: %s\n", strerror(status));
+-		return;
+-	}
+-
+ 	void* settings = load_driver_settings("tegra_dc");
+ 	tmds_settings& tmds = sHdmi.tmds;
++	// "hdmi_output false" leaves the HDMI block off with a screen plugged in
++	sHdmi.output_enabled = get_driver_boolean_parameter(settings,
++		"hdmi_output", true, true);
++	if (!sHdmi.output_enabled) {
++		unload_driver_settings(settings);
++		dprintf("tegra_dc: hdmi: output turned off in the settings\n");
++		return;
++	}
+ 	// "hdmi_dvi true" sends plain DVI even to HDMI sinks
+ 	tmds.force_dvi = get_driver_boolean_parameter(settings, "hdmi_dvi", false,
+ 		true);
+@@ -1419,6 +1473,12 @@ connect()
+ 		"hdmi_vco_cap", "1", "1"), NULL, 0), 0xfu);
+ 	unload_driver_settings(settings);
+ 
++	status_t status = set_hdmi_power(true);
++	if (status != B_OK) {
++		ERROR("cannot power the HDMI block: %s\n", strerror(status));
++		return;
++	}
++
+ 	// The screen may need a while after the hot plug line rises before it
+ 	// answers on the DDC bus (a television took more than a second)
+ 	uint8 edid[EDID_SIZE];
+@@ -1540,6 +1600,7 @@ hdmi_start(uint32 physical, uint16 width, uint16 height, uint32 colorDepth,
+ {
+ 	memset(&sHdmi, 0, sizeof(sHdmi));
+ 	sHdmi.thread = -1;
++	sHdmi.output_enabled = true;
+ 
+ 	// "hdmi false" in the driver settings leaves the HDMI block off
+ 	void* settings = load_driver_settings("tegra_dc");
+@@ -1649,6 +1710,8 @@ hdmi_get_status(tegra_dc_hdmi_status& status)
+ 	MutexLocker locker(sHdmi.lock);
+ 	status.plugged = sHdmi.plugged;
+ 	status.active = sHdmi.active;
++	status.enabled = sHdmi.output_enabled;
++	status.video = sHdmi.video.enabled;
+ 	status.has_edid = sHdmi.has_edid;
+ 	status.hdmi_sink = sHdmi.hdmi_sink;
+ 	status.dvi = sHdmi.sending_dvi;
+@@ -1677,6 +1740,26 @@ hdmi_reconnect()
+ }
+ 
+ 
++void
++hdmi_set_video(const hdmi_video& video)
++{
++	// thread ids are positive; before hdmi_start() it is 0
++	if (sHdmi.thread <= 0)
++		return;
++
++	MutexLocker locker(sHdmi.lock);
++	bool changed = video.enabled != sHdmi.video.enabled;
++	sHdmi.video = video;
++	if (!sHdmi.active)
++		return;
++	if (changed) {
++		program_mirror_window();
++		program_cursor_window();
++	}
++	program_overlay_window();
++}
++
++
+ void
+ hdmi_set_cursor(bool visible, uint32 physical, int32 x, int32 y,
+ 	uint32 width, uint32 height, uint32 skipX, uint32 skipY)
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.h b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.h
+index 9c57009845..b9f7c40a0d 100644
+--- a/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.h
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.h
+@@ -47,6 +47,21 @@ struct hdmi_overlay {
+ 
+ void hdmi_set_overlay(const hdmi_overlay& overlay);
+ 
++// A video shown on the whole HDMI screen instead of the mirrored panel
++struct hdmi_video {
++	bool	enabled;
++	uint32	physical;		// of the frame
++	uint32	color_depth;
++	uint32	byte_swap;
++	uint32	options;		// window options: enable, filters, CSC
++	uint32	bytes_per_pixel;
++	uint32	bytes_per_row;
++	uint32	width;
++	uint32	height;
++};
++
++void hdmi_set_video(const hdmi_video& video);
++
+ struct tegra_dc_hdmi_status;
+ void hdmi_get_status(tegra_dc_hdmi_status& status);
+ // stops the output and starts it again with the driver settings
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp b/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
+index 4ae232715b..409e1fd80a 100644
+--- a/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
+@@ -912,6 +912,57 @@ configure_overlay(const tegra_dc_overlay_config& config)
+ }
+ 
+ 
++/*!	Shows an overlay buffer on the whole HDMI screen, or the mirrored panel
++	again. Window B of display controller B has the same filters and color
++	space conversion as the panel's.
++*/
++static status_t
++set_hdmi_video(const tegra_dc_hdmi_video& config)
++{
++	hdmi_video video = {};
++	if (!config.enable) {
++		hdmi_set_video(video);
++		return B_OK;
++	}
++
++	int32 slot = find_overlay_buffer(config.handle);
++	if (slot < 0 || config.width < 2 || config.height < 2)
++		return B_BAD_VALUE;
++
++	video.options = WIN_OPTIONS_ENABLE | WIN_OPTIONS_H_FILTER
++		| WIN_OPTIONS_V_FILTER;
++	switch (config.space) {
++		case B_YCbCr422:
++			video.bytes_per_pixel = 2;
++			video.color_depth = COLOR_DEPTH_YCbCr422;
++			video.byte_swap = BYTE_SWAP_SWAP2;
++			video.options |= WIN_OPTIONS_CSC;
++			break;
++		case B_RGB32:
++		case B_RGBA32:
++			video.bytes_per_pixel = 4;
++			video.color_depth = COLOR_DEPTH_B8G8R8A8;
++			break;
++		default:
++			return B_BAD_VALUE;
++	}
++	if ((config.bytes_per_row & 7) != 0
++		|| config.width * video.bytes_per_pixel > config.bytes_per_row
++		|| (uint32)config.height * config.bytes_per_row
++			> sDevice.overlay_buffers[slot].size) {
++		return B_BAD_VALUE;
++	}
++
++	video.enabled = true;
++	video.physical = sDevice.overlay_buffers[slot].physical;
++	video.bytes_per_row = config.bytes_per_row;
++	video.width = config.width;
++	video.height = config.height;
++	hdmi_set_video(video);
++	return B_OK;
++}
++
++
+ //	#pragma mark - interrupts
+ 
+ 
+@@ -1279,6 +1330,17 @@ tegra_dc_ioctl(void* cookie, uint32 op, void* buffer, size_t length)
+ 			hdmi_reconnect();
+ 			return B_OK;
+ 
++		case TEGRA_DC_SET_HDMI_VIDEO:
++		{
++			tegra_dc_hdmi_video config;
++			if (length < sizeof(config)
++				|| user_memcpy(&config, buffer, sizeof(config)) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			MutexLocker locker(sDevice.lock);
++			return set_hdmi_video(config);
++		}
++
+ 		case TEGRA_DC_SET_DISPLAY_MODE:
+ 		{
+ 			display_mode mode;
+diff --git a/src/preferences/hdmi/HDMI.cpp b/src/preferences/hdmi/HDMI.cpp
+deleted file mode 100644
+index 4b9f80b8fb..0000000000
+--- a/src/preferences/hdmi/HDMI.cpp
++++ /dev/null
+@@ -1,344 +0,0 @@
+-/*
+- * Copyright 2026, Andrea Bernardi
+- * SPDX-License-Identifier: MIT
+- */
+-
+-
+-/*!	HDMI preferences of the NVIDIA Tegra 2 display driver (tegra_dc): shows
+-	the screen plugged into the HDMI port and the mode it gets, and sets how
+-	the driver chooses it. The choices go into the driver settings file,
+-	which the driver reads again when told to restart the output.
+-*/
+-
+-
+-#include <Alert.h>
+-#include <Application.h>
+-#include <Box.h>
+-#include <Catalog.h>
+-#include <CheckBox.h>
+-#include <Directory.h>
+-#include <File.h>
+-#include <FindDirectory.h>
+-#include <LayoutBuilder.h>
+-#include <MenuField.h>
+-#include <MenuItem.h>
+-#include <MessageRunner.h>
+-#include <Path.h>
+-#include <PopUpMenu.h>
+-#include <SeparatorView.h>
+-#include <String.h>
+-#include <StringList.h>
+-#include <StringView.h>
+-#include <Window.h>
+-
+-#include <errno.h>
+-#include <fcntl.h>
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <string.h>
+-#include <unistd.h>
+-
+-#include "tegra_dc_info.h"
+-
+-
+-#undef B_TRANSLATION_CONTEXT
+-#define B_TRANSLATION_CONTEXT "HDMI"
+-
+-
+-static const char* kDevice = "/dev/" TEGRA_DC_DEVICE_NAME;
+-
+-enum {
+-	kMsgModeChanged = 'mode',
+-	kMsgDviChanged = 'dvi ',
+-	kMsgSignalChanged = 'sgnl',
+-	kMsgUpdateStatus = 'stat'
+-};
+-
+-// what the driver settings say, as the popup menu has it
+-enum mode_choice {
+-	MODE_AUTOMATIC = 0,	// smallest mode that holds the panel's picture
+-	MODE_PREFERRED,		// the screen's preferred mode, or the largest
+-	MODE_720P
+-};
+-
+-static const char* kModeValues[] = { NULL, "preferred", "720p" };
+-
+-
+-/*!	The tegra_dc driver settings file: lines of "key value", kept as they
+-	are except for the keys this panel owns.
+-*/
+-class DriverSettings {
+-public:
+-	DriverSettings()
+-	{
+-		find_directory(B_USER_SETTINGS_DIRECTORY, &fPath);
+-		fPath.Append("kernel/drivers/tegra_dc");
+-
+-		BFile file(fPath.Path(), B_READ_ONLY);
+-		off_t size;
+-		if (file.InitCheck() != B_OK || file.GetSize(&size) != B_OK
+-			|| size > 65536) {
+-			return;
+-		}
+-		BString text;
+-		char* buffer = text.LockBuffer(size + 1);
+-		ssize_t bytes = file.Read(buffer, size);
+-		text.UnlockBuffer(bytes >= 0 ? bytes : 0);
+-		text.Split("\n", true, fLines);
+-	}
+-
+-	const char* Get(const char* key) const
+-	{
+-		for (int32 i = 0; i < fLines.CountStrings(); i++) {
+-			BString line = fLines.StringAt(i);
+-			line.Trim();
+-			int32 space = line.FindFirst(' ');
+-			if (space < 0)
+-				space = line.FindFirst('\t');
+-			BString name;
+-			line.CopyInto(name, 0, space >= 0 ? space : line.Length());
+-			if (name == key) {
+-				fValue = space >= 0 ? line.String() + space + 1 : "";
+-				fValue.Trim();
+-				return fValue.String();
+-			}
+-		}
+-		return NULL;
+-	}
+-
+-	void Set(const char* key, const char* value)
+-	{
+-		for (int32 i = fLines.CountStrings() - 1; i >= 0; i--) {
+-			BString line = fLines.StringAt(i);
+-			line.Trim();
+-			if (line == key || line.StartsWith(BString(key) << " ")
+-				|| line.StartsWith(BString(key) << "\t")) {
+-				fLines.Remove(i);
+-			}
+-		}
+-		if (value != NULL)
+-			fLines.Add(BString(key) << " " << value);
+-	}
+-
+-	status_t Save() const
+-	{
+-		BPath directory;
+-		fPath.GetParent(&directory);
+-		create_directory(directory.Path(), 0755);
+-
+-		BFile file(fPath.Path(), B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);
+-		if (file.InitCheck() != B_OK)
+-			return file.InitCheck();
+-		BString text = fLines.Join("\n");
+-		text << "\n";
+-		ssize_t written = file.Write(text.String(), text.Length());
+-		return written == text.Length() ? B_OK : B_IO_ERROR;
+-	}
+-
+-private:
+-	BPath				fPath;
+-	BStringList			fLines;
+-	mutable BString		fValue;
+-};
+-
+-
+-class HDMIWindow : public BWindow {
+-public:
+-								HDMIWindow();
+-
+-	virtual	void				MessageReceived(BMessage* message);
+-
+-private:
+-			void				_UpdateStatus();
+-			void				_Apply();
+-
+-			BStringView*		fScreenView;
+-			BStringView*		fModeView;
+-			BPopUpMenu*			fModeMenu;
+-			BCheckBox*			fDviCheckBox;
+-			BCheckBox*			fSignalCheckBox;
+-			BMessageRunner*		fStatusRunner;
+-};
+-
+-
+-HDMIWindow::HDMIWindow()
+-	:
+-	BWindow(BRect(100, 100, 500, 300), B_TRANSLATE_SYSTEM_NAME("HDMI"),
+-		B_TITLED_WINDOW, B_NOT_RESIZABLE | B_NOT_ZOOMABLE
+-			| B_AUTO_UPDATE_SIZE_LIMITS | B_QUIT_ON_WINDOW_CLOSE)
+-{
+-	fScreenView = new BStringView("screen", "");
+-	fModeView = new BStringView("mode", "");
+-
+-	fModeMenu = new BPopUpMenu("mode");
+-	fModeMenu->AddItem(new BMenuItem(
+-		B_TRANSLATE("Automatic (sharpest for this display)"),
+-		new BMessage(kMsgModeChanged)));
+-	fModeMenu->AddItem(new BMenuItem(B_TRANSLATE("Screen's preferred mode"),
+-		new BMessage(kMsgModeChanged)));
+-	fModeMenu->AddItem(new BMenuItem(B_TRANSLATE("1280×720"),
+-		new BMessage(kMsgModeChanged)));
+-	BMenuField* modeField = new BMenuField("mode field",
+-		B_TRANSLATE("Resolution:"), fModeMenu);
+-
+-	fDviCheckBox = new BCheckBox("dvi",
+-		B_TRANSLATE("Plain DVI signal (no sound)"),
+-		new BMessage(kMsgDviChanged));
+-	fSignalCheckBox = new BCheckBox("signal",
+-		B_TRANSLATE("Stronger signal (long cables)"),
+-		new BMessage(kMsgSignalChanged));
+-
+-	BBox* statusBox = new BBox("status");
+-	statusBox->SetLabel(B_TRANSLATE("Connected screen"));
+-	BLayoutBuilder::Group<>(statusBox, B_VERTICAL, B_USE_SMALL_SPACING)
+-		.SetInsets(B_USE_DEFAULT_SPACING, B_USE_BIG_SPACING,
+-			B_USE_DEFAULT_SPACING, B_USE_DEFAULT_SPACING)
+-		.Add(fScreenView)
+-		.Add(fModeView);
+-
+-	BLayoutBuilder::Group<>(this, B_VERTICAL)
+-		.SetInsets(B_USE_WINDOW_SPACING)
+-		.Add(statusBox)
+-		.Add(modeField)
+-		.Add(fDviCheckBox)
+-		.Add(fSignalCheckBox);
+-
+-	// the current settings
+-	DriverSettings settings;
+-	const char* mode = settings.Get("hdmi_mode");
+-	int32 choice = MODE_AUTOMATIC;
+-	for (int32 i = 1; i < (int32)B_COUNT_OF(kModeValues); i++) {
+-		if (mode != NULL && strcmp(mode, kModeValues[i]) == 0)
+-			choice = i;
+-	}
+-	fModeMenu->ItemAt(choice)->SetMarked(true);
+-	const char* dvi = settings.Get("hdmi_dvi");
+-	fDviCheckBox->SetValue(dvi != NULL && (strcmp(dvi, "true") == 0
+-		|| strcmp(dvi, "on") == 0 || strcmp(dvi, "1") == 0));
+-	const char* drive = settings.Get("hdmi_drive_current");
+-	fSignalCheckBox->SetValue(drive != NULL && atoi(drive) > 15);
+-
+-	_UpdateStatus();
+-	BMessage update(kMsgUpdateStatus);
+-	fStatusRunner = new BMessageRunner(this, &update, 1000000);
+-
+-	CenterOnScreen();
+-}
+-
+-
+-void
+-HDMIWindow::MessageReceived(BMessage* message)
+-{
+-	switch (message->what) {
+-		case kMsgModeChanged:
+-		case kMsgDviChanged:
+-		case kMsgSignalChanged:
+-			_Apply();
+-			break;
+-
+-		case kMsgUpdateStatus:
+-			_UpdateStatus();
+-			break;
+-
+-		default:
+-			BWindow::MessageReceived(message);
+-	}
+-}
+-
+-
+-void
+-HDMIWindow::_UpdateStatus()
+-{
+-	tegra_dc_hdmi_status status;
+-	int device = open(kDevice, O_RDONLY);
+-	bool known = device >= 0 && ioctl(device, TEGRA_DC_GET_HDMI_STATUS,
+-		&status, sizeof(status)) == 0;
+-	if (device >= 0)
+-		close(device);
+-
+-	BString screen;
+-	BString mode;
+-	if (!known) {
+-		screen = B_TRANSLATE("The display driver has no HDMI output.");
+-	} else if (!status.plugged) {
+-		screen = B_TRANSLATE("No screen is plugged in.");
+-	} else {
+-		if (status.screen_name[0] != '\0')
+-			screen = status.screen_name;
+-		else if (!status.has_edid)
+-			screen = B_TRANSLATE("Unknown screen (no EDID)");
+-		else
+-			screen = B_TRANSLATE("Unnamed screen");
+-		screen << " (" << (status.hdmi_sink ? "HDMI" : "DVI") << ")";
+-
+-		if (status.active) {
+-			float refresh = status.pixel_clock * 1000.0f
+-				/ ((float)status.h_total * status.v_total);
+-			mode.SetToFormat(B_TRANSLATE("%u×%u, %.0f Hz, %s"),
+-				status.width, status.height, refresh,
+-				status.dvi ? B_TRANSLATE("DVI, no sound")
+-					: B_TRANSLATE("HDMI with sound"));
+-		} else
+-			mode = B_TRANSLATE("The output is off.");
+-	}
+-
+-	if (screen != fScreenView->Text())
+-		fScreenView->SetText(screen);
+-	if (mode != fModeView->Text())
+-		fModeView->SetText(mode);
+-}
+-
+-
+-void
+-HDMIWindow::_Apply()
+-{
+-	DriverSettings settings;
+-	int32 choice = fModeMenu->IndexOf(fModeMenu->FindMarked());
+-	settings.Set("hdmi_mode", choice > 0 && choice < (int32)B_COUNT_OF(kModeValues)
+-		? kModeValues[choice] : NULL);
+-	settings.Set("hdmi_dvi",
+-		fDviCheckBox->Value() == B_CONTROL_ON ? "true" : NULL);
+-	settings.Set("hdmi_drive_current",
+-		fSignalCheckBox->Value() == B_CONTROL_ON ? "31" : NULL);
+-
+-	status_t status = settings.Save();
+-	if (status == B_OK) {
+-		int device = open(kDevice, O_RDONLY);
+-		if (device < 0 || ioctl(device, TEGRA_DC_RECONNECT_HDMI, NULL, 0) != 0)
+-			status = errno;
+-		if (device >= 0)
+-			close(device);
+-	}
+-	if (status != B_OK) {
+-		BString text(B_TRANSLATE("Could not apply the HDMI settings: %error%"));
+-		text.ReplaceFirst("%error%", strerror(status));
+-		BAlert* alert = new BAlert(B_TRANSLATE("HDMI"), text,
+-			B_TRANSLATE("OK"), NULL, NULL, B_WIDTH_AS_USUAL, B_STOP_ALERT);
+-		alert->Go(NULL);
+-	}
+-	_UpdateStatus();
+-}
+-
+-
+-class HDMIApplication : public BApplication {
+-public:
+-	HDMIApplication()
+-		:
+-		BApplication("application/x-vnd.Haiku-HDMI")
+-	{
+-	}
+-
+-	virtual void ReadyToRun()
+-	{
+-		(new HDMIWindow())->Show();
+-	}
+-};
+-
+-
+-int
+-main()
+-{
+-	HDMIApplication application;
+-	application.Run();
+-	return 0;
+-}
+diff --git a/src/preferences/hdmi/HDMI.rdef b/src/preferences/hdmi/HDMI.rdef
+deleted file mode 100644
+index 397d9e7c34..0000000000
+--- a/src/preferences/hdmi/HDMI.rdef
++++ /dev/null
+@@ -1,37 +0,0 @@
+-/*
+- * Copyright 2026, Andrea Bernardi
+- * SPDX-License-Identifier: MIT
+- */
+-
+-resource app_signature "application/x-vnd.Haiku-HDMI";
+-
+-resource app_name_catalog_entry "x-vnd.Haiku-HDMI:System name:HDMI";
+-
+-resource app_flags B_SINGLE_LAUNCH;
+-
+-resource app_version {
+-	major  = 1,
+-	middle = 0,
+-	minor  = 0,
+-	variety = 2,
+-	internal = 0,
+-	short_info = "HDMI",
+-	long_info  = "HDMI ©2026 Andrea Bernardi"
+-};
+-
+-resource vector_icon {
+-	$"6E6369660B03010000020016023CC7EE389BC0BA16573E39B04977C842ADC700"
+-	$"FFFFD3020006023C529D3753A2B8966F3D9D084B6044496AAF00474747FFA5A0"
+-	$"A002001602BC4E76BC411B3C90DABCA00D47587D4ABA850090FFD40200160238"
+-	$"313C3B5CF0BFCD963C7AAC4C13943FCAF901ECFFC3054B04017E020006033E2F"
+-	$"99387F17BA42DB3FF5B94A0E32482C90001D1E2C3D454658FF01010102000602"
+-	$"3879063B8224BE2CC83B10DB4A1F6F49B894FF9A9A9A00242222020006033C69"
+-	$"A60000000000003E186148800049800058F3F3F300D4CECEFFD9D9D9038DFF06"
+-	$"0D0A062228224A485E525252302C220A042228483852302C220A044838485E52"
+-	$"5252300A042228224A485E48380A04453A45572446242C0A04B561C15A244624"
+-	$"2CB569B8200A0445544557244626C1590A04453A45542644B569B8200A043826"
+-	$"3D234E28492C080438263D234E284E2E0A03492C4E284E2E0802425843C9830A"
+-	$"06486054606052CA1BC5B95C4D52480C0A06010C000A0001091001178400040A"
+-	$"040108000A05010A000A0001001001178400040A010101000A020102000A0302"
+-	$"0304000A070107000A080105000A090106000A0A010B1815FF0117822004"
+-};
+diff --git a/src/preferences/hdmi/Jamfile b/src/preferences/hdmi/Jamfile
+deleted file mode 100644
+index 4f4dfd8508..0000000000
+--- a/src/preferences/hdmi/Jamfile
++++ /dev/null
+@@ -1,15 +0,0 @@
+-SubDir HAIKU_TOP src preferences hdmi ;
+-
+-UsePrivateHeaders graphics [ FDirName graphics tegra_dc ] [ FDirName graphics common ] ;
+-
+-Application HDMI
+-	: HDMI.cpp
+-	: be [ TargetLibstdc++ ] localestub
+-	: HDMI.rdef
+-	;
+-
+-DoCatalogs HDMI :
+-	x-vnd.Haiku-HDMI
+-	:
+-	HDMI.cpp
+-	;

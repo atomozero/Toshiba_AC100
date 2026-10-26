@@ -1,0 +1,510 @@
+From 9b3ff7cb28df768d22dcbf641f25ee9ed52058cb Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 25 Oct 2026 23:05:07 +0100
+Subject: [PATCH 244/270] tegra_dc: video overlay on window B
+
+Physically contiguous, write combining buffers for video frames,
+cloned into the caller, and window B programmed to scale them with
+its linear filters and convert YCbCr 4:2:2 with BT.601 coefficients.
+Window B blends under window A by color key 0, or covers it without
+a key, and stays under the cursor on window C.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../private/graphics/tegra_dc/tegra_dc_info.h |  34 ++
+ .../drivers/graphics/tegra_dc/tegra_dc.cpp    | 374 +++++++++++++++++-
+ 2 files changed, 407 insertions(+), 1 deletion(-)
+
+diff --git a/headers/private/graphics/tegra_dc/tegra_dc_info.h b/headers/private/graphics/tegra_dc/tegra_dc_info.h
+index f63041e73a..4e78a4b608 100644
+--- a/headers/private/graphics/tegra_dc/tegra_dc_info.h
++++ b/headers/private/graphics/tegra_dc/tegra_dc_info.h
+@@ -61,6 +61,40 @@ enum {
+ 		// uint16[2], x and y of the hot spot
+ 	TEGRA_DC_SHOW_CURSOR,
+ 		// uint32, 0 hides
++	TEGRA_DC_ALLOCATE_OVERLAY_BUFFER,
++		// tegra_dc_overlay_buffer, size in, area and address out
++	TEGRA_DC_RELEASE_OVERLAY_BUFFER,
++		// area_id
++	TEGRA_DC_CONFIGURE_OVERLAY,
++		// tegra_dc_overlay_config
++};
++
++
++struct tegra_dc_overlay_buffer {
++	uint32			size;			// in
++	area_id			handle;			// the driver's area, to release it
++	area_id			area;			// a cloneable clone in the caller
++	void*			address;		// of that clone
++	uint32			physical;
++};
++
++struct tegra_dc_overlay_config {
++	uint32			enable;
++	area_id			handle;			// of the buffer to show
++	uint32			space;			// B_YCbCr422 or B_RGB32
++	uint32			bytes_per_row;
++	uint16			source_x;		// part of the buffer shown
++	uint16			source_y;
++	uint16			source_width;
++	uint16			source_height;
++	uint16			x;				// where on screen, inside it
++	uint16			y;
++	uint16			width;
++	uint16			height;
++	uint32			filter;			// bit 0 horizontal, bit 1 vertical
++	bool			color_key;		// show where window A has the key
++	uint32			key_lower;		// 0x00RRGGBB
++	uint32			key_upper;
+ };
+ 
+ 
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp b/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
+index 750ccfed0d..889ef4622f 100644
+--- a/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
+@@ -100,9 +100,11 @@ extern void* gFDT;
+ 
+ #define STATE_GENERAL_ACT_REQ		(1u << 0)
+ #define STATE_WIN_A_ACT_REQ			(1u << 1)
++#define STATE_WIN_B_ACT_REQ			(1u << 2)
+ #define STATE_WIN_C_ACT_REQ			(1u << 3)
+ #define STATE_GENERAL_UPDATE		(1u << 8)
+ #define STATE_WIN_A_UPDATE			(1u << 9)
++#define STATE_WIN_B_UPDATE			(1u << 10)
+ #define STATE_WIN_C_UPDATE			(1u << 11)
+ 
+ // The window registers (TRM 29.10 - 29.15) are those of the window that
+@@ -111,9 +113,26 @@ extern void* gFDT;
+ // reach the selected one.
+ #define DC_CMD_DISPLAY_WINDOW_HEADER	0x042
+ #define WINDOW_A_SELECT				(1u << 4)
++#define WINDOW_B_SELECT				(1u << 5)
+ #define WINDOW_C_SELECT				(1u << 6)
+ 
++// Window B/C scaling filters and color space conversion (TRM 29.12)
++#define WINC_H_FILTER_P00			0x601
++#define WINC_CSC_YOF				0x611
++#define WINC_CSC_KYRGB				0x612
++#define WINC_CSC_KUR				0x613
++#define WINC_CSC_KVR				0x614
++#define WINC_CSC_KUG				0x615
++#define WINC_CSC_KVG				0x616
++#define WINC_CSC_KUB				0x617
++#define WINC_CSC_KVB				0x618
++#define WINC_V_FILTER_P00			0x619
++
++#define DC_DISP_COLOR_KEY0_LOWER	0x436
++#define DC_DISP_COLOR_KEY0_UPPER	0x437
++
+ #define WIN_OPTIONS					0x700
++#define WIN_BYTE_SWAP				0x701
+ #define WIN_COLOR_DEPTH				0x703
+ #define WIN_POSITION				0x704
+ #define WIN_SIZE					0x705
+@@ -142,7 +161,22 @@ extern void* gFDT;
+ #define BLEND_CONTROL_ALPHA			(1u << 2)
+ #define BLEND_CONTROL_DEPENDENT		(2u << 2)
+ 
++#define BLEND_CKEY0					1u
++
+ #define WIN_OPTIONS_COLOR_EXPAND	(1u << 6)
++#define WIN_OPTIONS_H_FILTER		(1u << 8)
++#define WIN_OPTIONS_V_FILTER		(1u << 10)
++#define WIN_OPTIONS_CSC				(1u << 18)
++
++#define COLOR_DEPTH_YCbCr422		16
++#define BYTE_SWAP_SWAP2				1
++
++// Largest downscaling: the DDA steps are 4.12 fixed point
++#define MAX_H_DDA_2_BYTES			0x8000
++#define MAX_H_DDA_4_BYTES			0x4000
++#define MAX_V_DDA					0xf000
++
++#define MAX_OVERLAY_BUFFERS			16
+ #define WIN_OPTIONS_ENABLE			(1u << 30)
+ 
+ #define COLOR_DEPTH_B5G6R5			6
+@@ -178,6 +212,15 @@ struct tegra_dc_device {
+ 	uint16				cursor_height;
+ 	uint16				cursor_hot_x;
+ 	uint16				cursor_hot_y;
++
++	// video overlay, on window B
++	struct {
++		area_id			area;			// the cloneable mapping
++		area_id			memory;			// the contiguous memory itself
++		uint32			physical;
++		uint32			size;
++	}					overlay_buffers[MAX_OVERLAY_BUFFERS];
++	bool				overlay_ready;	// filters, CSC and blending set
+ };
+ 
+ 
+@@ -464,7 +507,10 @@ setup_cursor_window()
+ 	// Window A takes what window C leaves
+ 	select_window(WINDOW_A_SELECT);
+ 	write_dc(WIN_BLEND_2WIN_Y, BLEND_CONTROL_DEPENDENT);
+-	write_dc(WIN_BLEND_3WIN, BLEND_CONTROL_DEPENDENT);
++	if (!sDevice.overlay_ready) {
++		// with the video, configure_overlay() decides how A and B blend
++		write_dc(WIN_BLEND_3WIN, BLEND_CONTROL_DEPENDENT);
++	}
+ 
+ 	// High priority memory requests for window C too, as U-Boot set them for
+ 	// window A
+@@ -563,6 +609,279 @@ load_cursor_image(const tegra_dc_cursor_bitmap& cursor)
+ }
+ 
+ 
++//	#pragma mark - overlay
++
++
++/*!	Physically contiguous memory for a video frame, mapped write combining as
++	device memory: the clones in app_server and in the application then get
++	the same memory type, the display controller does not see the caches.
++*/
++static status_t
++allocate_overlay_buffer(tegra_dc_overlay_buffer& buffer)
++{
++	int32 slot = -1;
++	for (int32 i = 0; i < MAX_OVERLAY_BUFFERS; i++) {
++		if (sDevice.overlay_buffers[i].area < 0) {
++			slot = i;
++			break;
++		}
++	}
++	if (slot < 0)
++		return B_NO_MEMORY;
++	if (buffer.size == 0 || buffer.size > 16 * 1024 * 1024)
++		return B_BAD_VALUE;
++
++	uint32 size = (buffer.size + B_PAGE_SIZE - 1) & ~(B_PAGE_SIZE - 1);
++	void* address;
++	area_id memory = create_area("tegra_dc overlay memory", &address,
++		B_ANY_KERNEL_ADDRESS, size, B_32_BIT_CONTIGUOUS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
++	if (memory < 0)
++		return memory;
++
++	physical_entry entry;
++	status_t status = get_memory_map(address, size, &entry, 1);
++	if (status == B_OK) {
++		memset(address, 0, size);
++		status = vm_set_area_memory_type(memory, entry.address,
++			B_WRITE_COMBINING_MEMORY);
++	}
++	area_id area = -1;
++	if (status == B_OK) {
++		void* mapping;
++		area = map_physical_memory("tegra_dc overlay", entry.address, size,
++			B_ANY_KERNEL_ADDRESS | B_WRITE_COMBINING_MEMORY,
++			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA | B_CLONEABLE_AREA,
++			&mapping);
++		if (area < 0)
++			status = area;
++	}
++
++	area_id clone = -1;
++	if (status == B_OK) {
++		// app_server clones it again into the application drawing the video
++		void* cloneAddress;
++		clone = vm_clone_area(B_CURRENT_TEAM, "tegra_dc overlay buffer",
++			&cloneAddress, B_ANY_ADDRESS,
++			B_READ_AREA | B_WRITE_AREA | B_CLONEABLE_AREA,
++			REGION_NO_PRIVATE_MAP, area, true);
++		if (clone < 0)
++			status = clone;
++		else
++			buffer.address = cloneAddress;
++	}
++	if (status != B_OK) {
++		delete_area(area);
++		delete_area(memory);
++		return status;
++	}
++
++	sDevice.overlay_buffers[slot].area = area;
++	sDevice.overlay_buffers[slot].memory = memory;
++	sDevice.overlay_buffers[slot].physical = entry.address;
++	sDevice.overlay_buffers[slot].size = size;
++
++	buffer.handle = area;
++	buffer.area = clone;
++	buffer.physical = entry.address;
++	return B_OK;
++}
++
++
++static int32
++find_overlay_buffer(area_id handle)
++{
++	for (int32 i = 0; i < MAX_OVERLAY_BUFFERS; i++) {
++		if (handle >= 0 && sDevice.overlay_buffers[i].area == handle)
++			return i;
++	}
++	return -1;
++}
++
++
++static void
++free_overlay_buffer(int32 slot)
++{
++	delete_area(sDevice.overlay_buffers[slot].area);
++	delete_area(sDevice.overlay_buffers[slot].memory);
++	sDevice.overlay_buffers[slot].area = -1;
++	sDevice.overlay_buffers[slot].memory = -1;
++}
++
++
++/*!	Window B: the video, between window A (the desktop) and window C (the
++	cursor). Its scaling filters are linear, and its color space conversion
++	is BT.601 with video range luma.
++*/
++static void
++setup_overlay_window()
++{
++	select_window(WINDOW_B_SELECT);
++	write_dc(WIN_OPTIONS, 0);
++
++	// 6-tap horizontal filter, only the two middle taps: phase i of 16 lies
++	// i/16 of the way from pixel 2 to pixel 3
++	for (uint32 phase = 0; phase < 16; phase++) {
++		write_dc(WINC_H_FILTER_P00 + phase,
++			((8 * phase) << 16) | ((128 - 8 * phase) << 8));
++	}
++	// 2-tap vertical filter: the weight of the earlier line
++	for (uint32 phase = 0; phase < 16; phase++)
++		write_dc(WINC_V_FILTER_P00 + phase, 128 - 8 * phase);
++
++	// R = 1.164 (Y - 16) + 1.596 V, G = 1.164 (Y - 16) - 0.391 U - 0.813 V,
++	// B = 1.164 (Y - 16) + 2.018 U, in 1/256 (10 and 11 bit two's complement)
++	write_dc(WINC_CSC_YOF, 0xf0);
++	write_dc(WINC_CSC_KYRGB, 298);
++	write_dc(WINC_CSC_KUR, 0);
++	write_dc(WINC_CSC_KVR, 409);
++	write_dc(WINC_CSC_KUG, 0x400 - 100);
++	write_dc(WINC_CSC_KVG, 0x400 - 208);
++	write_dc(WINC_CSC_KUB, 516);
++	write_dc(WINC_CSC_KVB, 0);
++
++	// Window B is opaque: it takes what the cursor above it leaves
++	write_dc(WIN_BLEND_NOKEY, BLEND_WEIGHT1(255) | BLEND_WEIGHT0(255));
++	write_dc(WIN_BLEND_1WIN, BLEND_WEIGHT1(255) | BLEND_WEIGHT0(255));
++	write_dc(WIN_BLEND_2WIN_X, BLEND_CONTROL_DEPENDENT);
++	write_dc(WIN_BLEND_2WIN_Y, BLEND_CONTROL_DEPENDENT);
++	write_dc(WIN_BLEND_3WIN, BLEND_CONTROL_DEPENDENT);
++
++	// The cursor stays above the video
++	select_window(WINDOW_C_SELECT);
++	write_dc(WIN_BLEND_2WIN_Y, BLEND_CONTROL_ALPHA | BLEND_WEIGHT1(255)
++		| BLEND_WEIGHT0(255));
++
++	// High priority memory requests for window B too
++	write_dc(DC_DISP_MEM_HIGH_PRIORITY,
++		(read_dc(DC_DISP_MEM_HIGH_PRIORITY) & ~(0x7fu << 8)) | (0x20u << 8));
++	write_dc(DC_DISP_MEM_HIGH_PRIORITY_TIMER,
++		(read_dc(DC_DISP_MEM_HIGH_PRIORITY_TIMER) & ~(0x3fu << 8))
++			| (1u << 8));
++
++	select_window(WINDOW_A_SELECT);
++	sDevice.overlay_ready = true;
++}
++
++
++/*!	The DDA step from one output pixel to the next, in source pixels, 4.12
++	fixed point, so that the first and last output pixels fall on the first
++	and last source pixels.
++*/
++static uint32
++dda_increment(uint32 source, uint32 target)
++{
++	if (target <= 1 || source <= 1)
++		return 0x1000;
++	return ((source - 1) * 0x1000 + (target - 1) / 2) / (target - 1);
++}
++
++
++static status_t
++configure_overlay(const tegra_dc_overlay_config& config)
++{
++	if (!sDevice.overlay_ready)
++		setup_overlay_window();
++
++	if (!config.enable) {
++		select_window(WINDOW_B_SELECT);
++		write_dc(WIN_OPTIONS, 0);
++		select_window(WINDOW_A_SELECT);
++		write_dc(DC_CMD_STATE_CONTROL, STATE_WIN_B_UPDATE);
++		read_dc(DC_CMD_STATE_CONTROL);
++		write_dc(DC_CMD_STATE_CONTROL, STATE_WIN_B_ACT_REQ);
++		return B_OK;
++	}
++
++	int32 slot = find_overlay_buffer(config.handle);
++	if (slot < 0)
++		return B_BAD_VALUE;
++
++	uint32 bytesPerPixel;
++	uint32 colorDepth;
++	uint32 byteSwap = 0;
++	uint32 options = WIN_OPTIONS_ENABLE;
++	uint32 maxDDA;
++	switch (config.space) {
++		case B_YCbCr422:
++			// Y0 Cb Y1 Cr: the UYVY format swapped in pairs of bytes
++			bytesPerPixel = 2;
++			colorDepth = COLOR_DEPTH_YCbCr422;
++			byteSwap = BYTE_SWAP_SWAP2;
++			options |= WIN_OPTIONS_CSC;
++			maxDDA = MAX_H_DDA_2_BYTES;
++			break;
++		case B_RGB32:
++		case B_RGBA32:
++			bytesPerPixel = 4;
++			colorDepth = COLOR_DEPTH_B8G8R8A8;
++			maxDDA = MAX_H_DDA_4_BYTES;
++			break;
++		default:
++			return B_BAD_VALUE;
++	}
++
++	uint32 sourceX = config.source_x;
++	if (bytesPerPixel == 2)
++		sourceX &= ~1u;
++	if (config.width == 0 || config.height == 0
++		|| config.source_width == 0 || config.source_height == 0
++		|| config.x + config.width > PANEL_WIDTH
++		|| config.y + config.height > PANEL_HEIGHT
++		|| (config.bytes_per_row & 7) != 0
++		|| (sourceX + config.source_width) * bytesPerPixel
++			> config.bytes_per_row
++		|| (config.source_y + config.source_height) * config.bytes_per_row
++			> sDevice.overlay_buffers[slot].size) {
++		return B_BAD_VALUE;
++	}
++
++	uint32 hIncrement = dda_increment(config.source_width, config.width);
++	uint32 vIncrement = dda_increment(config.source_height, config.height);
++	if (hIncrement > maxDDA || vIncrement > MAX_V_DDA)
++		return B_BAD_VALUE;
++	if ((config.filter & 1) != 0)
++		options |= WIN_OPTIONS_H_FILTER;
++	if ((config.filter & 2) != 0)
++		options |= WIN_OPTIONS_V_FILTER;
++
++	select_window(WINDOW_B_SELECT);
++	write_dc(WIN_COLOR_DEPTH, colorDepth);
++	write_dc(WIN_BYTE_SWAP, byteSwap);
++	write_dc(WIN_POSITION, (config.y << 16) | config.x);
++	write_dc(WIN_SIZE, (config.height << 16) | config.width);
++	write_dc(WIN_PRESCALED_SIZE, (config.source_height << 16)
++		| (config.source_width * bytesPerPixel));
++	write_dc(WIN_H_INITIAL_DDA, 0);
++	write_dc(WIN_V_INITIAL_DDA, 0);
++	write_dc(WIN_DDA_INCREMENT, (vIncrement << 16) | hIncrement);
++	write_dc(WIN_LINE_STRIDE, config.bytes_per_row);
++	write_dc(WIN_BUF_STRIDE, 0);
++	write_dc(WIN_BUFFER_ADDR_MODE, 0);
++	write_dc(WINBUF_START_ADDR, sDevice.overlay_buffers[slot].physical);
++	write_dc(WINBUF_ADDR_H_OFFSET, sourceX * bytesPerPixel);
++	write_dc(WINBUF_ADDR_V_OFFSET, config.source_y);
++	write_dc(WIN_OPTIONS, options);
++
++	// With a color key, window A gives way to the video only where it shows
++	// the key color, so windows over the video stay visible
++	write_dc(DC_DISP_COLOR_KEY0_LOWER, config.key_lower & 0xffffff);
++	write_dc(DC_DISP_COLOR_KEY0_UPPER, config.key_upper & 0xffffff);
++	select_window(WINDOW_A_SELECT);
++	uint32 under = config.color_key ? BLEND_CKEY0 : 0;
++	write_dc(WIN_BLEND_NOKEY, BLEND_WEIGHT1(255) | BLEND_WEIGHT0(255));
++	write_dc(WIN_BLEND_2WIN_X, under | BLEND_CONTROL_FIX);
++	write_dc(WIN_BLEND_3WIN, under | BLEND_CONTROL_FIX);
++
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_UPDATE | STATE_WIN_A_UPDATE
++		| STATE_WIN_B_UPDATE);
++	read_dc(DC_CMD_STATE_CONTROL);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_ACT_REQ | STATE_WIN_A_ACT_REQ
++		| STATE_WIN_B_ACT_REQ);
++	return B_OK;
++}
++
++
+ //	#pragma mark - interrupts
+ 
+ 
+@@ -614,6 +933,16 @@ enable_vblank_interrupt(bool enable)
+ static void
+ uninit_device()
+ {
++	if (sDevice.overlay_ready) {
++		tegra_dc_overlay_config hide = {};
++		configure_overlay(hide);
++		sDevice.overlay_ready = false;
++	}
++	for (int32 i = 0; i < MAX_OVERLAY_BUFFERS; i++) {
++		if (sDevice.overlay_buffers[i].area >= 0)
++			free_overlay_buffer(i);
++	}
++
+ 	if (sDevice.shared_info != NULL) {
+ 		enable_vblank_interrupt(false);
+ 		remove_io_interrupt_handler(TEGRA20_DC_A_INTERRUPT, vblank_interrupt,
+@@ -858,6 +1187,47 @@ tegra_dc_ioctl(void* cookie, uint32 op, void* buffer, size_t length)
+ 			return B_OK;
+ 		}
+ 
++		case TEGRA_DC_ALLOCATE_OVERLAY_BUFFER:
++		{
++			tegra_dc_overlay_buffer overlayBuffer;
++			if (length < sizeof(overlayBuffer)
++				|| user_memcpy(&overlayBuffer, buffer, sizeof(overlayBuffer))
++					!= B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			MutexLocker locker(sDevice.lock);
++			status_t status = allocate_overlay_buffer(overlayBuffer);
++			if (status != B_OK)
++				return status;
++			return user_memcpy(buffer, &overlayBuffer, sizeof(overlayBuffer));
++		}
++
++		case TEGRA_DC_RELEASE_OVERLAY_BUFFER:
++		{
++			area_id handle;
++			if (length < sizeof(handle)
++				|| user_memcpy(&handle, buffer, sizeof(handle)) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			MutexLocker locker(sDevice.lock);
++			int32 slot = find_overlay_buffer(handle);
++			if (slot < 0)
++				return B_BAD_VALUE;
++			free_overlay_buffer(slot);
++			return B_OK;
++		}
++
++		case TEGRA_DC_CONFIGURE_OVERLAY:
++		{
++			tegra_dc_overlay_config config;
++			if (length < sizeof(config)
++				|| user_memcpy(&config, buffer, sizeof(config)) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			MutexLocker locker(sDevice.lock);
++			return configure_overlay(config);
++		}
++
+ 		case TEGRA_DC_SET_DISPLAY_MODE:
+ 		{
+ 			display_mode mode;
+@@ -957,6 +1327,8 @@ init_driver(void)
+ 	memset(&sDevice, 0, sizeof(sDevice));
+ 	sDevice.registers_area = sDevice.scanout_area = sDevice.shared_area = -1;
+ 	sDevice.pwm_area = -1;
++	for (int32 i = 0; i < MAX_OVERLAY_BUFFERS; i++)
++		sDevice.overlay_buffers[i].area = sDevice.overlay_buffers[i].memory = -1;
+ 	mutex_init(&sDevice.lock, "tegra_dc");
+ 	return B_OK;
+ }

@@ -1,7 +1,7 @@
-From 9be62a0be7d8752ce07f8b0ed3dc12996dd77989 Mon Sep 17 00:00:00 2001
+From e33c7f755ac2fcd1de77ef2248f0779dd0d43930 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Tue, 20 Oct 2026 22:04:29 +0200
-Subject: [PATCH 177/203] ehci: the Tegra 2 AHB registers start at 0x6000c004
+Subject: [PATCH 177/270] ehci: the Tegra 2 AHB registers start at 0x6000c004
 
 The TRM's AHB register offsets are relative to 0x6000c004, so the
 priority setting went into AHB_ARBITRATION_DISABLE and took the USB3

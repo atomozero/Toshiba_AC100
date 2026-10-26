@@ -1,7 +1,7 @@
-From 9dba6047aab243efb17e22a095dfba670b26ed1f Mon Sep 17 00:00:00 2001
+From f9a117a4be5c325605b6f49b4d670ce94305150c Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Tue, 20 Oct 2026 00:25:06 +0200
-Subject: [PATCH 155/203] sdhci: add a device tree attachment, with NVIDIA
+Subject: [PATCH 155/270] sdhci: add a device tree attachment, with NVIDIA
  Tegra 2 support
 
 Controllers described in a flattened device tree are matched by their
@@ -21,16 +21,17 @@ Used for the SD slot and the eMMC of the Toshiba AC100.
  create mode 100644 src/add-ons/kernel/busses/mmc/sdhci_fdt.cpp
 
 diff --git a/src/add-ons/kernel/busses/mmc/Jamfile b/src/add-ons/kernel/busses/mmc/Jamfile
-index 6190c2fa0d..27836143e5 100644
+index 32ea0366a6..421cf70b2c 100644
 --- a/src/add-ons/kernel/busses/mmc/Jamfile
 +++ b/src/add-ons/kernel/busses/mmc/Jamfile
-@@ -11,5 +11,6 @@ SubDirHdrs $(HAIKU_TOP) src add-ons kernel bus_managers acpi acpica include plat
+@@ -11,6 +11,7 @@ SubDirHdrs $(HAIKU_TOP) src add-ons kernel bus_managers acpi acpica include plat
  KernelAddon sdhci :
  	sdhci.cpp
  	sdhci_acpi.cpp
 +	sdhci_fdt.cpp
  	sdhci_pci.cpp
  ;
+ 
 diff --git a/src/add-ons/kernel/busses/mmc/sdhci.cpp b/src/add-ons/kernel/busses/mmc/sdhci.cpp
 index 7e071f0782..2f19af1f6a 100644
 --- a/src/add-ons/kernel/busses/mmc/sdhci.cpp

@@ -1,0 +1,341 @@
+From 6c9b59cc34f62b738379b699f5800afebeff3ca4 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 24 Oct 2026 20:36:19 +0200
+Subject: [PATCH 211/270] arm: add a driver for the ADT7461 temperature sensor
+ of the AC100
+
+The sensor shares the DVC I2C bus with the power management IC, which
+the kernel drives for the clock, so the kernel now offers reads and
+writes on that bus to drivers. /dev/sensor/adt7461 reads the
+temperatures of the Tegra 2 and of the board as text.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ build/jam/packages/Haiku                      |   3 +
+ src/add-ons/kernel/drivers/sensor/Jamfile     |   4 +-
+ .../kernel/drivers/sensor/adt7461/Jamfile     |   5 +
+ .../kernel/drivers/sensor/adt7461/adt7461.cpp | 227 ++++++++++++++++++
+ .../kernel/arch/arm/arch_real_time_clock.cpp  |  38 +++
+ 5 files changed, 276 insertions(+), 1 deletion(-)
+ create mode 100644 src/add-ons/kernel/drivers/sensor/adt7461/Jamfile
+ create mode 100644 src/add-ons/kernel/drivers/sensor/adt7461/adt7461.cpp
+
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index e1c4f4c0fd..44f9a2f19c 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -201,6 +201,9 @@ AddDriversToPackage misc :
+ 	<driver>mem
+ 	nvmm@x86_64
+ 	;
++AddDriversToPackage sensor :
++	adt7461@arm
++	;
+ AddDriversToPackage net
+ 	: $(SYSTEM_ADD_ONS_DRIVERS_NET) ;
+ AddDriversToPackage ports :
+diff --git a/src/add-ons/kernel/drivers/sensor/Jamfile b/src/add-ons/kernel/drivers/sensor/Jamfile
+index 52011f6c26..6dc3104859 100644
+--- a/src/add-ons/kernel/drivers/sensor/Jamfile
++++ b/src/add-ons/kernel/drivers/sensor/Jamfile
+@@ -1,4 +1,6 @@
+ SubDir HAIKU_TOP src add-ons kernel drivers sensor ;
+ 
+ SubInclude HAIKU_TOP src add-ons kernel drivers sensor acpi_als ;
+-
++if $(TARGET_ARCH) = arm {
++	SubInclude HAIKU_TOP src add-ons kernel drivers sensor adt7461 ;
++}
+diff --git a/src/add-ons/kernel/drivers/sensor/adt7461/Jamfile b/src/add-ons/kernel/drivers/sensor/adt7461/Jamfile
+new file mode 100644
+index 0000000000..d93f2c06eb
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/sensor/adt7461/Jamfile
+@@ -0,0 +1,5 @@
++SubDir HAIKU_TOP src add-ons kernel drivers sensor adt7461 ;
++
++KernelAddon adt7461 :
++	adt7461.cpp
++	;
+diff --git a/src/add-ons/kernel/drivers/sensor/adt7461/adt7461.cpp b/src/add-ons/kernel/drivers/sensor/adt7461/adt7461.cpp
+new file mode 100644
+index 0000000000..dcff7c61a6
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/sensor/adt7461/adt7461.cpp
+@@ -0,0 +1,227 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++/*!	The ADT7461 temperature sensor of the Toshiba AC100, on the DVC I2C bus
++	that the kernel drives for the power management IC. It measures the board
++	("local") and, through a diode on the chip, the Tegra 2 ("remote").
++	/dev/sensor/adt7461 reads as text, in degrees Celsius.
++*/
++
++
++#include <stdio.h>
++#include <string.h>
++
++#include <Drivers.h>
++#include <KernelExport.h>
++
++
++#define ADT7461_ADDRESS				0x4c
++
++#define ADT7461_LOCAL_TEMP			0x00
++#define ADT7461_REMOTE_TEMP_HIGH	0x01
++#define ADT7461_STATUS				0x02
++#define ADT7461_CONFIG				0x03
++#define ADT7461_REMOTE_TEMP_LOW		0x10
++#define ADT7461_MANUFACTURER_ID		0xfe
++#define ADT7461_DIE_REVISION		0xff
++
++#define ADT7461_CONFIG_EXTENDED		(1 << 2)
++	// 0 is then -64 degrees, for the range -64 to 191
++#define ADT7461_MANUFACTURER_ADI	0x41
++
++#define TRACE_ALWAYS(x...)			dprintf("adt7461: " x)
++
++
++// in the kernel, next to the clock of the power management IC
++extern "C" status_t arm_dvc_i2c_read(uint8 address, uint8 reg, uint8* data,
++	uint32 length);
++
++
++static const char* sDeviceNames[] = { "sensor/adt7461", NULL };
++
++int32 api_version = B_CUR_DRIVER_API_VERSION;
++
++
++static status_t
++read_register(uint8 reg, uint8* _value)
++{
++	return arm_dvc_i2c_read(ADT7461_ADDRESS, reg, _value, 1);
++}
++
++
++/*!	Reads both temperatures in quarters of a degree. */
++static status_t
++read_temperatures(int32* _local, int32* _remote, uint8* _status)
++{
++	uint8 config, local, high, low, status;
++	status_t result = read_register(ADT7461_CONFIG, &config);
++	if (result == B_OK)
++		result = read_register(ADT7461_LOCAL_TEMP, &local);
++	// the high byte latches the low one, so it is read first
++	if (result == B_OK)
++		result = read_register(ADT7461_REMOTE_TEMP_HIGH, &high);
++	if (result == B_OK)
++		result = read_register(ADT7461_REMOTE_TEMP_LOW, &low);
++	if (result == B_OK)
++		result = read_register(ADT7461_STATUS, &status);
++	if (result != B_OK)
++		return result;
++
++	int32 offset = (config & ADT7461_CONFIG_EXTENDED) != 0 ? 64 * 4 : 0;
++	*_local = local * 4 - offset;
++	*_remote = ((high << 2) | (low >> 6)) - offset;
++	*_status = status;
++	return B_OK;
++}
++
++
++static int
++format_temperature(char* buffer, size_t size, int32 quarters)
++{
++	const char* sign = quarters < 0 ? "-" : "";
++	if (quarters < 0)
++		quarters = -quarters;
++	return snprintf(buffer, size, "%s%" B_PRId32 ".%02" B_PRId32, sign,
++		quarters / 4, quarters % 4 * 25);
++}
++
++
++//	#pragma mark - device hooks
++
++
++static status_t
++adt7461_open(const char* name, uint32 flags, void** _cookie)
++{
++	*_cookie = NULL;
++	return B_OK;
++}
++
++
++static status_t
++adt7461_close(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++adt7461_free(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++adt7461_control(void* cookie, uint32 op, void* arg, size_t length)
++{
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++static status_t
++adt7461_read(void* cookie, off_t position, void* buffer, size_t* _length)
++{
++	int32 local, remote;
++	uint8 status;
++	status_t result = read_temperatures(&local, &remote, &status);
++	if (result != B_OK) {
++		*_length = 0;
++		return result;
++	}
++
++	char localText[16], remoteText[16];
++	format_temperature(localText, sizeof(localText), local);
++	format_temperature(remoteText, sizeof(remoteText), remote);
++
++	char text[128];
++	size_t textLength = snprintf(text, sizeof(text), "cpu %s C\nboard %s C\n"
++		"status %#04x\n", remoteText, localText, status);
++
++	if (position < 0 || (size_t)position >= textLength) {
++		*_length = 0;
++		return B_OK;
++	}
++	size_t length = min_c(*_length, textLength - (size_t)position);
++	if (user_memcpy(buffer, text + position, length) != B_OK)
++		return B_BAD_ADDRESS;
++	*_length = length;
++	return B_OK;
++}
++
++
++static status_t
++adt7461_write(void* cookie, off_t position, const void* buffer,
++	size_t* _length)
++{
++	*_length = 0;
++	return B_NOT_ALLOWED;
++}
++
++
++static device_hooks sDeviceHooks = {
++	adt7461_open,
++	adt7461_close,
++	adt7461_free,
++	adt7461_control,
++	adt7461_read,
++	adt7461_write,
++};
++
++
++//	#pragma mark - driver
++
++
++status_t
++init_hardware(void)
++{
++	uint8 manufacturer, revision;
++	status_t status = read_register(ADT7461_MANUFACTURER_ID, &manufacturer);
++	if (status == B_OK)
++		status = read_register(ADT7461_DIE_REVISION, &revision);
++	if (status != B_OK)
++		return status;
++	if (manufacturer != ADT7461_MANUFACTURER_ADI)
++		return B_DEVICE_NOT_FOUND;
++
++	int32 local, remote;
++	uint8 sensorStatus;
++	status = read_temperatures(&local, &remote, &sensorStatus);
++	if (status == B_OK) {
++		char localText[16], remoteText[16];
++		format_temperature(localText, sizeof(localText), local);
++		format_temperature(remoteText, sizeof(remoteText), remote);
++		TRACE_ALWAYS("revision %#x: cpu %s C, board %s C, status %#x\n",
++			revision, remoteText, localText, sensorStatus);
++	}
++	return status;
++}
++
++
++status_t
++init_driver(void)
++{
++	return B_OK;
++}
++
++
++void
++uninit_driver(void)
++{
++}
++
++
++const char**
++publish_devices(void)
++{
++	return sDeviceNames;
++}
++
++
++device_hooks*
++find_device(const char* name)
++{
++	return &sDeviceHooks;
++}
+diff --git a/src/system/kernel/arch/arm/arch_real_time_clock.cpp b/src/system/kernel/arch/arm/arch_real_time_clock.cpp
+index b3233623b3..64ef8ca5e0 100644
+--- a/src/system/kernel/arch/arm/arch_real_time_clock.cpp
++++ b/src/system/kernel/arch/arm/arch_real_time_clock.cpp
+@@ -249,6 +249,44 @@ tps6586x_write(uint8 reg, const uint8* data, uint32 length)
+ }
+ 
+ 
++/*!	For the drivers of the other chips on the DVC bus, like the ADT7461
++	temperature sensor of the AC100: reads \a length bytes from register
++	\a reg of the chip at \a address.
++*/
++extern "C" status_t
++arm_dvc_i2c_read(uint8 address, uint8 reg, uint8* data, uint32 length)
++{
++	if (sDVC == NULL)
++		return B_NO_INIT;
++
++	InterruptsSpinLocker locker(sDVCLock);
++	status_t status = dvc_i2c_transfer(address, &reg, 1, false, true);
++	if (status == B_OK)
++		status = dvc_i2c_transfer(address, data, length, true, false);
++	return status;
++}
++
++
++/*!	Writes \a length bytes to register \a reg of the chip at \a address on the
++	DVC bus.
++*/
++extern "C" status_t
++arm_dvc_i2c_write(uint8 address, uint8 reg, const uint8* data, uint32 length)
++{
++	if (sDVC == NULL)
++		return B_NO_INIT;
++
++	uint8 buffer[8];
++	if (length + 1 > sizeof(buffer))
++		return B_BAD_VALUE;
++	buffer[0] = reg;
++	memcpy(buffer + 1, data, length);
++
++	InterruptsSpinLocker locker(sDVCLock);
++	return dvc_i2c_transfer(address, buffer, length + 1, false, false);
++}
++
++
+ /*!	Returns the seconds since 1970 of the TPS6586x clock, or 0 if it is not
+ 	available or not running.
+ */

@@ -1,7 +1,7 @@
-From 3dbc60d273ea220765a5edede9d23de6d0552c7b Mon Sep 17 00:00:00 2001
+From 83155bb70d9794ca6ec083f4168b341c3714fa05 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 23:12:42 +0200
-Subject: [PATCH 124/203] ARM bring-up: let userland read the cycle counter
+Subject: [PATCH 124/270] ARM bring-up: let userland read the cycle counter
 
 To see why a busy thread runs three times slower with two CPUs on the
 AC100: whether it gets fewer instructions per cycle or a slower clock (not

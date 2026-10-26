@@ -1,0 +1,187 @@
+From 440402be41c641f7588537f836b7d71a437a0e34 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 26 Oct 2026 14:34:16 +0100
+Subject: [PATCH 253/270] tegra_dc: send audio clock regeneration packets to
+ HDMI sinks
+
+HDMI sinks get the 48 kHz audio clock regeneration packets (N 6144,
+CTS = the pixel clock in kHz) and a stereo audio infoframe, as the
+HDMI specification has them, even while no sound is sent. The two
+infoframes share one writer.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../kernel/drivers/graphics/tegra_dc/hdmi.cpp | 127 +++++++++++++++---
+ 1 file changed, 107 insertions(+), 20 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
+index 544af5f510..aed6eb31b3 100644
+--- a/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
+@@ -199,9 +199,35 @@ extern "C" status_t arm_dvc_i2c_write(uint8 address, uint8 reg,
+ #define SOR_STATE_PROTOCOL_TMDS_A	(1u << 8)
+ #define SOR_STATE_HSYNC_NEGATIVE	(1u << 12)
+ #define SOR_STATE_VSYNC_NEGATIVE	(1u << 13)
++#define HDMI_AUDIO_INFOFRAME_CTRL	0x1e
++#define HDMI_AUDIO_INFOFRAME_HEADER	0x20
+ #define HDMI_AVI_INFOFRAME_CTRL		0x23
+ #define INFOFRAME_CTRL_ENABLE		(1u << 0)
+ #define HDMI_AVI_INFOFRAME_HEADER	0x25
++#define HDMI_GENERIC_CTRL			0x2a
++#define GENERIC_CTRL_AUDIO			(1u << 16)
++#define HDMI_ACR_CTRL				0x35
++#define HDMI_ACR_0441_SUBPACK_LOW	0x38
++#define HDMI_ACR_0441_SUBPACK_HIGH	0x39
++#define ACR_SUBPACK_CTS(x)			(((uint32)(x) & 0xffffff) << 8)
++#define ACR_SUBPACK_N(x)			((uint32)(x) & 0xffffff)
++#define ACR_ENABLE					(1u << 31)
++#define HDMI_SPARE					0x4f
++#define SPARE_HW_CTS				(1u << 0)
++#define SPARE_FORCE_SW_CTS			(1u << 1)
++#define SPARE_CTS_RESET_VAL(x)		(((uint32)(x) & 0x7) << 16)
++#define HDMI_AUDIO_FS(x)			(0x82 + (x))
++#define AUDIO_FS_LOW(x)				((uint32)(x) & 0xfff)
++#define AUDIO_FS_HIGH(x)			(((uint32)(x) & 0xfff) << 16)
++#define HDMI_AUDIO_CNTRL0			0x8b
++#define AUDIO_CNTRL0_ERROR_TOLERANCE(x)	((uint32)(x) & 0xff)
++#define AUDIO_CNTRL0_SOURCE_AUTO	(0u << 20)
++#define AUDIO_CNTRL0_FRAMES_PER_BLOCK(x)	(((uint32)(x) & 0xff) << 24)
++#define HDMI_AUDIO_N				0x8c
++#define AUDIO_N_VALUE(x)			((uint32)(x) & 0xfffff)
++#define AUDIO_N_RESETF				(1u << 20)
++#define AUDIO_N_GENERATE_ALTERNATE	(1u << 24)
++#define HDMI_AUDIO_CLOCK			216000000	// Hz
+ #define HDMI_CTRL					0x44
+ #define HDMI_CTRL_REKEY(x)			((uint32)(x) & 0x7f)
+ #define HDMI_CTRL_MAX_AC_PACKET(x)	(((uint32)(x) & 0x1f) << 16)
+@@ -1003,6 +1029,79 @@ stop_display_controller()
+ //	#pragma mark - HDMI block
+ 
+ 
++/*!	Writes an infoframe (3 header bytes, a checksum and the payload) into
++	the header register at \a word and the subpack registers after it.
++*/
++static void
++write_infoframe(uint32 word, uint8* frame, size_t size)
++{
++	uint8 sum = 0;
++	frame[3] = 0;
++	for (size_t i = 0; i < size; i++)
++		sum += frame[i];
++	frame[3] = 0x100 - sum;
++
++	write_hdmi(word++, frame[0] | (frame[1] << 8) | (frame[2] << 16));
++	// subpacks of 7 bytes: 4 in the low word, 3 in the high one
++	for (size_t i = 3; i < size; i += 7) {
++		uint32 low = 0, high = 0;
++		for (size_t j = 0; j < 4 && i + j < size; j++)
++			low |= (uint32)frame[i + j] << (j * 8);
++		for (size_t j = 0; j < 3 && i + 4 + j < size; j++)
++			high |= (uint32)frame[i + 4 + j] << (j * 8);
++		write_hdmi(word++, low);
++		write_hdmi(word++, high);
++	}
++}
++
++
++/*!	Audio clock regeneration and the audio infoframe for 48 kHz stereo, so
++	that HDMI sinks find the audio clock they expect even while there is no
++	sound: N = 128 * 48000 / 1000, CTS = the pixel clock in kHz.
++*/
++static void
++setup_audio_packets()
++{
++	const uint32 n = 6144;
++	uint32 cts = sHdmi.mode.pixel_clock;
++
++	write_hdmi(HDMI_AUDIO_CNTRL0, AUDIO_CNTRL0_FRAMES_PER_BLOCK(0xc0)
++		| AUDIO_CNTRL0_ERROR_TOLERANCE(6) | AUDIO_CNTRL0_SOURCE_AUTO);
++
++	write_hdmi(HDMI_ACR_CTRL, 0);
++	write_hdmi(HDMI_AUDIO_N, AUDIO_N_RESETF | AUDIO_N_GENERATE_ALTERNATE
++		| AUDIO_N_VALUE(n - 1));
++	write_hdmi(HDMI_ACR_0441_SUBPACK_HIGH, ACR_SUBPACK_N(n) | ACR_ENABLE);
++	write_hdmi(HDMI_ACR_0441_SUBPACK_LOW, ACR_SUBPACK_CTS(cts));
++	write_hdmi(HDMI_SPARE, SPARE_HW_CTS | SPARE_FORCE_SW_CTS
++		| SPARE_CTS_RESET_VAL(1));
++	write_hdmi(HDMI_AUDIO_N, read_hdmi(HDMI_AUDIO_N) & ~AUDIO_N_RESETF);
++
++	// Limits of the measured sample rate, in audio clocks per 8 frames
++	static const uint32 kRates[] = { 32000, 44100, 48000, 88200, 96000,
++		176400, 192000 };
++	for (size_t i = 0; i < B_COUNT_OF(kRates); i++) {
++		uint32 rate = kRates[i];
++		uint32 delta = rate > 96000 ? 2 : rate > 48000 ? 6 : 9;
++		uint32 eightHalf = (8 * (uint64)HDMI_AUDIO_CLOCK) / (rate * 128);
++		write_hdmi(HDMI_AUDIO_FS(i), AUDIO_FS_LOW(eightHalf - delta)
++			| AUDIO_FS_HIGH(eightHalf + delta));
++	}
++
++	// Two channels, everything else from the stream; only the first 10
++	// bytes fit the registers
++	uint8 frame[14] = {};
++	frame[0] = 0x84;	// type
++	frame[1] = 1;		// version
++	frame[2] = 10;		// length
++	frame[4] = 1;		// channel count - 1
++	write_infoframe(HDMI_AUDIO_INFOFRAME_HEADER, frame, 10);
++	write_hdmi(HDMI_AUDIO_INFOFRAME_CTRL, INFOFRAME_CTRL_ENABLE);
++	write_hdmi(HDMI_GENERIC_CTRL, read_hdmi(HDMI_GENERIC_CTRL)
++		| GENERIC_CTRL_AUDIO);
++}
++
++
+ /*!	The AVI infoframe: RGB, 16:9 or 4:3 picture, the CEA mode if it is one. */
+ static void
+ write_avi_infoframe()
+@@ -1016,24 +1115,7 @@ write_avi_infoframe()
+ 	bool wide = mode.h_display * 3 > mode.v_display * 4 + mode.v_display / 2;
+ 	frame[5] = (wide ? 0x20 : 0x10) | 0x08;	// picture aspect, same active
+ 	frame[7] = mode.vic;
+-	uint8 sum = 0;
+-	for (size_t i = 0; i < sizeof(frame); i++)
+-		sum += frame[i];
+-	frame[3] = 0x100 - sum;
+-
+-	write_hdmi(HDMI_AVI_INFOFRAME_HEADER, frame[0] | (frame[1] << 8)
+-		| (frame[2] << 16));
+-	// two subpacks of 7 bytes: 4 in the low word, 3 in the high one
+-	uint32 word = HDMI_AVI_INFOFRAME_HEADER + 1;
+-	for (size_t i = 3; i < sizeof(frame); i += 7) {
+-		uint32 low = 0, high = 0;
+-		for (size_t j = 0; j < 4 && i + j < sizeof(frame); j++)
+-			low |= (uint32)frame[i + j] << (j * 8);
+-		for (size_t j = 0; j < 3 && i + 4 + j < sizeof(frame); j++)
+-			high |= (uint32)frame[i + 4 + j] << (j * 8);
+-		write_hdmi(word++, low);
+-		write_hdmi(word++, high);
+-	}
++	write_infoframe(HDMI_AVI_INFOFRAME_HEADER, frame, sizeof(frame));
+ 	write_hdmi(HDMI_AVI_INFOFRAME_CTRL, INFOFRAME_CTRL_ENABLE);
+ }
+ 
+@@ -1068,10 +1150,13 @@ start_hdmi(bool hdmiSink)
+ 	if (hdmiSink)
+ 		control |= HDMI_CTRL_ENABLE;
+ 	write_hdmi(HDMI_CTRL, control);
+-	if (hdmiSink)
++	if (hdmiSink) {
+ 		write_avi_infoframe();
+-	else
++		setup_audio_packets();
++	} else {
+ 		write_hdmi(HDMI_AVI_INFOFRAME_CTRL, 0);
++		write_hdmi(HDMI_AUDIO_INFOFRAME_CTRL, 0);
++	}
+ 
+ 	// TMDS settings of the Tegra 2: pre-emphasis above 27 MHz
+ 	const tmds_settings& tmds = sHdmi.tmds;
+@@ -1138,6 +1223,8 @@ static void
+ stop_hdmi()
+ {
+ 	write_hdmi(HDMI_AVI_INFOFRAME_CTRL, 0);
++	write_hdmi(HDMI_AUDIO_INFOFRAME_CTRL, 0);
++	write_hdmi(HDMI_GENERIC_CTRL, 0);
+ 	write_hdmi(HDMI_SOR_PLL0, read_hdmi(HDMI_SOR_PLL0) | SOR_PLL_PWR
+ 		| SOR_PLL_PDBG);
+ 	enable_block(CAR_CLK_OUT_ENB_H, CAR_RST_DEVICES_H, CAR_HDMI_BIT, false);

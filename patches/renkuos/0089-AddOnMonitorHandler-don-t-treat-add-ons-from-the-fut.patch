@@ -1,7 +1,7 @@
-From 82b3d799331097b9697aaf7f971611acc3be6c00 Mon Sep 17 00:00:00 2001
+From c10f0f1b7d78585da6a3ed3826b0926a605731fb Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 14:29:34 +0200
-Subject: [PATCH 089/203] AddOnMonitorHandler: don't treat add-ons from the
+Subject: [PATCH 089/270] AddOnMonitorHandler: don't treat add-ons from the
  future as unstable
 
 With the clock not set (1970), every add-on looked modified "in the future"

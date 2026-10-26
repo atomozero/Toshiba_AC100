@@ -1,7 +1,7 @@
-From a70e75ba546509c204d2c805c46e32b8e0bf8201 Mon Sep 17 00:00:00 2001
+From ce6266fd350db146b63fa72105a9aff92524baa2 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 16:21:11 +0200
-Subject: [PATCH 099/203] libroot/arm: provide __gnu_Unwind_Find_exidx() for
+Subject: [PATCH 099/270] libroot/arm: provide __gnu_Unwind_Find_exidx() for
  C++ exceptions
 
 The ARM EHABI unwinder of libgcc looks up the exception index table of the

@@ -1,7 +1,7 @@
-From 9c62cd9e8da06776c2d211106b3596febdd6ddaa Mon Sep 17 00:00:00 2001
+From f3ec586be4ea952ad2326e3b868532b2182f99ea Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Tue, 20 Oct 2026 00:23:52 +0200
-Subject: [PATCH 153/203] sdhci: controller quirks
+Subject: [PATCH 153/270] sdhci: controller quirks
 
 Some controllers deviate from the SD Host Controller specification in ways
 the driver cannot detect, for example the NVIDIA Tegra ones (see the

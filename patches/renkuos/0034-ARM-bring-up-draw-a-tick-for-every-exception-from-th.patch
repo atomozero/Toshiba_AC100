@@ -1,7 +1,7 @@
-From d33316cab86e5114f6c9cb0cc79f8dbba4adf0d9 Mon Sep 17 00:00:00 2001
+From 364fbecef60b98c83b8472428ea216779002a9f8 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 18:41:33 +0200
-Subject: [PATCH 034/203] ARM bring-up: draw a tick for every exception from
+Subject: [PATCH 034/270] ARM bring-up: draw a tick for every exception from
  the vectors (not for merging)
 
 ---

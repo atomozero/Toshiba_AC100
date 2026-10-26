@@ -1,7 +1,7 @@
-From f020f2ad0c4e1005088dff2f5bc303fb3a7ac57c Mon Sep 17 00:00:00 2001
+From e684b6031b4d780face1ae085c637cf8a7399dd9 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 18:07:36 +0200
-Subject: [PATCH 029/203] ARM bring-up: map kernel pages accessed and modified
+Subject: [PATCH 029/270] ARM bring-up: map kernel pages accessed and modified
  (experiment, not for merging)
 
 ---

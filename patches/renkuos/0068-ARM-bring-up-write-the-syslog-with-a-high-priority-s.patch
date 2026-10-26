@@ -1,7 +1,7 @@
-From 94b4e5aafad7436f73c9130b618916355ec94403 Mon Sep 17 00:00:00 2001
+From f4c0f53adb282726034e1aab49b83267111c5a3f Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 00:36:24 +0200
-Subject: [PATCH 068/203] ARM bring-up: write the syslog with a high priority
+Subject: [PATCH 068/270] ARM bring-up: write the syslog with a high priority
  so it is not starved (not for merging)
 
 ---

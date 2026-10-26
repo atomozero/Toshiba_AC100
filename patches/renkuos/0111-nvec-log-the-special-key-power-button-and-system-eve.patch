@@ -1,7 +1,7 @@
-From fdea9be48f25b21d18db9a065b67eedcfc5a96ba Mon Sep 17 00:00:00 2001
+From 7e29237e0228c142869d20eac5e9e5cae7d77033 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 19:46:00 +0200
-Subject: [PATCH 111/203] nvec: log the special key, power button and system
+Subject: [PATCH 111/270] nvec: log the special key, power button and system
  events (bring-up)
 
 Neither the power button nor the backlight keys did anything on the AC100,

@@ -1,7 +1,7 @@
-From bb639dd47d3f548996dee6f4078fc59989dfbff0 Mon Sep 17 00:00:00 2001
+From 067e3038f81b1178ac55d79097292ab2c11f7c3b Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 22:59:11 +0200
-Subject: [PATCH 122/203] ARM bring-up: count the private timer interrupts per
+Subject: [PATCH 122/270] ARM bring-up: count the private timer interrupts per
  CPU
 
 With two CPUs a busy thread on the AC100 runs three times slower than with

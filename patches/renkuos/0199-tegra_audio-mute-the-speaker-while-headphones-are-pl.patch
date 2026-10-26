@@ -1,7 +1,7 @@
-From aa81416430adfa08deef3aae83ecb1ed63f1d769 Mon Sep 17 00:00:00 2001
+From 0e37d43fdd6cd92f8fade90d91b9b4476c76e01c Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 24 Oct 2026 10:14:10 +0200
-Subject: [PATCH 199/203] tegra_audio: mute the speaker while headphones are
+Subject: [PATCH 199/270] tegra_audio: mute the speaker while headphones are
  plugged in
 
 The jack switch of the AC100 is on GPIO W2 (nvidia,hp-det-gpios), high

@@ -1,7 +1,7 @@
-From dc6147cf22cc5581ce68457823bbe94378450061 Mon Sep 17 00:00:00 2001
+From f72bd101cfa57591447bce99c1c566df8c6fe1f4 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Tue, 20 Oct 2026 01:13:50 +0200
-Subject: [PATCH 160/203] ARM: link libroot and applications against the
+Subject: [PATCH 160/270] ARM: link libroot and applications against the
  cross-compiler libsupc++ and libgcc
 
 libroot embeds libsupc++.a, and every image links the static libgcc.a, from

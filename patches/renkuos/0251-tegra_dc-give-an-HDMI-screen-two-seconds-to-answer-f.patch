@@ -1,0 +1,35 @@
+From fe9ba0bea7c135155d84665c2ce268d1bda16ee7 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 26 Oct 2026 14:15:10 +0100
+Subject: [PATCH 251/270] tegra_dc: give an HDMI screen two seconds to answer
+ for its EDID
+
+A television did not acknowledge its DDC address within the first
+three tenths of a second after the hot plug line rose.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
+index 5810c31ef2..204714f522 100644
+--- a/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
+@@ -1123,12 +1123,13 @@ connect()
+ 		"hdmi_vco_cap", "1", "1"), NULL, 0), 0xfu);
+ 	unload_driver_settings(settings);
+ 
+-	// The screen may need a moment after the hot plug line rises
++	// The screen may need a while after the hot plug line rises before it
++	// answers on the DDC bus (a television took more than a second)
+ 	uint8 edid[EDID_SIZE];
+ 	uint32 edidSize = 0;
+ 	setup_ddc();
+-	for (int32 attempt = 0; attempt < 3; attempt++) {
+-		snooze(100000);
++	for (int32 attempt = 0; attempt < 10; attempt++) {
++		snooze(200000);
+ 		status = read_edid(edid, &edidSize);
+ 		if (status == B_OK)
+ 			break;

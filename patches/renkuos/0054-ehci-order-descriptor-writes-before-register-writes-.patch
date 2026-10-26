@@ -1,7 +1,7 @@
-From db9055442a0687363c995bbac1a9d5ebb2e835e8 Mon Sep 17 00:00:00 2001
+From 7a7bdcd2f993a0d01c97295e5615860808cbd911 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 22:35:40 +0200
-Subject: [PATCH 054/203] ehci: order descriptor writes before register writes
+Subject: [PATCH 054/270] ehci: order descriptor writes before register writes
  on ARM
 
 Make sure the descriptors written to (non-cacheable, normal) memory have

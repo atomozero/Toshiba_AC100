@@ -1,7 +1,7 @@
-From 032544afa5a0667a8db97c75f8be13aa85125320 Mon Sep 17 00:00:00 2001
+From 028f8c69baacdba00149117b2af7b97a4f3e028f Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Fri, 23 Oct 2026 19:01:44 +0200
-Subject: [PATCH 184/203] ARM bring-up: name the syscall and the user pc of a
+Subject: [PATCH 184/270] ARM bring-up: name the syscall and the user pc of a
  bad address (not for merging)
 
 ---

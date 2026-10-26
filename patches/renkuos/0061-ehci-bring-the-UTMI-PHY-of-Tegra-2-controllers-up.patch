@@ -1,7 +1,7 @@
-From 134eab357ae00d34c3413ada09255cee03ec7601 Mon Sep 17 00:00:00 2001
+From 82146512b0c0f6f82c6bd103fb2b891f6f1db3ee Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 23:28:11 +0200
-Subject: [PATCH 061/203] ehci: bring the UTMI PHY of Tegra 2 controllers up
+Subject: [PATCH 061/270] ehci: bring the UTMI PHY of Tegra 2 controllers up
 
 The boot firmware may leave a Tegra 2 USB controller in a state where
 its UTMI PHY clock is not valid, and accessing the controller then

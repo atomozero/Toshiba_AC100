@@ -1,7 +1,7 @@
-From 9da1066c0d7ee71f38d0fe8d7b6bae86fe5e9a67 Mon Sep 17 00:00:00 2001
+From 298a16b6e47a5e9121eb677efa398cbd55a0f6bc Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Mon, 19 Oct 2026 23:13:38 +0200
-Subject: [PATCH 149/203] ARM bring-up: log new hub ports; ask a device that
+Subject: [PATCH 149/270] ARM bring-up: log new hub ports; ask a device that
  rejects its address for its descriptor first, like Linux (not for merging)
 
 ---

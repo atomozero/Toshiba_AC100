@@ -1,7 +1,7 @@
-From e2f693a46a5a5b1258c11ca59091266e297cbfe6 Mon Sep 17 00:00:00 2001
+From 52aa0dbad99644e8fffb041e9451f8d692fa71fb Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 12:01:36 +0200
-Subject: [PATCH 005/203] kernel/arm: fix user TLB invalidation and make ARMv7
+Subject: [PATCH 005/270] kernel/arm: fix user TLB invalidation and make ARMv7
  atomics lock-free
 
 - arch_cpu_user_tlb_invalidate() was empty (#warning WRITEME), so whenever

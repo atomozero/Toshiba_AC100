@@ -1,7 +1,7 @@
-From 73a9105f0986a81f134646396fb2878a951ed8b3 Mon Sep 17 00:00:00 2001
+From b6a856593b3e78945a0d2d2b4920dca58a969d81 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Tue, 20 Oct 2026 18:39:03 +0200
-Subject: [PATCH 167/203] media: build the unaligned copies with
+Subject: [PATCH 167/270] media: build the unaligned copies with
  -Werror=class-memaccess
 
 x86_64 builds the media kit and server with warnings as errors, and gcc

@@ -1,7 +1,7 @@
-From 0ea47aaecc86ecb4d09783ff4f3c6525426d6696 Mon Sep 17 00:00:00 2001
+From adde74fdcf7bb9639a7cdcf4f03f988467772e10 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 24 Oct 2026 10:34:32 +0200
-Subject: [PATCH 200/203] sdhci: gather the physical ranges of a request in one
+Subject: [PATCH 200/270] sdhci: gather the physical ranges of a request in one
  ADMA2 transfer
 
 The controllers announced a single DMA segment per operation, so a read

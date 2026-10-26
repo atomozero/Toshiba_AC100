@@ -1,7 +1,7 @@
-From ca9e15b0724f4b82b6ea2e274e3963a67f495bc8 Mon Sep 17 00:00:00 2001
+From a63aed7663ad07863396ad902ece593d47fd5441 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 15:38:54 +0200
-Subject: [PATCH 098/203] kernel/arm: keep r1 and a sane CPSR when returning
+Subject: [PATCH 098/270] kernel/arm: keep r1 and a sane CPSR when returning
  from a signal handler
 
 arch_restore_signal_frame() only returned r0, and the syscall exit writes

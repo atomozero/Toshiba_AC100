@@ -1,0 +1,61 @@
+From 18fb3236ebc3dba3bb3e1482c6bb18495032a603 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 25 Oct 2026 19:49:33 +0100
+Subject: [PATCH 227/270] ARM bring-up: log the first eMMC reads and the reads
+ at its end, with their data (not for merging)
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../kernel/drivers/disk/mmc/mmc_disk.cpp      | 32 +++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
+index e3c3f742c8..10314e75f4 100644
+--- a/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
++++ b/src/add-ons/kernel/drivers/disk/mmc/mmc_disk.cpp
+@@ -25,6 +25,9 @@
+ #include <drivers/driver_settings.h>
+ #include <kernel/OS.h>
+ #include <util/fs_trim_support.h>
++#include <vm/vm.h>
++
++#include <algorithm>
+ 
+ #include <AutoDeleter.h>
+ 
+@@ -293,6 +296,35 @@ mmc_disk_execute_iorequest(void* data, IOOperation* operation)
+ 		return error;
+ 	}
+ 
++	{
++		// AC100 bring-up: what the first reads asked for and got
++		static int32 sReadLogCount = 0;
++		static int32 sEndReadLogCount = 0;
++		bool atEnd = operation->Offset() >= 16000000000LL;
++		if (!operation->IsWrite()
++			&& ((!atEnd && atomic_add(&sReadLogCount, 1) < 60)
++				|| (atEnd && atomic_add(&sEndReadLogCount, 1) < 200))) {
++			uint8 head[16];
++			memset(head, 0, sizeof(head));
++			const generic_io_vec* vecs = operation->Vecs();
++			if (operation->VecCount() > 0) {
++				vm_memcpy_from_physical(head, vecs[0].base,
++					std::min((generic_size_t)sizeof(head), vecs[0].length),
++					false);
++			}
++			dprintf("AC100: read %" B_PRIdOFF " +%" B_PRIuGENADDR " (%s, %"
++				B_PRIu32 " vecs, vec0 %#" B_PRIxPHYSADDR "): %02x %02x %02x "
++				"%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
++				"%02x\n", operation->Offset(), operation->Length(),
++				(info->flags & kIoCommandOffsetAsSectors) != 0 ? "sectors"
++					: "bytes", operation->VecCount(),
++				operation->VecCount() > 0 ? (phys_addr_t)vecs[0].base : 0,
++				head[0], head[1], head[2], head[3], head[4], head[5], head[6],
++				head[7], head[8], head[9], head[10], head[11], head[12],
++				head[13], head[14], head[15]);
++		}
++	}
++
+ 	info->scheduler->OperationCompleted(operation, B_OK, operation->Length());
+ 	return B_OK;
+ }

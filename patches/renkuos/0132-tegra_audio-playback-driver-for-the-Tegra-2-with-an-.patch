@@ -1,7 +1,7 @@
-From 75b7d1894725daaaf56ed0672d6163c4eba9b71b Mon Sep 17 00:00:00 2001
+From 35d225843e0aff623c70c22dfa32f17ad2195fcf Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Mon, 19 Oct 2026 10:06:54 +0200
-Subject: [PATCH 132/203] tegra_audio: playback driver for the Tegra 2 with an
+Subject: [PATCH 132/270] tegra_audio: playback driver for the Tegra 2 with an
  ALC5632 codec (AC100)
 
 A multi_audio driver for the audio of the Toshiba AC100: PLL A gives the
@@ -28,10 +28,10 @@ tone at start.
  create mode 100644 src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
 
 diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
-index 0b70bed42e..9f6a19fa5e 100644
+index b2392b104e..e1c4f4c0fd 100644
 --- a/build/jam/packages/Haiku
 +++ b/build/jam/packages/Haiku
-@@ -155,6 +155,7 @@ AddNewDriversToPackage display :
+@@ -157,6 +157,7 @@ AddNewDriversToPackage display :
  #	display_adapter@x86
  	;
  AddNewDriversToPackage audio hmulti :

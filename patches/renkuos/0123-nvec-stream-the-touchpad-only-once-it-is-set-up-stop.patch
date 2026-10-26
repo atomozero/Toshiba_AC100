@@ -1,7 +1,7 @@
-From bbb019390e96fb88112c9539976b46fbcc6223a1 Mon Sep 17 00:00:00 2001
+From bc4b21cc1a16f68799758f18e450606a4c54f612 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 23:12:41 +0200
-Subject: [PATCH 123/203] nvec: stream the touchpad only once it is set up,
+Subject: [PATCH 123/270] nvec: stream the touchpad only once it is set up,
  stop it at power off
 
 The EC keeps the touchpad's state while the machine is off. Asking it to

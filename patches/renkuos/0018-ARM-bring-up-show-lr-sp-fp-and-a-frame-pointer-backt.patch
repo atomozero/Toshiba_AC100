@@ -1,7 +1,7 @@
-From f7517ea1896619d5ef6f59163279962dbe6ef9b1 Mon Sep 17 00:00:00 2001
+From aeeca3f5baedda958ac7381f0458d7ca4304809c Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 16:25:55 +0200
-Subject: [PATCH 018/203] ARM bring-up: show lr, sp, fp and a frame pointer
+Subject: [PATCH 018/270] ARM bring-up: show lr, sp, fp and a frame pointer
  backtrace on early faults (not for merging)
 
 ---

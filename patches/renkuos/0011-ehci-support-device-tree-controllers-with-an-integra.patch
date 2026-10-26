@@ -1,7 +1,7 @@
-From 1740637f297ea2637dd7d936d5a96977d5cc2343 Mon Sep 17 00:00:00 2001
+From 68aba4beebf5791edf89d9c93c7689d3fd6cc1b3 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 14:19:34 +0200
-Subject: [PATCH 011/203] ehci: support device tree controllers with an
+Subject: [PATCH 011/270] ehci: support device tree controllers with an
  integrated TT (Tegra 2)
 
 - Split the PCI specific parts (AMD workaround, BAR mapping, BIOS

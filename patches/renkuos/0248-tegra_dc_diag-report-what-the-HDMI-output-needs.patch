@@ -1,0 +1,110 @@
+From e75e6d097da689365e051aca81da85594390d72b Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 26 Oct 2026 07:28:26 +0100
+Subject: [PATCH 248/270] tegra_dc_diag: report what the HDMI output needs
+
+The TPS6586x supply enables and voltages, PLL_D, the pin multiplexer
+and the GPIO port of the hot plug line, all read only.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../misc/tegra_dc_diag/tegra_dc_diag.cpp      | 79 +++++++++++++++++++
+ 1 file changed, 79 insertions(+)
+
+diff --git a/src/add-ons/kernel/drivers/misc/tegra_dc_diag/tegra_dc_diag.cpp b/src/add-ons/kernel/drivers/misc/tegra_dc_diag/tegra_dc_diag.cpp
+index 018cbcfa22..eca552a0a7 100644
+--- a/src/add-ons/kernel/drivers/misc/tegra_dc_diag/tegra_dc_diag.cpp
++++ b/src/add-ons/kernel/drivers/misc/tegra_dc_diag/tegra_dc_diag.cpp
+@@ -286,6 +286,84 @@ report_dc(char* buffer, size_t size, size_t length, const char* name,
+ }
+ 
+ 
++extern "C" status_t arm_dvc_i2c_read(uint8 address, uint8 reg, uint8* data,
++	size_t length);
++
++
++/*!	What HDMI needs, read only: the TPS6586x supplies (LDO7 = AVDD_HDMI
++	3.3 V, LDO8 = AVDD_HDMI_PLL 1.8 V), PLL_D, the pin multiplexer, and the
++	GPIO bank with the hot plug detect pin (N7).
++*/
++static size_t
++report_hdmi(char* buffer, size_t size, size_t length)
++{
++	static const uint8 kPmicRegisters[] = { 0x10, 0x11, 0x12, 0x13, 0x14,
++		0x41, 0x42, 0x43, 0x44, 0x45, 0x46 };
++	length = append(buffer, size, length, "pmic:");
++	for (size_t i = 0; i < B_COUNT_OF(kPmicRegisters); i++) {
++		uint8 value;
++		if (arm_dvc_i2c_read(0x34, kPmicRegisters[i], &value, 1) == B_OK) {
++			length = append(buffer, size, length, " %02x=%02x",
++				kPmicRegisters[i], value);
++		} else {
++			length = append(buffer, size, length, " %02x=?",
++				kPmicRegisters[i]);
++		}
++	}
++	length = append(buffer, size, length, "\n");
++
++	area_id area;
++	volatile uint32* car = map_registers("tegra car", TEGRA20_CAR_BASE,
++		B_PAGE_SIZE, &area);
++	if (car != NULL) {
++		length = append(buffer, size, length, "car: RST_L %08" B_PRIx32
++			" RST_H %08" B_PRIx32 " ENB_L %08" B_PRIx32 " ENB_H %08" B_PRIx32
++			" PLLD_BASE %08" B_PRIx32 " PLLD_OUT %08" B_PRIx32 " PLLD_MISC %08"
++			B_PRIx32 " OSC_CTRL %08" B_PRIx32 "\n", car[CAR_RST_DEVICES_L / 4],
++			car[CAR_RST_DEVICES_H / 4], car[CAR_CLK_OUT_ENB_L / 4],
++			car[CAR_CLK_OUT_ENB_H / 4], car[0xd0 / 4], car[0xd4 / 4],
++			car[0xdc / 4], car[0x50 / 4]);
++		delete_area(area);
++	}
++
++	volatile uint32* misc = map_registers("tegra apb misc",
++		0x70000000, B_PAGE_SIZE, &area);
++	if (misc != NULL) {
++		length = append(buffer, size, length, "tristate:");
++		for (uint32 offset = 0x14; offset <= 0x20; offset += 4) {
++			length = append(buffer, size, length, " %08" B_PRIx32,
++				misc[offset / 4]);
++		}
++		length = append(buffer, size, length, "\npinmux:");
++		for (uint32 offset = 0x80; offset <= 0x9c; offset += 4) {
++			length = append(buffer, size, length, " %08" B_PRIx32,
++				misc[offset / 4]);
++		}
++		length = append(buffer, size, length, "\npull:");
++		for (uint32 offset = 0xa0; offset <= 0xb0; offset += 4) {
++			length = append(buffer, size, length, " %08" B_PRIx32,
++				misc[offset / 4]);
++		}
++		length = append(buffer, size, length, "\n");
++		delete_area(area);
++	}
++
++	// GPIO ports M..P are bank 3: CNF, OE, OUT, IN at 0x00/0x10/0x20/0x30
++	volatile uint32* gpio = map_registers("tegra gpio", 0x6000d000,
++		B_PAGE_SIZE, &area);
++	if (gpio != NULL) {
++		volatile uint32* bank = gpio + 0x180 / 4;
++		length = append(buffer, size, length, "gpio port N: CNF %02" B_PRIx32
++			" OE %02" B_PRIx32 " OUT %02" B_PRIx32 " IN %02" B_PRIx32
++			" (hot plug = bit 7)\n", bank[0x04 / 4] & 0xff,
++			bank[0x14 / 4] & 0xff, bank[0x24 / 4] & 0xff,
++			bank[0x34 / 4] & 0xff);
++		delete_area(area);
++	}
++	return length;
++}
++
++
+ static size_t
+ report_memory(char* buffer, size_t size, size_t length)
+ {
+@@ -404,6 +482,7 @@ diag_read(void* cookie, off_t position, void* buffer, size_t* _length)
+ 		textLength = report_dc(text, kSize, textLength, "DC B",
+ 			TEGRA20_DC_B_BASE);
+ 	textLength = report_memory(text, kSize, textLength);
++	textLength = report_hdmi(text, kSize, textLength);
+ 	if (textLength >= kSize)
+ 		textLength = kSize - 1;
+ 

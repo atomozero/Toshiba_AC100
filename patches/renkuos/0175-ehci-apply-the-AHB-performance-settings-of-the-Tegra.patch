@@ -1,7 +1,7 @@
-From 98510b6443d63864950831794e1aae7d709a2b28 Mon Sep 17 00:00:00 2001
+From 99ac714c4c68e89d95e2310475e1dc9a62210082 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Tue, 20 Oct 2026 21:51:04 +0200
-Subject: [PATCH 175/203] ehci: apply the AHB performance settings of the Tegra
+Subject: [PATCH 175/270] ehci: apply the AHB performance settings of the Tegra
  2 TRM
 
 The Tegra 2 TRM (26.3.6, "Performance Settings for USB Controllers")

@@ -1,7 +1,7 @@
-From 14ce6df75868231a880363f8058254e93f1efb9f Mon Sep 17 00:00:00 2001
+From fa365bf3f2f45fd7373e4fa751e0b2d95b81f8f5 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 16:08:03 +0200
-Subject: [PATCH 016/203] ARM bring-up: show marker values as hex digits (not
+Subject: [PATCH 016/270] ARM bring-up: show marker values as hex digits (not
  for merging)
 
 ---

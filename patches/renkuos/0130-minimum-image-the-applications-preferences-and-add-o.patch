@@ -1,7 +1,7 @@
-From 6dafffe61d461c337732b9e4cbc70da1a38befe1 Mon Sep 17 00:00:00 2001
+From cd9970e97e0e3b48c6260a09b8f6e41537925685 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Mon, 19 Oct 2026 07:45:43 +0200
-Subject: [PATCH 130/203] minimum image: the applications, preferences and
+Subject: [PATCH 130/270] minimum image: the applications, preferences and
  add-ons of the regular image on ARM
 
 Add the applications, preferences, demos, servers, translators, media and
@@ -11,13 +11,13 @@ MidiPlayer, PatchBay; WonderBrushTranslator). Media builds the MIDI settings
 in when libmidi is not available, Cortex gets the uint32 casts the ARM
 compiler needs.
 ---
- build/jam/images/definitions/minimum          | 155 ++++++++++++++++++
+ build/jam/images/definitions/minimum          | 154 ++++++++++++++++++
  .../Persistence/Wrappers/MediaFormatIO.cpp    |   6 +-
  src/preferences/media/Jamfile                 |  13 +-
- 3 files changed, 170 insertions(+), 4 deletions(-)
+ 3 files changed, 169 insertions(+), 4 deletions(-)
 
 diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
-index 293203516e..8fded281fb 100644
+index 597883423d..2117eed1c1 100644
 --- a/build/jam/images/definitions/minimum
 +++ b/build/jam/images/definitions/minimum
 @@ -214,8 +214,10 @@ rule HaikuImageGetSystemLibs
@@ -31,11 +31,10 @@ index 293203516e..8fded281fb 100644
  			libmedia.so@arm
  			libmidi2.so@arm
  			libnetwork.so
-@@ -464,3 +466,156 @@ for repository in $(HAIKU_REPOSITORIES) {
- 	AddFilesToHaikuImage system cache package-repositories
- 		: $(cache) : $(repository:G=) ;
+@@ -477,3 +479,155 @@ if $(HAIKU_IS_BOOTSTRAP) != 1 {
+ 	AddFilesToHaikuImage system settings package-repositories
+ 		: $(thirdPartyRepositoryConfigs) ;
  }
-+
 +
 +# The Toshiba AC100 (ARM) gets the applications of the regular image that can
 +# be built for it: nothing needing OpenGL or ffmpeg, and the image translators

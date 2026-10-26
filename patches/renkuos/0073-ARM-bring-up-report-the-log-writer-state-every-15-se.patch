@@ -1,7 +1,7 @@
-From aba3c0266cb255b8fa4a65b5d4f315dcb5b16666 Mon Sep 17 00:00:00 2001
+From 42b487f6f9bb58c8ea49614014ac560f45bd79cf Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 09:49:18 +0200
-Subject: [PATCH 073/203] ARM bring-up: report the log writer state every 15
+Subject: [PATCH 073/270] ARM bring-up: report the log writer state every 15
  seconds, map MMC buses to controllers (not for merging)
 
 ---

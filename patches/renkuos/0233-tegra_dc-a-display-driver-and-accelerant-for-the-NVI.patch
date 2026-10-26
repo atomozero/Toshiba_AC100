@@ -1,0 +1,1275 @@
+From 00452a025974825d3adfaba9e29eaa225ab7e27c Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 25 Oct 2026 21:24:09 +0100
+Subject: [PATCH 233/270] tegra_dc: a display driver and accelerant for the
+ NVIDIA Tegra 2
+
+A first driver for the display controller of the Tegra 2 (Tegra20), as in
+the Toshiba AC100. It keeps what the firmware set up (clocks, pins, panel
+timing, window A scanning out of the memory it reserved) and offers the
+panel at 32 as well as 16 bits per pixel, changing only the pixel format
+and line stride of window A through its shadowed registers. The vertical
+blank interrupt releases the retrace semaphore.
+
+The scanout memory is mapped write combining as device memory, so that
+the clone in app_server gets the same memory type. The driver only
+publishes its device when it finds the display as expected; otherwise
+app_server keeps using the frame buffer driver.
+
+Register descriptions come from the Tegra 2 Technical Reference Manual,
+chapter 29.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../private/graphics/tegra_dc/tegra_dc_info.h |  52 ++
+ src/add-ons/accelerants/Jamfile               |   1 +
+ src/add-ons/accelerants/tegra_dc/Jamfile      |  13 +
+ .../accelerants/tegra_dc/accelerant.cpp       | 172 +++++
+ src/add-ons/accelerants/tegra_dc/accelerant.h |  32 +
+ .../accelerants/tegra_dc/accelerant_protos.h  |  43 ++
+ src/add-ons/accelerants/tegra_dc/hooks.cpp    |  52 ++
+ src/add-ons/accelerants/tegra_dc/mode.cpp     | 156 +++++
+ src/add-ons/kernel/drivers/graphics/Jamfile   |   1 +
+ .../kernel/drivers/graphics/tegra_dc/Jamfile  |  12 +
+ .../drivers/graphics/tegra_dc/tegra_dc.cpp    | 620 ++++++++++++++++++
+ 11 files changed, 1154 insertions(+)
+ create mode 100644 headers/private/graphics/tegra_dc/tegra_dc_info.h
+ create mode 100644 src/add-ons/accelerants/tegra_dc/Jamfile
+ create mode 100644 src/add-ons/accelerants/tegra_dc/accelerant.cpp
+ create mode 100644 src/add-ons/accelerants/tegra_dc/accelerant.h
+ create mode 100644 src/add-ons/accelerants/tegra_dc/accelerant_protos.h
+ create mode 100644 src/add-ons/accelerants/tegra_dc/hooks.cpp
+ create mode 100644 src/add-ons/accelerants/tegra_dc/mode.cpp
+ create mode 100644 src/add-ons/kernel/drivers/graphics/tegra_dc/Jamfile
+ create mode 100644 src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
+
+diff --git a/headers/private/graphics/tegra_dc/tegra_dc_info.h b/headers/private/graphics/tegra_dc/tegra_dc_info.h
+new file mode 100644
+index 0000000000..5aacc49b3a
+--- /dev/null
++++ b/headers/private/graphics/tegra_dc/tegra_dc_info.h
+@@ -0,0 +1,52 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef TEGRA_DC_INFO_H
++#define TEGRA_DC_INFO_H
++
++
++#include <Accelerant.h>
++#include <Drivers.h>
++#include <edid.h>
++
++
++#define TEGRA_DC_ACCELERANT_NAME	"tegra_dc.accelerant"
++#define TEGRA_DC_DEVICE_NAME		"graphics/tegra_dc"
++
++
++/*!	Shared between the kernel driver and the accelerant (cloned read-write
++	by it). The kernel driver owns the hardware: the accelerant only reads
++	this and asks for changes through the ioctls below.
++*/
++struct tegra_dc_shared_info {
++	area_id			mode_list_area;		// created by the primary accelerant
++	uint32			mode_count;
++
++	display_mode	current_mode;
++	uint32			bytes_per_row;
++
++	display_timing	timing;				// as the firmware set the panel up
++	uint32			frame_buffer_size;	// bytes mapped for scanout
++
++	sem_id			vblank_sem;
++	uint32			vblank_count;		// vertical blank interrupts so far
++
++	edid1_info		edid_info;
++	bool			has_edid;
++};
++
++
++enum {
++	TEGRA_DC_GET_PRIVATE_DATA = B_DEVICE_OP_CODES_END + 1,
++		// area_id of the shared info
++	TEGRA_DC_GET_DEVICE_NAME,
++		// char[B_PATH_NAME_LENGTH]
++	TEGRA_DC_CLONE_FRAME_BUFFER,
++		// area_info of a clone of the scanout memory in the caller
++	TEGRA_DC_SET_DISPLAY_MODE,
++		// display_mode
++};
++
++
++#endif	// TEGRA_DC_INFO_H
+diff --git a/src/add-ons/accelerants/Jamfile b/src/add-ons/accelerants/Jamfile
+index 9b6a99e650..a46e4e18d6 100644
+--- a/src/add-ons/accelerants/Jamfile
++++ b/src/add-ons/accelerants/Jamfile
+@@ -5,6 +5,7 @@ SubInclude HAIKU_TOP src add-ons accelerants ati ;
+ SubInclude HAIKU_TOP src add-ons accelerants common ;
+ SubInclude HAIKU_TOP src add-ons accelerants et6x00 ;
+ SubInclude HAIKU_TOP src add-ons accelerants framebuffer ;
++SubInclude HAIKU_TOP src add-ons accelerants tegra_dc ;
+ SubInclude HAIKU_TOP src add-ons accelerants intel_810 ;
+ SubInclude HAIKU_TOP src add-ons accelerants intel_extreme ;
+ SubInclude HAIKU_TOP src add-ons accelerants matrox ;
+diff --git a/src/add-ons/accelerants/tegra_dc/Jamfile b/src/add-ons/accelerants/tegra_dc/Jamfile
+new file mode 100644
+index 0000000000..2c3b3676e8
+--- /dev/null
++++ b/src/add-ons/accelerants/tegra_dc/Jamfile
+@@ -0,0 +1,13 @@
++SubDir HAIKU_TOP src add-ons accelerants tegra_dc ;
++
++UsePrivateHeaders graphics ;
++UsePrivateHeaders [ FDirName graphics tegra_dc ] ;
++UsePrivateHeaders [ FDirName graphics common ] ;
++UsePrivateHeaders shared ;
++
++Addon tegra_dc.accelerant :
++	accelerant.cpp
++	hooks.cpp
++	mode.cpp
++	: libaccelerantscommon.a
++;
+diff --git a/src/add-ons/accelerants/tegra_dc/accelerant.cpp b/src/add-ons/accelerants/tegra_dc/accelerant.cpp
+new file mode 100644
+index 0000000000..a97df0adeb
+--- /dev/null
++++ b/src/add-ons/accelerants/tegra_dc/accelerant.cpp
+@@ -0,0 +1,172 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++/*!	Accelerant for the display controller of the NVIDIA Tegra 2. The kernel
++	driver owns the hardware; the accelerant offers its modes to app_server
++	and gives it a clone of the scanout memory.
++*/
++
++
++#include "accelerant.h"
++#include "accelerant_protos.h"
++
++#include <errno.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <AutoDeleterOS.h>
++
++
++accelerant_info* gInfo;
++
++
++/*!	Common part of the primary accelerant and of its clones. */
++static status_t
++init_common(int device, bool isClone)
++{
++	gInfo = (accelerant_info*)calloc(1, sizeof(accelerant_info));
++	if (gInfo == NULL)
++		return B_NO_MEMORY;
++	MemoryDeleter infoDeleter(gInfo);
++
++	gInfo->is_clone = isClone;
++	gInfo->device = device;
++	gInfo->mode_list_area = -1;
++	gInfo->frame_buffer_area = -1;
++
++	area_id sharedArea;
++	if (ioctl(device, TEGRA_DC_GET_PRIVATE_DATA, &sharedArea,
++			sizeof(area_id)) != 0) {
++		return B_ERROR;
++	}
++
++	AreaDeleter sharedDeleter(clone_area("tegra_dc shared info",
++		(void**)&gInfo->shared_info, B_ANY_ADDRESS,
++		B_READ_AREA | B_WRITE_AREA, sharedArea));
++	status_t status = gInfo->shared_info_area = sharedDeleter.Get();
++	if (status < B_OK)
++		return status;
++
++	infoDeleter.Detach();
++	sharedDeleter.Detach();
++	return B_OK;
++}
++
++
++static void
++uninit_common()
++{
++	delete_area(gInfo->frame_buffer_area);
++	delete_area(gInfo->shared_info_area);
++
++	// only a clone opened the device itself
++	if (gInfo->is_clone)
++		close(gInfo->device);
++
++	free(gInfo);
++	gInfo = NULL;
++}
++
++
++//	#pragma mark - public accelerant functions
++
++
++status_t
++tegra_dc_init_accelerant(int device)
++{
++	status_t status = init_common(device, false);
++	if (status != B_OK)
++		return status;
++
++	status = create_mode_list();
++	if (status != B_OK) {
++		uninit_common();
++		return status;
++	}
++
++	area_info info;
++	if (ioctl(device, TEGRA_DC_CLONE_FRAME_BUFFER, &info, sizeof(info)) != 0) {
++		status = errno;
++		uninit_common();
++		return status;
++	}
++	gInfo->frame_buffer_area = info.area;
++	gInfo->frame_buffer = info.address;
++	return B_OK;
++}
++
++
++ssize_t
++tegra_dc_accelerant_clone_info_size(void)
++{
++	return B_PATH_NAME_LENGTH;
++}
++
++
++void
++tegra_dc_get_accelerant_clone_info(void* info)
++{
++	ioctl(gInfo->device, TEGRA_DC_GET_DEVICE_NAME, info, B_PATH_NAME_LENGTH);
++}
++
++
++status_t
++tegra_dc_clone_accelerant(void* info)
++{
++	char path[B_PATH_NAME_LENGTH];
++	strlcpy(path, "/dev/", sizeof(path));
++	strlcat(path, (const char*)info, sizeof(path));
++
++	int device = open(path, B_READ_WRITE);
++	if (device < 0)
++		return errno;
++
++	status_t status = init_common(device, true);
++	if (status != B_OK) {
++		close(device);
++		return status;
++	}
++
++	gInfo->mode_list_area = clone_area("tegra_dc cloned modes",
++		(void**)&gInfo->mode_list, B_ANY_ADDRESS, B_READ_AREA,
++		gInfo->shared_info->mode_list_area);
++	if (gInfo->mode_list_area < B_OK) {
++		status = gInfo->mode_list_area;
++		uninit_common();
++		return status;
++	}
++	return B_OK;
++}
++
++
++void
++tegra_dc_uninit_accelerant(void)
++{
++	delete_area(gInfo->mode_list_area);
++	uninit_common();
++}
++
++
++status_t
++tegra_dc_get_accelerant_device_info(accelerant_device_info* info)
++{
++	info->version = B_ACCELERANT_VERSION;
++	strlcpy(info->name, "NVIDIA Tegra 2 display controller",
++		sizeof(info->name));
++	strlcpy(info->chipset, "Tegra20 DC", sizeof(info->chipset));
++	strlcpy(info->serial_no, "None", sizeof(info->serial_no));
++	info->memory = gInfo->shared_info->frame_buffer_size;
++	info->dac_speed = gInfo->shared_info->timing.pixel_clock / 1000;
++	return B_OK;
++}
++
++
++sem_id
++tegra_dc_accelerant_retrace_semaphore(void)
++{
++	return gInfo->shared_info->vblank_sem;
++}
+diff --git a/src/add-ons/accelerants/tegra_dc/accelerant.h b/src/add-ons/accelerants/tegra_dc/accelerant.h
+new file mode 100644
+index 0000000000..10ed145c13
+--- /dev/null
++++ b/src/add-ons/accelerants/tegra_dc/accelerant.h
+@@ -0,0 +1,32 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef TEGRA_DC_ACCELERANT_H
++#define TEGRA_DC_ACCELERANT_H
++
++
++#include "tegra_dc_info.h"
++
++
++struct accelerant_info {
++	int					device;
++	bool				is_clone;
++
++	area_id				shared_info_area;
++	tegra_dc_shared_info* shared_info;
++
++	area_id				mode_list_area;
++	display_mode*		mode_list;
++
++	area_id				frame_buffer_area;
++		// clone of the scanout memory
++	void*				frame_buffer;
++};
++
++extern accelerant_info* gInfo;
++
++status_t create_mode_list();
++
++
++#endif	// TEGRA_DC_ACCELERANT_H
+diff --git a/src/add-ons/accelerants/tegra_dc/accelerant_protos.h b/src/add-ons/accelerants/tegra_dc/accelerant_protos.h
+new file mode 100644
+index 0000000000..14bd171c90
+--- /dev/null
++++ b/src/add-ons/accelerants/tegra_dc/accelerant_protos.h
+@@ -0,0 +1,43 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef TEGRA_DC_ACCELERANT_PROTOS_H
++#define TEGRA_DC_ACCELERANT_PROTOS_H
++
++
++#include <Accelerant.h>
++
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// general
++status_t tegra_dc_init_accelerant(int fd);
++ssize_t tegra_dc_accelerant_clone_info_size(void);
++void tegra_dc_get_accelerant_clone_info(void* data);
++status_t tegra_dc_clone_accelerant(void* data);
++void tegra_dc_uninit_accelerant(void);
++status_t tegra_dc_get_accelerant_device_info(accelerant_device_info* info);
++sem_id tegra_dc_accelerant_retrace_semaphore(void);
++
++// modes
++uint32 tegra_dc_accelerant_mode_count(void);
++status_t tegra_dc_get_mode_list(display_mode* modes);
++status_t tegra_dc_propose_display_mode(display_mode* target,
++	const display_mode* low, const display_mode* high);
++status_t tegra_dc_set_display_mode(display_mode* mode);
++status_t tegra_dc_get_display_mode(display_mode* currentMode);
++status_t tegra_dc_get_preferred_display_mode(display_mode* preferredMode);
++status_t tegra_dc_get_edid_info(void* info, size_t size, uint32* _version);
++status_t tegra_dc_get_frame_buffer_config(frame_buffer_config* config);
++status_t tegra_dc_get_pixel_clock_limits(display_mode* mode, uint32* _low,
++	uint32* _high);
++
++#ifdef __cplusplus
++}
++#endif
++
++
++#endif	// TEGRA_DC_ACCELERANT_PROTOS_H
+diff --git a/src/add-ons/accelerants/tegra_dc/hooks.cpp b/src/add-ons/accelerants/tegra_dc/hooks.cpp
+new file mode 100644
+index 0000000000..60caafa6a2
+--- /dev/null
++++ b/src/add-ons/accelerants/tegra_dc/hooks.cpp
+@@ -0,0 +1,52 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "accelerant_protos.h"
++
++
++extern "C" void*
++get_accelerant_hook(uint32 feature, void* data)
++{
++	switch (feature) {
++		// general
++		case B_INIT_ACCELERANT:
++			return (void*)tegra_dc_init_accelerant;
++		case B_UNINIT_ACCELERANT:
++			return (void*)tegra_dc_uninit_accelerant;
++		case B_CLONE_ACCELERANT:
++			return (void*)tegra_dc_clone_accelerant;
++		case B_ACCELERANT_CLONE_INFO_SIZE:
++			return (void*)tegra_dc_accelerant_clone_info_size;
++		case B_GET_ACCELERANT_CLONE_INFO:
++			return (void*)tegra_dc_get_accelerant_clone_info;
++		case B_GET_ACCELERANT_DEVICE_INFO:
++			return (void*)tegra_dc_get_accelerant_device_info;
++		case B_ACCELERANT_RETRACE_SEMAPHORE:
++			return (void*)tegra_dc_accelerant_retrace_semaphore;
++
++		// modes
++		case B_ACCELERANT_MODE_COUNT:
++			return (void*)tegra_dc_accelerant_mode_count;
++		case B_GET_MODE_LIST:
++			return (void*)tegra_dc_get_mode_list;
++		case B_PROPOSE_DISPLAY_MODE:
++			return (void*)tegra_dc_propose_display_mode;
++		case B_SET_DISPLAY_MODE:
++			return (void*)tegra_dc_set_display_mode;
++		case B_GET_DISPLAY_MODE:
++			return (void*)tegra_dc_get_display_mode;
++		case B_GET_PREFERRED_DISPLAY_MODE:
++			return (void*)tegra_dc_get_preferred_display_mode;
++		case B_GET_EDID_INFO:
++			return (void*)tegra_dc_get_edid_info;
++		case B_GET_FRAME_BUFFER_CONFIG:
++			return (void*)tegra_dc_get_frame_buffer_config;
++		case B_GET_PIXEL_CLOCK_LIMITS:
++			return (void*)tegra_dc_get_pixel_clock_limits;
++	}
++
++	return NULL;
++}
+diff --git a/src/add-ons/accelerants/tegra_dc/mode.cpp b/src/add-ons/accelerants/tegra_dc/mode.cpp
+new file mode 100644
+index 0000000000..3203eda5c2
+--- /dev/null
++++ b/src/add-ons/accelerants/tegra_dc/mode.cpp
+@@ -0,0 +1,156 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++/*!	Modes: the panel as the firmware set it up, at 32 or 16 bits per pixel. */
++
++
++#include "accelerant.h"
++#include "accelerant_protos.h"
++
++#include <errno.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <create_display_modes.h>
++
++
++static bool
++is_mode_supported(display_mode* mode)
++{
++	const display_timing& timing = gInfo->shared_info->timing;
++	return mode != NULL
++		&& mode->timing.h_display == timing.h_display
++		&& mode->timing.v_display == timing.v_display
++		&& mode->virtual_width == timing.h_display
++		&& mode->virtual_height == timing.v_display
++		&& (mode->space == B_RGB32 || mode->space == B_RGB16);
++}
++
++
++static void
++panel_mode(display_mode& mode, color_space space)
++{
++	memset(&mode, 0, sizeof(display_mode));
++	mode.timing = gInfo->shared_info->timing;
++	mode.space = space;
++	mode.virtual_width = mode.timing.h_display;
++	mode.virtual_height = mode.timing.v_display;
++	mode.flags = B_8_BIT_DAC | B_PARALLEL_ACCESS;
++}
++
++
++status_t
++create_mode_list()
++{
++	const color_space spaces[] = { B_RGB32, B_RGB16 };
++	display_mode mode;
++	panel_mode(mode, B_RGB32);
++
++	gInfo->mode_list_area = create_display_modes("tegra_dc modes", NULL,
++		&mode, 1, spaces, B_COUNT_OF(spaces), is_mode_supported,
++		&gInfo->mode_list, &gInfo->shared_info->mode_count);
++	if (gInfo->mode_list_area < 0)
++		return gInfo->mode_list_area;
++
++	gInfo->shared_info->mode_list_area = gInfo->mode_list_area;
++	return B_OK;
++}
++
++
++//	#pragma mark -
++
++
++uint32
++tegra_dc_accelerant_mode_count(void)
++{
++	return gInfo->shared_info->mode_count;
++}
++
++
++status_t
++tegra_dc_get_mode_list(display_mode* modes)
++{
++	memcpy(modes, gInfo->mode_list,
++		gInfo->shared_info->mode_count * sizeof(display_mode));
++	return B_OK;
++}
++
++
++status_t
++tegra_dc_propose_display_mode(display_mode* target, const display_mode* low,
++	const display_mode* high)
++{
++	// The panel has one timing: keep the color space, take everything else
++	color_space space = (color_space)target->space;
++	if (space != B_RGB16)
++		space = B_RGB32;
++	panel_mode(*target, space);
++	return B_OK;
++}
++
++
++status_t
++tegra_dc_set_display_mode(display_mode* mode)
++{
++	if (!is_mode_supported(mode))
++		return B_BAD_VALUE;
++	if (ioctl(gInfo->device, TEGRA_DC_SET_DISPLAY_MODE, mode,
++			sizeof(display_mode)) != 0) {
++		return errno;
++	}
++	return B_OK;
++}
++
++
++status_t
++tegra_dc_get_display_mode(display_mode* currentMode)
++{
++	*currentMode = gInfo->shared_info->current_mode;
++	return B_OK;
++}
++
++
++status_t
++tegra_dc_get_preferred_display_mode(display_mode* preferredMode)
++{
++	panel_mode(*preferredMode, B_RGB32);
++	return B_OK;
++}
++
++
++status_t
++tegra_dc_get_edid_info(void* info, size_t size, uint32* _version)
++{
++	if (!gInfo->shared_info->has_edid)
++		return B_ERROR;
++	if (size < sizeof(edid1_info))
++		return B_BUFFER_OVERFLOW;
++
++	memcpy(info, &gInfo->shared_info->edid_info, sizeof(edid1_info));
++	*_version = EDID_VERSION_1;
++	return B_OK;
++}
++
++
++status_t
++tegra_dc_get_frame_buffer_config(frame_buffer_config* config)
++{
++	config->frame_buffer = gInfo->frame_buffer;
++	config->frame_buffer_dma = NULL;
++	config->bytes_per_row = gInfo->shared_info->bytes_per_row;
++	return B_OK;
++}
++
++
++status_t
++tegra_dc_get_pixel_clock_limits(display_mode* mode, uint32* _low,
++	uint32* _high)
++{
++	// Only the panel's own pixel clock
++	*_low = *_high = gInfo->shared_info->timing.pixel_clock;
++	return B_OK;
++}
+diff --git a/src/add-ons/kernel/drivers/graphics/Jamfile b/src/add-ons/kernel/drivers/graphics/Jamfile
+index cfaa4e4878..08fc69f278 100644
+--- a/src/add-ons/kernel/drivers/graphics/Jamfile
++++ b/src/add-ons/kernel/drivers/graphics/Jamfile
+@@ -14,6 +14,7 @@ SubInclude HAIKU_TOP src add-ons kernel drivers graphics radeon ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics radeon_hd ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics s3 ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics skeleton ;
++SubInclude HAIKU_TOP src add-ons kernel drivers graphics tegra_dc ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics vesa ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics via ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics virtio ;
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/Jamfile b/src/add-ons/kernel/drivers/graphics/tegra_dc/Jamfile
+new file mode 100644
+index 0000000000..1299df76fa
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/Jamfile
+@@ -0,0 +1,12 @@
++SubDir HAIKU_TOP src add-ons kernel drivers graphics tegra_dc ;
++
++UsePrivateHeaders [ FDirName graphics common ] ;
++UsePrivateHeaders [ FDirName graphics tegra_dc ] ;
++UsePrivateKernelHeaders ;
++UseLibraryHeaders [ FDirName libfdt ] ;
++
++KernelAddon tegra_dc :
++	tegra_dc.cpp
++	:
++	kernel_fdt.a
++	;
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp b/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
+new file mode 100644
+index 0000000000..992f3ed5a0
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
+@@ -0,0 +1,620 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++/*!	Driver for the display controller of the NVIDIA Tegra 2 (Tegra20), as in
++	the Toshiba AC100. Register descriptions come from the Tegra 2 Technical
++	Reference Manual, chapter 29 "Display Controller".
++
++	The firmware (U-Boot) has set the panel up: clocks, pins, timings and
++	window A scanning out a 16 bit frame buffer from memory it reserved. This
++	driver keeps all of that and only changes window A: its pixel format and
++	line stride, to offer 32 bit as well as 16 bit. It also takes the vertical
++	blank interrupt for the retrace semaphore.
++
++	The driver only publishes its device when it finds this state. Otherwise
++	app_server keeps using the generic frame buffer driver.
++*/
++
++
++#include <stdio.h>
++#include <string.h>
++
++#include <KernelExport.h>
++#include <OS.h>
++#include <boot_item.h>
++#include <frame_buffer_console.h>
++#include <graphic_driver.h>
++#include <lock.h>
++#include <util/AutoLock.h>
++#include <vm/vm.h>
++
++#include <libfdt.h>
++
++#include "tegra_dc_info.h"
++
++
++//#define TRACE_TEGRA_DC
++#ifdef TRACE_TEGRA_DC
++#	define TRACE(x...) dprintf("tegra_dc: " x)
++#else
++#	define TRACE(x...) ;
++#endif
++#define ERROR(x...) dprintf("tegra_dc: " x)
++
++
++extern void* gFDT;
++
++
++#define VESA_EDID_BOOT_INFO			"vesa_edid/v1"
++
++#define TEGRA20_CAR_BASE			0x60006000
++#define CAR_RST_DEVICES_L			0x004
++#define CAR_CLK_OUT_ENB_L			0x010
++#define CAR_DISP1_BIT				(1u << 27)
++
++#define TEGRA20_DC_A_BASE			0x54200000
++#define TEGRA20_DC_SIZE				0x10000
++#define TEGRA20_DC_A_INTERRUPT		(32 + 73)
++
++// The memory the firmware reserved for its frame buffer. The kernel keeps
++// it out of its free memory, up to its last 192KB (the physical page pool).
++#define SCANOUT_BASE				0x1f800000
++#define SCANOUT_SIZE				0x500000
++
++#define PANEL_WIDTH					1024
++#define PANEL_HEIGHT				600
++
++// Display controller registers, word offsets (TRM 29.7 - 29.15)
++#define DC_CMD_INT_STATUS			0x037
++#define DC_CMD_INT_MASK				0x038
++#define DC_CMD_INT_ENABLE			0x039
++#define DC_CMD_INT_TYPE				0x03a
++#define DC_CMD_INT_POLARITY			0x03b
++#define DC_CMD_STATE_CONTROL		0x041
++#define DC_DISP_SYNC_WIDTH			0x407
++#define DC_DISP_BACK_PORCH			0x408
++#define DC_DISP_DISP_ACTIVE			0x409
++#define DC_DISP_FRONT_PORCH			0x40a
++#define DC_DISP_DISP_CLOCK_CONTROL	0x42e
++#define DC_DISP_DATA_ENABLE_OPTIONS	0x432
++
++#define INT_V_BLANK					(1u << 2)
++
++#define STATE_WIN_A_ACT_REQ			(1u << 1)
++#define STATE_WIN_A_UPDATE			(1u << 9)
++
++// Window A, through its own register aperture (as Linux addresses the
++// windows, which avoids the window header register; checked on the AC100)
++#define WIN_A_BASE					0xa00
++#define WIN_OPTIONS					(WIN_A_BASE + 0x180 + 0x00)
++#define WIN_COLOR_DEPTH				(WIN_A_BASE + 0x180 + 0x03)
++#define WIN_SIZE					(WIN_A_BASE + 0x180 + 0x05)
++#define WIN_PRESCALED_SIZE			(WIN_A_BASE + 0x180 + 0x06)
++#define WIN_LINE_STRIDE				(WIN_A_BASE + 0x180 + 0x0a)
++#define WINBUF_START_ADDR			(WIN_A_BASE + 0x1c0 + 0x00)
++#define WINBUF_ADDR_H_OFFSET		(WIN_A_BASE + 0x1c0 + 0x06)
++#define WINBUF_ADDR_V_OFFSET		(WIN_A_BASE + 0x1c0 + 0x08)
++
++#define WIN_OPTIONS_COLOR_EXPAND	(1u << 6)
++#define WIN_OPTIONS_ENABLE			(1u << 30)
++
++#define COLOR_DEPTH_B5G6R5			6
++#define COLOR_DEPTH_B8G8R8A8		12
++
++// The pixel clock: PLL_P divided by the shift clock divider
++#define PLL_P_KHZ					216000
++
++
++struct tegra_dc_device {
++	mutex				lock;
++	int32				open_count;
++
++	area_id				registers_area;
++	volatile uint32*	registers;
++
++	area_id				scanout_area;
++	uint8*				scanout;
++
++	area_id				shared_area;
++	tegra_dc_shared_info* shared_info;
++};
++
++
++int32 api_version = B_CUR_DRIVER_API_VERSION;
++
++static const char* sDeviceNames[] = { TEGRA_DC_DEVICE_NAME, NULL };
++static tegra_dc_device sDevice;
++
++
++static inline uint32
++read_dc(uint32 word)
++{
++	return sDevice.registers[word];
++}
++
++
++static inline void
++write_dc(uint32 word, uint32 value)
++{
++	sDevice.registers[word] = value;
++}
++
++
++static volatile uint32*
++map_registers(const char* name, phys_addr_t base, size_t size, area_id* _area)
++{
++	void* address;
++	*_area = map_physical_memory(name, base, size, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++	return *_area >= 0 ? (volatile uint32*)address : NULL;
++}
++
++
++/*!	Reads the panel timing the firmware programmed. The front porch register
++	holds one less than the front porch (as U-Boot programs it; it makes the
++	frame rate come out at the panel's 60 Hz).
++*/
++static void
++read_timing(display_timing& timing)
++{
++	uint32 syncWidth = read_dc(DC_DISP_SYNC_WIDTH);
++	uint32 backPorch = read_dc(DC_DISP_BACK_PORCH);
++	uint32 active = read_dc(DC_DISP_DISP_ACTIVE);
++	uint32 frontPorch = read_dc(DC_DISP_FRONT_PORCH);
++	uint32 clockControl = read_dc(DC_DISP_DISP_CLOCK_CONTROL);
++
++	timing.h_display = active & 0xffff;
++	timing.h_sync_start = timing.h_display + (frontPorch & 0xffff) + 1;
++	timing.h_sync_end = timing.h_sync_start + (syncWidth & 0xffff);
++	timing.h_total = timing.h_sync_end + (backPorch & 0xffff);
++
++	timing.v_display = active >> 16;
++	timing.v_sync_start = timing.v_display + (frontPorch >> 16) + 1;
++	timing.v_sync_end = timing.v_sync_start + (syncWidth >> 16);
++	timing.v_total = timing.v_sync_end + (backPorch >> 16);
++
++	// Shift clock divider n: the pixel clock is the source / (n / 2 + 1)
++	uint32 divider = clockControl & 0xff;
++	timing.pixel_clock = PLL_P_KHZ * 2 / (divider + 2);
++	timing.flags = 0;
++}
++
++
++static void
++fill_mode(display_mode& mode, color_space space)
++{
++	memset(&mode, 0, sizeof(display_mode));
++	mode.timing = sDevice.shared_info->timing;
++	mode.space = space;
++	mode.virtual_width = PANEL_WIDTH;
++	mode.virtual_height = PANEL_HEIGHT;
++	mode.flags = B_8_BIT_DAC | B_PARALLEL_ACCESS;
++}
++
++
++/*!	Moves a window register change from the assembly copy through the armed
++	copy to the active one. The two steps have to be separate writes (TRM
++	29.7.28); the second one takes effect at the next frame boundary.
++*/
++static status_t
++commit_window_a()
++{
++	write_dc(DC_CMD_STATE_CONTROL, STATE_WIN_A_UPDATE);
++	read_dc(DC_CMD_STATE_CONTROL);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_WIN_A_ACT_REQ);
++
++	bigtime_t timeout = system_time() + 100000;
++	while ((read_dc(DC_CMD_STATE_CONTROL) & STATE_WIN_A_ACT_REQ) != 0) {
++		if (system_time() > timeout)
++			return B_TIMED_OUT;
++		snooze(1000);
++	}
++	return B_OK;
++}
++
++
++static status_t
++program_display_mode(const display_mode& mode)
++{
++	uint32 bytesPerPixel;
++	uint32 colorDepth;
++	uint32 kdlDepth;
++	switch (mode.space) {
++		case B_RGB16:
++			bytesPerPixel = 2;
++			colorDepth = COLOR_DEPTH_B5G6R5;
++			kdlDepth = 16;
++			break;
++		case B_RGB32:
++		case B_RGBA32:
++			bytesPerPixel = 4;
++			colorDepth = COLOR_DEPTH_B8G8R8A8;
++			kdlDepth = 32;
++			break;
++		default:
++			return B_BAD_VALUE;
++	}
++	if (mode.virtual_width != PANEL_WIDTH
++		|| mode.virtual_height != PANEL_HEIGHT
++		|| mode.timing.h_display != PANEL_WIDTH
++		|| mode.timing.v_display != PANEL_HEIGHT) {
++		return B_BAD_VALUE;
++	}
++
++	uint32 bytesPerRow = PANEL_WIDTH * bytesPerPixel;
++	if (bytesPerRow * PANEL_HEIGHT > SCANOUT_SIZE)
++		return B_BAD_VALUE;
++
++	// Start from a black screen: app_server draws everything again
++	memset(sDevice.scanout, 0, bytesPerRow * PANEL_HEIGHT);
++
++	uint32 options = read_dc(WIN_OPTIONS) | WIN_OPTIONS_ENABLE;
++	if (bytesPerPixel == 2)
++		options |= WIN_OPTIONS_COLOR_EXPAND;
++	else
++		options &= ~WIN_OPTIONS_COLOR_EXPAND;
++
++	write_dc(WIN_COLOR_DEPTH, colorDepth);
++	write_dc(WIN_OPTIONS, options);
++	write_dc(WIN_PRESCALED_SIZE, (PANEL_HEIGHT << 16) | bytesPerRow);
++	write_dc(WIN_LINE_STRIDE, bytesPerRow);
++	write_dc(WINBUF_START_ADDR, SCANOUT_BASE);
++	write_dc(WINBUF_ADDR_H_OFFSET, 0);
++	write_dc(WINBUF_ADDR_V_OFFSET, 0);
++
++	status_t status = commit_window_a();
++	if (status != B_OK) {
++		ERROR("window A did not take the new mode\n");
++		return status;
++	}
++
++	tegra_dc_shared_info& info = *sDevice.shared_info;
++	fill_mode(info.current_mode, (color_space)mode.space);
++	info.bytes_per_row = bytesPerRow;
++
++	// The kernel debugger writes the screen too
++	frame_buffer_update((addr_t)sDevice.scanout, PANEL_WIDTH, PANEL_HEIGHT,
++		kdlDepth, bytesPerRow);
++
++	dprintf("tegra_dc: %dx%d, %" B_PRIu32 " bits per pixel\n", PANEL_WIDTH,
++		PANEL_HEIGHT, kdlDepth);
++	return B_OK;
++}
++
++
++static int32
++vblank_interrupt(void* data)
++{
++	uint32 status = read_dc(DC_CMD_INT_STATUS);
++	if (status == 0)
++		return B_UNHANDLED_INTERRUPT;
++
++	// write 1 to clear
++	write_dc(DC_CMD_INT_STATUS, status);
++	if ((status & INT_V_BLANK) == 0)
++		return B_HANDLED_INTERRUPT;
++
++	sDevice.shared_info->vblank_count++;
++
++	// Wake whoever waits for the retrace, without letting the count grow
++	sem_id sem = sDevice.shared_info->vblank_sem;
++	int32 count;
++	if (get_sem_count(sem, &count) == B_OK && count < 0) {
++		release_sem_etc(sem, -count, B_DO_NOT_RESCHEDULE);
++		return B_INVOKE_SCHEDULER;
++	}
++	return B_HANDLED_INTERRUPT;
++}
++
++
++static void
++enable_vblank_interrupt(bool enable)
++{
++	// The driver owns all the display controller interrupts. Start from all
++	// of them off and nothing pending, then enable V_BLANK: edge triggered,
++	// default polarity.
++	write_dc(DC_CMD_INT_MASK, 0);
++	write_dc(DC_CMD_INT_ENABLE, 0);
++	write_dc(DC_CMD_INT_STATUS, 0xffffffff);
++	write_dc(DC_CMD_INT_TYPE, 0);
++	write_dc(DC_CMD_INT_POLARITY, 0);
++
++	if (enable) {
++		// A set mask bit lets the interrupt through
++		write_dc(DC_CMD_INT_ENABLE, INT_V_BLANK);
++		write_dc(DC_CMD_INT_MASK, INT_V_BLANK);
++	}
++}
++
++
++static void
++uninit_device()
++{
++	if (sDevice.shared_info != NULL) {
++		enable_vblank_interrupt(false);
++		remove_io_interrupt_handler(TEGRA20_DC_A_INTERRUPT, vblank_interrupt,
++			NULL);
++		delete_sem(sDevice.shared_info->vblank_sem);
++	}
++	delete_area(sDevice.shared_area);
++	delete_area(sDevice.scanout_area);
++	delete_area(sDevice.registers_area);
++	sDevice.shared_area = sDevice.scanout_area = sDevice.registers_area = -1;
++	sDevice.shared_info = NULL;
++	sDevice.scanout = NULL;
++	sDevice.registers = NULL;
++}
++
++
++static status_t
++init_device()
++{
++	sDevice.registers = map_registers("tegra_dc registers", TEGRA20_DC_A_BASE,
++		TEGRA20_DC_SIZE, &sDevice.registers_area);
++	if (sDevice.registers == NULL)
++		return sDevice.registers_area;
++
++	// Write combining device memory: a clone in app_server gets the same
++	// memory type, the display controller does not see the CPU caches
++	sDevice.scanout_area = map_physical_memory("tegra_dc frame buffer",
++		SCANOUT_BASE, SCANOUT_SIZE,
++		B_ANY_KERNEL_BLOCK_ADDRESS | B_WRITE_COMBINING_MEMORY,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA | B_CLONEABLE_AREA,
++		(void**)&sDevice.scanout);
++	if (sDevice.scanout_area < 0) {
++		status_t status = sDevice.scanout_area;
++		uninit_device();
++		return status;
++	}
++
++	sDevice.shared_area = create_area("tegra_dc shared info",
++		(void**)&sDevice.shared_info, B_ANY_KERNEL_ADDRESS,
++		(sizeof(tegra_dc_shared_info) + B_PAGE_SIZE - 1) & ~(B_PAGE_SIZE - 1), B_FULL_LOCK,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA | B_CLONEABLE_AREA);
++	if (sDevice.shared_area < 0) {
++		status_t status = sDevice.shared_area;
++		uninit_device();
++		return status;
++	}
++
++	tegra_dc_shared_info& info = *sDevice.shared_info;
++	memset(&info, 0, sizeof(tegra_dc_shared_info));
++	info.mode_list_area = -1;
++	info.frame_buffer_size = SCANOUT_SIZE;
++	read_timing(info.timing);
++
++	// The mode the firmware left
++	bool depth32 = read_dc(WIN_COLOR_DEPTH) == COLOR_DEPTH_B8G8R8A8;
++	fill_mode(info.current_mode, depth32 ? B_RGB32 : B_RGB16);
++	info.bytes_per_row = read_dc(WIN_LINE_STRIDE) & 0xffff;
++
++	edid1_info* edid = (edid1_info*)get_boot_item(VESA_EDID_BOOT_INFO, NULL);
++	if (edid != NULL) {
++		info.edid_info = *edid;
++		info.has_edid = true;
++	}
++
++	info.vblank_sem = create_sem(0, "tegra_dc retrace");
++	if (info.vblank_sem < 0) {
++		status_t status = info.vblank_sem;
++		uninit_device();
++		return status;
++	}
++	// Userland cannot acquire a kernel semaphore: give it to the team that
++	// opens the device first (app_server), as intel_extreme does
++	thread_info threadInfo;
++	if (get_thread_info(find_thread(NULL), &threadInfo) == B_OK)
++		set_sem_owner(info.vblank_sem, threadInfo.team);
++
++	status_t status = install_io_interrupt_handler(TEGRA20_DC_A_INTERRUPT,
++		vblank_interrupt, NULL, 0);
++	if (status != B_OK) {
++		ERROR("cannot install the interrupt handler: %s\n", strerror(status));
++		delete_sem(info.vblank_sem);
++		sDevice.shared_info = NULL;
++		uninit_device();
++		return status;
++	}
++	enable_vblank_interrupt(true);
++
++	dprintf("tegra_dc: %" B_PRIu32 "x%" B_PRIu32 " panel, pixel clock %"
++		B_PRIu32 " kHz, totals %" B_PRIu32 "x%" B_PRIu32 ", %s\n",
++		(uint32)info.timing.h_display, (uint32)info.timing.v_display,
++		info.timing.pixel_clock, (uint32)info.timing.h_total,
++		(uint32)info.timing.v_total, depth32 ? "32 bit" : "16 bit");
++	return B_OK;
++}
++
++
++//	#pragma mark - device hooks
++
++
++static status_t
++tegra_dc_open(const char* name, uint32 flags, void** _cookie)
++{
++	MutexLocker locker(sDevice.lock);
++	if (sDevice.open_count == 0) {
++		status_t status = init_device();
++		if (status != B_OK)
++			return status;
++	}
++	sDevice.open_count++;
++	*_cookie = &sDevice;
++	return B_OK;
++}
++
++
++static status_t
++tegra_dc_close(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++tegra_dc_free(void* cookie)
++{
++	MutexLocker locker(sDevice.lock);
++	if (--sDevice.open_count == 0)
++		uninit_device();
++	return B_OK;
++}
++
++
++static status_t
++tegra_dc_ioctl(void* cookie, uint32 op, void* buffer, size_t length)
++{
++	switch (op) {
++		case B_GET_ACCELERANT_SIGNATURE:
++			if (user_strlcpy((char*)buffer, TEGRA_DC_ACCELERANT_NAME,
++					B_FILE_NAME_LENGTH) < B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			return B_OK;
++
++		case TEGRA_DC_GET_PRIVATE_DATA:
++			return user_memcpy(buffer, &sDevice.shared_area, sizeof(area_id));
++
++		case TEGRA_DC_GET_DEVICE_NAME:
++			if (user_strlcpy((char*)buffer, TEGRA_DC_DEVICE_NAME,
++					B_PATH_NAME_LENGTH) < B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			return B_OK;
++
++		case TEGRA_DC_CLONE_FRAME_BUFFER:
++		{
++			void* address;
++			area_id area = vm_clone_area(B_CURRENT_TEAM,
++				"tegra_dc cloned frame buffer", &address, B_ANY_ADDRESS,
++				B_READ_AREA | B_WRITE_AREA, REGION_NO_PRIVATE_MAP,
++				sDevice.scanout_area, true);
++			if (area < 0)
++				return area;
++			return _user_get_area_info(area, (area_info*)buffer);
++		}
++
++		case TEGRA_DC_SET_DISPLAY_MODE:
++		{
++			display_mode mode;
++			if (length < sizeof(display_mode)
++				|| user_memcpy(&mode, buffer, sizeof(display_mode)) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			MutexLocker locker(sDevice.lock);
++			return program_display_mode(mode);
++		}
++	}
++
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++static status_t
++tegra_dc_read(void* cookie, off_t position, void* buffer, size_t* _length)
++{
++	*_length = 0;
++	return B_NOT_ALLOWED;
++}
++
++
++static status_t
++tegra_dc_write(void* cookie, off_t position, const void* buffer,
++	size_t* _length)
++{
++	*_length = 0;
++	return B_NOT_ALLOWED;
++}
++
++
++static device_hooks sDeviceHooks = {
++	tegra_dc_open,
++	tegra_dc_close,
++	tegra_dc_free,
++	tegra_dc_ioctl,
++	tegra_dc_read,
++	tegra_dc_write,
++};
++
++
++//	#pragma mark - driver
++
++
++/*!	Only claims the display when the firmware left it as expected: a Tegra 2,
++	display controller A running, and window A scanning out of the memory
++	reserved for it.
++*/
++status_t
++init_hardware(void)
++{
++	if (gFDT == NULL || fdt_node_check_compatible(gFDT, 0, "nvidia,tegra20")
++			!= 0) {
++		return B_DEVICE_NOT_FOUND;
++	}
++
++	area_id carArea;
++	volatile uint32* car = map_registers("tegra car", TEGRA20_CAR_BASE,
++		B_PAGE_SIZE, &carArea);
++	if (car == NULL)
++		return B_ERROR;
++	bool running = (car[CAR_CLK_OUT_ENB_L / 4] & CAR_DISP1_BIT) != 0
++		&& (car[CAR_RST_DEVICES_L / 4] & CAR_DISP1_BIT) == 0;
++	delete_area(carArea);
++	if (!running) {
++		dprintf("tegra_dc: display controller A is not running\n");
++		return B_DEVICE_NOT_FOUND;
++	}
++
++	area_id dcArea;
++	volatile uint32* dc = map_registers("tegra_dc registers",
++		TEGRA20_DC_A_BASE, TEGRA20_DC_SIZE, &dcArea);
++	if (dc == NULL)
++		return B_ERROR;
++	uint32 options = dc[WIN_OPTIONS];
++	uint32 start = dc[WINBUF_START_ADDR];
++	uint32 size = dc[WIN_SIZE];
++	delete_area(dcArea);
++
++	if ((options & WIN_OPTIONS_ENABLE) == 0 || start != SCANOUT_BASE
++		|| size != ((PANEL_HEIGHT << 16) | PANEL_WIDTH)) {
++		dprintf("tegra_dc: window A not as expected (options %#" B_PRIx32
++			", start %#" B_PRIx32 ", size %#" B_PRIx32 ")\n", options, start,
++			size);
++		return B_DEVICE_NOT_FOUND;
++	}
++	return B_OK;
++}
++
++
++status_t
++init_driver(void)
++{
++	memset(&sDevice, 0, sizeof(sDevice));
++	sDevice.registers_area = sDevice.scanout_area = sDevice.shared_area = -1;
++	mutex_init(&sDevice.lock, "tegra_dc");
++	return B_OK;
++}
++
++
++void
++uninit_driver(void)
++{
++	mutex_destroy(&sDevice.lock);
++}
++
++
++const char**
++publish_devices(void)
++{
++	return sDeviceNames;
++}
++
++
++device_hooks*
++find_device(const char* name)
++{
++	return &sDeviceHooks;
++}

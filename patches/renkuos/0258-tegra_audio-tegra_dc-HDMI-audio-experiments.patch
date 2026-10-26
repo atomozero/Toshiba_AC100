@@ -1,0 +1,99 @@
+From ad3ba92b63190242d9992a3fa06ec2d2b2b41895 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 26 Oct 2026 18:58:12 +0100
+Subject: [PATCH 258/270] tegra_audio, tegra_dc: HDMI audio experiments
+
+The S/PDIF channel status registers are cleared (44.1 kHz consumer
+PCM), but not sent: with TC_EN a television lost the picture. Only
+the 44.1 kHz audio clock regeneration subpacket is enabled, the others
+are cleared; enabling all seven made the picture flicker too.
+
+HDMI audio still sounds metallic on a television; under investigation.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../kernel/drivers/audio/tegra/tegra_audio.cpp     | 11 +++++++++--
+ .../kernel/drivers/graphics/tegra_dc/hdmi.cpp      | 14 ++++++++++----
+ 2 files changed, 19 insertions(+), 6 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp b/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
+index 2a9a582bec..a7d620252b 100644
+--- a/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
++++ b/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
+@@ -133,12 +133,14 @@ struct tegra_audio_diag {
+ #define SPDIF_BASE					0x70002400
+ #define SPDIF_CTRL					0x00
+ #define SPDIF_CTRL_TX_EN			(1U << 28)
++#define SPDIF_CTRL_TC_EN			(1U << 27)	// send the channel status
+ #define SPDIF_CTRL_PACK				(1U << 14)	// left and right in a word
+ #define SPDIF_CTRL_BIT_MODE_16		(0U << 12)
+ #define SPDIF_DATA_FIFO_CSR			0x0c
+ #define SPDIF_FIFO_TX_CLR			(1U << 7)
+ #define SPDIF_FIFO_TX_ATN_FOUR_SLOTS	(1U << 5)
+ #define SPDIF_DATA_OUT				0x40
++#define SPDIF_CH_STA_TX(i)			(0x140 + (i) * 4)	// A to F
+ #define SPDIF_DMA_REQUEST			3
+ 
+ // APB DMA
+@@ -609,6 +611,10 @@ setup_spdif(tegra_audio* audio)
+ 	spin(10);
+ 	set_reset(audio, CLOCK_SPDIF, false);
+ 
++	// Consumer channel status of linear PCM at 44.1 kHz (sample frequency
++	// code 0 in bits 27-24 of the first word), as the NVIDIA driver sends
++	for (int32 i = 0; i < 6; i++)
++		write32(audio->spdif, SPDIF_CH_STA_TX(i), 0);
+ 	write32(audio->spdif, SPDIF_CTRL, SPDIF_CTRL_PACK
+ 		| SPDIF_CTRL_BIT_MODE_16);
+ 	write32(audio->spdif, SPDIF_DATA_FIFO_CSR, SPDIF_FIFO_TX_ATN_FOUR_SLOTS);
+@@ -733,6 +739,7 @@ start_playback(tegra_audio* audio)
+ 	if (audio->spdifEnabled) {
+ 		// the DMA fills the S/PDIF FIFO first (TRM 27.3.3.7)
+ 		spin(20);
++		// TC_EN (channel status) made a television lose the picture
+ 		write32(audio->spdif, SPDIF_CTRL,
+ 			read32(audio->spdif, SPDIF_CTRL) | SPDIF_CTRL_TX_EN);
+ 	}
+@@ -755,8 +762,8 @@ stop_playback(tegra_audio* audio)
+ 		& ~(DMA_CSR_ENABLE | DMA_CSR_IE_EOC));
+ 	write32(audio->channel, DMA_STATUS, read32(audio->channel, DMA_STATUS));
+ 	if (audio->spdifEnabled) {
+-		write32(audio->spdif, SPDIF_CTRL,
+-			read32(audio->spdif, SPDIF_CTRL) & ~SPDIF_CTRL_TX_EN);
++		write32(audio->spdif, SPDIF_CTRL, read32(audio->spdif, SPDIF_CTRL)
++			& ~(SPDIF_CTRL_TC_EN | SPDIF_CTRL_TX_EN));
+ 		write32(audio->spdifChannel, DMA_CSR,
+ 			read32(audio->spdifChannel, DMA_CSR)
+ 				& ~(DMA_CSR_ENABLE | DMA_CSR_IE_EOC));
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
+index efdf3387b6..716a67dfe9 100644
+--- a/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
+@@ -219,8 +219,8 @@ extern "C" status_t arm_dvc_i2c_write(uint8 address, uint8 reg,
+ #define HDMI_GENERIC_CTRL			0x2a
+ #define GENERIC_CTRL_AUDIO			(1u << 16)
+ #define HDMI_ACR_CTRL				0x35
+-#define HDMI_ACR_0441_SUBPACK_LOW	0x38
+-#define HDMI_ACR_0441_SUBPACK_HIGH	0x39
++#define HDMI_ACR_SUBPACK_LOW(i)		(0x36 + 2 * (i))	// 32, 44.1, 88.2,
++#define HDMI_ACR_SUBPACK_HIGH(i)	(0x37 + 2 * (i))	// 176.4, 48, 96, 192 kHz
+ #define ACR_SUBPACK_CTS(x)			(((uint32)(x) & 0xffffff) << 8)
+ #define ACR_SUBPACK_N(x)			((uint32)(x) & 0xffffff)
+ #define ACR_ENABLE					(1u << 31)
+@@ -1170,8 +1170,14 @@ setup_audio_packets()
+ 	write_hdmi(HDMI_ACR_CTRL, 0);
+ 	write_hdmi(HDMI_AUDIO_N, AUDIO_N_RESETF | AUDIO_N_GENERATE_ALTERNATE
+ 		| AUDIO_N_VALUE(n - 1));
+-	write_hdmi(HDMI_ACR_0441_SUBPACK_HIGH, ACR_SUBPACK_N(n) | ACR_ENABLE);
+-	write_hdmi(HDMI_ACR_0441_SUBPACK_LOW, ACR_SUBPACK_CTS(cts));
++	// One pair of registers per sample rate; only the 44.1 kHz one is
++	// enabled (enabling all of them made a television lose the picture)
++	for (uint32 i = 0; i < 7; i++) {
++		write_hdmi(HDMI_ACR_SUBPACK_HIGH(i), i == 1
++			? ACR_SUBPACK_N(n) | ACR_ENABLE : 0);
++		write_hdmi(HDMI_ACR_SUBPACK_LOW(i), i == 1
++			? ACR_SUBPACK_CTS(cts) : 0);
++	}
+ 	write_hdmi(HDMI_SPARE, SPARE_HW_CTS | SPARE_FORCE_SW_CTS
+ 		| SPARE_CTS_RESET_VAL(1));
+ 	write_hdmi(HDMI_AUDIO_N, read_hdmi(HDMI_AUDIO_N) & ~AUDIO_N_RESETF);

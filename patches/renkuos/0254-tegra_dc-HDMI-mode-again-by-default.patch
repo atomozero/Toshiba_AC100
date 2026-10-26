@@ -1,0 +1,29 @@
+From 7b8de5e8329800aa2f7cda83592bd6bd71cb9ab6 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 26 Oct 2026 14:35:31 +0100
+Subject: [PATCH 254/270] tegra_dc: HDMI mode again by default
+
+With the audio clock regeneration packets a television keeps the
+picture in HDMI mode too.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
+index aed6eb31b3..eaefbe1aa9 100644
+--- a/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
+@@ -1260,9 +1260,8 @@ connect()
+ 
+ 	void* settings = load_driver_settings("tegra_dc");
+ 	tmds_settings& tmds = sHdmi.tmds;
+-	// Without audio clock regeneration packets, which the driver does not
+-	// send yet, HDMI sinks may keep losing the picture: DVI unless asked
+-	tmds.force_dvi = get_driver_boolean_parameter(settings, "hdmi_dvi", true,
++	// "hdmi_dvi true" sends plain DVI even to HDMI sinks
++	tmds.force_dvi = get_driver_boolean_parameter(settings, "hdmi_dvi", false,
+ 		true);
+ 	tmds.pre_emphasis = min_c(strtoul(get_driver_parameter(settings,
+ 		"hdmi_pre_emphasis", "6", "6"), NULL, 0), 0xfu);

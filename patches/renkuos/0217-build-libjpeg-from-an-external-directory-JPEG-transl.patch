@@ -1,0 +1,59 @@
+From c4df1d8d27f2b08d7d127e78e857ca8197d4c739 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 25 Oct 2026 10:59:18 +0100
+Subject: [PATCH 217/270] build: libjpeg from an external directory; JPEG
+ translator in the ARM image
+
+Like libpng, HAIKU_EXTERNAL_JPEG_DIR points to a libjpeg extracted from a
+package built for the target, when the repositories have none. Without
+the JPEG translator, ShowImage and the other translation kit users could
+not open photos.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ build/jam/BuildFeatures              | 10 +++++++++-
+ build/jam/images/definitions/minimum |  3 ++-
+ 2 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/build/jam/BuildFeatures b/build/jam/BuildFeatures
+index 6e178a59f1..585b900496 100644
+--- a/build/jam/BuildFeatures
++++ b/build/jam/BuildFeatures
+@@ -417,7 +417,15 @@ if [ IsPackageAvailable jasper_devel ] {
+ 
+ 
+ # jpeg
+-if [ IsPackageAvailable libjpeg_turbo_devel ] {
++if $(HAIKU_EXTERNAL_JPEG_DIR) && ! [ IsPackageAvailable libjpeg_turbo_devel ] {
++	# A libjpeg built elsewhere for the target (extracted package), when the
++	# repositories have none for it.
++	SetBuildFeatureAttribute jpeg : headers
++		: [ FDirName $(HAIKU_EXTERNAL_JPEG_DIR) develop headers ] ;
++	SetBuildFeatureAttribute jpeg : library
++		: [ FDirName $(HAIKU_EXTERNAL_JPEG_DIR) lib libjpeg.so ] ;
++	EnableBuildFeatures jpeg ;
++} else if [ IsPackageAvailable libjpeg_turbo_devel ] {
+ 	ExtractBuildFeatureArchives jpeg :
+ 		file: base libjpeg_turbo
+ 			runtime: lib
+diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
+index 5822cfa57d..55f91fdfc2 100644
+--- a/build/jam/images/definitions/minimum
++++ b/build/jam/images/definitions/minimum
+@@ -492,7 +492,7 @@ if $(HAIKU_IS_BOOTSTRAP) != 1 {
+ # The Toshiba AC100 (ARM) gets the applications of the regular image that can
+ # be built for it: nothing needing OpenGL or ffmpeg, and of the image
+ # translators needing a library only those whose library is available for ARM
+-# (PNG, through HAIKU_EXTERNAL_LIBPNG_DIR).
++# (PNG and JPEG, through HAIKU_EXTERNAL_LIBPNG_DIR and HAIKU_EXTERNAL_JPEG_DIR).
+ if arm in $(HAIKU_PACKAGING_ARCHS) {
+ 	SYSTEM_BIN += [ FFilterByBuildFeatures
+ 		cddb_lookup
+@@ -600,6 +600,7 @@ if arm in $(HAIKU_PACKAGING_ARCHS) {
+ 		GIFTranslator
+ 		HVIFTranslator
+ 		ICOTranslator
++		JPEGTranslator@jpeg
+ 		PCXTranslator
+ 		PNGTranslator@libpng
+ 		PPMTranslator

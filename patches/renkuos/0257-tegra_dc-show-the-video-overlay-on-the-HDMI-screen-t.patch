@@ -1,0 +1,278 @@
+From cc6c65d7977544855407202979916e118a707a1b Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 26 Oct 2026 16:34:32 +0100
+Subject: [PATCH 257/270] tegra_dc: show the video overlay on the HDMI screen
+ too
+
+Window B of display controller B shows the same overlay buffer as
+window B of controller A, with the same filters, color space
+conversion and color key, scaled and placed as the mirrored picture.
+Without it the screen showed the color key where the video is.
+
+BBitmap: the client's clone of an overlay buffer is cloneable, as
+MediaPlayer's VideoConsumer passes its area on to the media server as
+a buffer.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../kernel/drivers/graphics/tegra_dc/hdmi.cpp | 114 ++++++++++++++++++
+ .../kernel/drivers/graphics/tegra_dc/hdmi.h   |  24 ++++
+ .../drivers/graphics/tegra_dc/tegra_dc.cpp    |  24 ++++
+ src/kits/interface/Bitmap.cpp                 |   3 +-
+ 4 files changed, 164 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
+index 737af8c40d..efdf3387b6 100644
+--- a/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
+@@ -124,7 +124,9 @@ extern "C" status_t arm_dvc_i2c_write(uint8 address, uint8 reg,
+ #define DC_CMD_STATE_CONTROL		0x041
+ #define STATE_GENERAL_ACT_REQ		(1u << 0)
+ #define STATE_WIN_A_ACT_REQ			(1u << 1)
++#define STATE_WIN_B_ACT_REQ			(1u << 2)
+ #define STATE_WIN_C_ACT_REQ			(1u << 3)
++#define STATE_WIN_B_UPDATE			(1u << 10)
+ #define STATE_GENERAL_UPDATE		(1u << 8)
+ #define STATE_WIN_A_UPDATE			(1u << 9)
+ #define STATE_WIN_C_UPDATE			(1u << 11)
+@@ -168,6 +170,16 @@ extern "C" status_t arm_dvc_i2c_write(uint8 address, uint8 reg,
+ #define WIN_LINE_STRIDE				0x70a
+ #define WIN_BUF_STRIDE				0x70b
+ #define WIN_BUFFER_ADDR_MODE		0x70d
++#define WIN_OPTIONS_H_FILTER		(1u << 8)
++#define WIN_OPTIONS_V_FILTER		(1u << 10)
++#define WIN_OPTIONS_CSC				(1u << 18)
++#define WINC_H_FILTER_P00			0x601
++#define WINC_CSC_YOF				0x611
++#define WINC_V_FILTER_P00			0x619
++#define DC_DISP_COLOR_KEY0_LOWER	0x436
++#define DC_DISP_COLOR_KEY0_UPPER	0x437
++#define BLEND_CKEY0					1u
++#define MAX_V_DDA					0xf000
+ #define WIN_BLEND_NOKEY				0x70f
+ #define WIN_BLEND_1WIN				0x710
+ #define WIN_BLEND_2WIN_X			0x711
+@@ -350,6 +362,8 @@ static struct {
+ 		uint32		skip_y;
+ 	}				cursor;
+ 
++	hdmi_overlay	overlay;
++
+ 	bool			active;
+ 	hdmi_mode		mode;
+ 	tmds_settings	tmds;
+@@ -951,6 +965,90 @@ setup_cursor_blending()
+ }
+ 
+ 
++/*!	Window B of display controller B: the scaling filters and the BT.601
++	color space conversion, as window B of controller A has them.
++*/
++static void
++setup_overlay_window()
++{
++	write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_B_SELECT);
++	for (uint32 phase = 0; phase < 16; phase++) {
++		write_dc(WINC_H_FILTER_P00 + phase,
++			((8 * phase) << 16) | ((128 - 8 * phase) << 8));
++		write_dc(WINC_V_FILTER_P00 + phase, 128 - 8 * phase);
++	}
++	static const uint32 kCsc[] = { 0xf0, 298, 0, 409, 0x400 - 100,
++		0x400 - 208, 516, 0 };
++	for (size_t i = 0; i < B_COUNT_OF(kCsc); i++)
++		write_dc(WINC_CSC_YOF + i, kCsc[i]);
++
++	// opaque, under the cursor
++	write_dc(WIN_BLEND_NOKEY, BLEND_FIX_255);
++	write_dc(WIN_BLEND_1WIN, BLEND_FIX_255);
++	write_dc(WIN_BLEND_2WIN_X, BLEND_DEPENDENT);
++	write_dc(WIN_BLEND_2WIN_Y, BLEND_DEPENDENT);
++	write_dc(WIN_BLEND_3WIN, BLEND_DEPENDENT);
++	write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_A_SELECT);
++}
++
++
++/*!	The video at the same place of the mirrored picture as on the panel. */
++static void
++program_overlay_window()
++{
++	const hdmi_overlay& overlay = sHdmi.overlay;
++	uint32 x = sHdmi.window_x + overlay.x * sHdmi.window_width / sHdmi.width;
++	uint32 y = sHdmi.window_y
++		+ overlay.y * sHdmi.window_height / sHdmi.height;
++	uint32 width = overlay.width * sHdmi.window_width / sHdmi.width;
++	uint32 height = overlay.height * sHdmi.window_height / sHdmi.height;
++	width = min_c(width, sHdmi.mode.h_display - x);
++	height = min_c(height, sHdmi.mode.v_display - y);
++	uint32 hIncrement = dda_increment(overlay.source_width, width);
++	uint32 vIncrement = dda_increment(overlay.source_height, height);
++	uint32 maxHIncrement = overlay.bytes_per_pixel == 2 ? 0x8000 : 0x4000;
++	bool visible = overlay.visible && width > 1 && height > 1
++		&& hIncrement <= maxHIncrement && vIncrement <= MAX_V_DDA;
++
++	write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_B_SELECT);
++	if (!visible)
++		write_dc(WIN_OPTIONS, 0);
++	else {
++		write_dc(WIN_COLOR_DEPTH, overlay.color_depth);
++		write_dc(WIN_BYTE_SWAP, overlay.byte_swap);
++		write_dc(WIN_POSITION, (y << 16) | x);
++		write_dc(WIN_SIZE, (height << 16) | width);
++		write_dc(WIN_PRESCALED_SIZE, (overlay.source_height << 16)
++			| (overlay.source_width * overlay.bytes_per_pixel));
++		write_dc(WIN_H_INITIAL_DDA, 0);
++		write_dc(WIN_V_INITIAL_DDA, 0);
++		write_dc(WIN_DDA_INCREMENT, (vIncrement << 16) | hIncrement);
++		write_dc(WIN_LINE_STRIDE, overlay.bytes_per_row);
++		write_dc(WIN_BUF_STRIDE, 0);
++		write_dc(WIN_BUFFER_ADDR_MODE, 0);
++		write_dc(WINBUF_START_ADDR, overlay.physical);
++		write_dc(WINBUF_ADDR_H_OFFSET,
++			overlay.source_x * overlay.bytes_per_pixel);
++		write_dc(WINBUF_ADDR_V_OFFSET, overlay.source_y);
++		write_dc(WIN_OPTIONS, overlay.options);
++	}
++
++	// The frame buffer gives way to the video where it has the key color
++	write_dc(DC_DISP_COLOR_KEY0_LOWER, overlay.key_lower & 0xffffff);
++	write_dc(DC_DISP_COLOR_KEY0_UPPER, overlay.key_upper & 0xffffff);
++	write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_A_SELECT);
++	uint32 under = overlay.color_key ? BLEND_CKEY0 : 0;
++	write_dc(WIN_BLEND_2WIN_X, under);
++	write_dc(WIN_BLEND_3WIN, visible ? under : BLEND_DEPENDENT);
++
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_UPDATE | STATE_WIN_A_UPDATE
++		| STATE_WIN_B_UPDATE);
++	read_dc(DC_CMD_STATE_CONTROL);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_ACT_REQ
++		| STATE_WIN_A_ACT_REQ | STATE_WIN_B_ACT_REQ);
++}
++
++
+ static void
+ start_display_controller()
+ {
+@@ -994,8 +1092,10 @@ start_display_controller()
+ 		write_dc(WIN_OPTIONS, 0);
+ 	}
+ 	setup_cursor_blending();
++	setup_overlay_window();
+ 	program_mirror_window();
+ 	program_cursor_window();
++	program_overlay_window();
+ 
+ 	write_dc(DC_CMD_DISPLAY_COMMAND, DISPLAY_CTRL_C_DISPLAY);
+ 	write_dc(DC_CMD_DISPLAY_POWER_CONTROL, DISPLAY_POWER_ALL);
+@@ -1466,6 +1566,20 @@ hdmi_set_source(uint32 colorDepth, uint32 bytesPerRow)
+ }
+ 
+ 
++void
++hdmi_set_overlay(const hdmi_overlay& overlay)
++{
++	// thread ids are positive; before hdmi_start() it is 0
++	if (sHdmi.thread <= 0)
++		return;
++
++	MutexLocker locker(sHdmi.lock);
++	sHdmi.overlay = overlay;
++	if (sHdmi.active)
++		program_overlay_window();
++}
++
++
+ void
+ hdmi_set_cursor(bool visible, uint32 physical, int32 x, int32 y,
+ 	uint32 width, uint32 height, uint32 skipX, uint32 skipY)
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.h b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.h
+index 6e1930660b..1b4ae2865a 100644
+--- a/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.h
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.h
+@@ -23,5 +23,29 @@ void hdmi_set_source(uint32 colorDepth, uint32 bytesPerRow);
+ void hdmi_set_cursor(bool visible, uint32 physical, int32 x, int32 y,
+ 	uint32 width, uint32 height, uint32 skipX, uint32 skipY);
+ 
++// The video overlay, as window B of the panel's controller shows it
++struct hdmi_overlay {
++	bool	visible;
++	uint32	physical;		// of the source buffer
++	uint32	color_depth;
++	uint32	byte_swap;
++	uint32	options;		// window options: enable, filters, CSC
++	uint32	bytes_per_pixel;
++	uint32	bytes_per_row;
++	uint32	source_x;		// in pixels
++	uint32	source_y;
++	uint32	source_width;
++	uint32	source_height;
++	uint32	x;				// on the panel
++	uint32	y;
++	uint32	width;
++	uint32	height;
++	bool	color_key;
++	uint32	key_lower;
++	uint32	key_upper;
++};
++
++void hdmi_set_overlay(const hdmi_overlay& overlay);
++
+ 
+ #endif	// TEGRA_DC_HDMI_H
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp b/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
+index 085afc8d03..374a759e2d 100644
+--- a/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
+@@ -790,6 +790,9 @@ configure_overlay(const tegra_dc_overlay_config& config)
+ 		setup_overlay_window();
+ 
+ 	if (!config.enable) {
++		hdmi_overlay hidden = {};
++		hdmi_set_overlay(hidden);
++
+ 		select_window(WINDOW_B_SELECT);
+ 		write_dc(WIN_OPTIONS, 0);
+ 		select_window(WINDOW_A_SELECT);
+@@ -884,6 +887,27 @@ configure_overlay(const tegra_dc_overlay_config& config)
+ 	read_dc(DC_CMD_STATE_CONTROL);
+ 	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_ACT_REQ | STATE_WIN_A_ACT_REQ
+ 		| STATE_WIN_B_ACT_REQ);
++
++	hdmi_overlay mirror;
++	mirror.visible = true;
++	mirror.physical = sDevice.overlay_buffers[slot].physical;
++	mirror.color_depth = colorDepth;
++	mirror.byte_swap = byteSwap;
++	mirror.options = options;
++	mirror.bytes_per_pixel = bytesPerPixel;
++	mirror.bytes_per_row = config.bytes_per_row;
++	mirror.source_x = sourceX;
++	mirror.source_y = config.source_y;
++	mirror.source_width = config.source_width;
++	mirror.source_height = config.source_height;
++	mirror.x = config.x;
++	mirror.y = config.y;
++	mirror.width = config.width;
++	mirror.height = config.height;
++	mirror.color_key = config.color_key;
++	mirror.key_lower = config.key_lower;
++	mirror.key_upper = config.key_upper;
++	hdmi_set_overlay(mirror);
+ 	return B_OK;
+ }
+ 
+diff --git a/src/kits/interface/Bitmap.cpp b/src/kits/interface/Bitmap.cpp
+index 59883a3206..3054036aa3 100644
+--- a/src/kits/interface/Bitmap.cpp
++++ b/src/kits/interface/Bitmap.cpp
+@@ -505,9 +505,10 @@ overlay_bits(overlay_client_data* data)
+ 	if (data->client_source != data->area) {
+ 		if (data->client_area >= 0)
+ 			delete_area(data->client_area);
++		// cloneable: media nodes pass it on as a buffer (VideoConsumer)
+ 		data->client_area = clone_area("overlay bitmap",
+ 			(void**)&data->client_base, B_ANY_ADDRESS,
+-			B_READ_AREA | B_WRITE_AREA, data->area);
++			B_READ_AREA | B_WRITE_AREA | B_CLONEABLE_AREA, data->area);
+ 		if (data->client_area < 0) {
+ 			data->client_source = -1;
+ 			return NULL;

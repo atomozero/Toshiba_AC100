@@ -1,7 +1,7 @@
-From ce4c6f23aa235fce572561006a12dda4efbbb7c0 Mon Sep 17 00:00:00 2001
+From d7312af64b3bc58c4e6dc17deafd01222a5cf7b4 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 12:01:36 +0200
-Subject: [PATCH 004/203] SupportDefs: use a strong compare-and-swap in
+Subject: [PATCH 004/270] SupportDefs: use a strong compare-and-swap in
  atomic_test_and_set()
 
 atomic_test_and_set() and atomic_test_and_set64() used a weak

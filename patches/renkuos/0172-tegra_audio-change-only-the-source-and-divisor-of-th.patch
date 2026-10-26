@@ -1,7 +1,7 @@
-From bb58fd3e5e3eaaaba2be520673d72f03f1690dae Mon Sep 17 00:00:00 2001
+From 8cb521f77e19f9a1c3b1e9e8e4487e8cafd3e82a Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Tue, 20 Oct 2026 20:38:57 +0200
-Subject: [PATCH 172/203] tegra_audio: change only the source and divisor of
+Subject: [PATCH 172/270] tegra_audio: change only the source and divisor of
  the I2S1 clock
 
 Write the source and the divisor of CLK_SOURCE_I2S1 and keep its other

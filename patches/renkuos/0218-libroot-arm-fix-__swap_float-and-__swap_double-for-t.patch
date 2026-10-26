@@ -1,0 +1,57 @@
+From 92d0c642a86834d639ace2791eb2cbb83e9f32c8 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 25 Oct 2026 11:07:04 +0100
+Subject: [PATCH 218/270] libroot: arm: fix __swap_float and __swap_double for
+ the hard-float ABI
+
+With the hard-float ABI floats and doubles are passed and returned in
+s0/d0, but both functions swapped r0, so they returned their argument
+unchanged; __swap_double also only swapped 32 bits. B_HOST_TO_BENDIAN_FLOAT
+and friends were no-ops, and a translator writing a TranslatorBitmap
+header with them (the JPEG translator) produced bounds that the readers
+using swap_data() could not parse.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/system/libroot/os/arch/arm/byteorder.S | 22 ++++++++++++++++++----
+ 1 file changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/src/system/libroot/os/arch/arm/byteorder.S b/src/system/libroot/os/arch/arm/byteorder.S
+index 5189c683f9..1e53e08eff 100644
+--- a/src/system/libroot/os/arch/arm/byteorder.S
++++ b/src/system/libroot/os/arch/arm/byteorder.S
+@@ -65,16 +65,30 @@ FUNCTION_END(__swap_int64)
+ /* float __swap_float(float value)
+  */
+ FUNCTION(__swap_float):
++#ifdef __ARM_PCS_VFP
++		/* the hard-float ABI passes and returns floats in s0 */
++		vmov	r0, s0
++		rev		r0, r0
++		vmov	s0, r0
++		mov		pc, lr
++#else
+ 		b		__swap_int32
+-		//rts
++#endif
+ FUNCTION_END(__swap_float)
+ 
+ 
+ /* double __swap_double(double value)
+  */
+ FUNCTION(__swap_double):
+-		b		__swap_int32
+-		//rts
+-#warning M68K: XXX:check sizeof(double)
++#ifdef __ARM_PCS_VFP
++		/* the hard-float ABI passes and returns doubles in d0 */
++		vmov	r0, r1, d0
++		rev		r2, r0
++		rev		r0, r1
++		vmov	d0, r0, r2
++		mov		pc, lr
++#else
++		b		__swap_int64
++#endif
+ FUNCTION_END(__swap_double)
+ 

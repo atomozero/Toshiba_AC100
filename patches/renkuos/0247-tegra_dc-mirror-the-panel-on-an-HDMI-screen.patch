@@ -1,0 +1,1272 @@
+From 3b8644425c70782f92106ada889bfd77d9bb15ec Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 26 Oct 2026 07:28:26 +0100
+Subject: [PATCH 247/270] tegra_dc: mirror the panel on an HDMI screen
+
+While the hot plug line (GPIO N7 on the AC100) shows a screen, power
+the HDMI block (TPS6586x LDO7 and LDO8), read the screen's EDID over
+the DDC bus (I2C2), set PLL_D to twice the pixel clock and start
+display controller B and the HDMI serializer. Display controller B
+scans out the panel's frame buffer, scaled to the screen's preferred
+mode without changing its proportions, or to 1280x720 without a
+usable EDID mode. HDMI sinks get an AVI infoframe, DVI sinks plain
+TMDS. Unplugging stops everything again.
+
+'hdmi false' in the tegra_dc driver settings keeps the HDMI block off.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../kernel/drivers/graphics/tegra_dc/Jamfile  |    1 +
+ .../kernel/drivers/graphics/tegra_dc/hdmi.cpp | 1158 +++++++++++++++++
+ .../kernel/drivers/graphics/tegra_dc/hdmi.h   |   22 +
+ .../drivers/graphics/tegra_dc/tegra_dc.cpp    |   10 +
+ 4 files changed, 1191 insertions(+)
+ create mode 100644 src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
+ create mode 100644 src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.h
+
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/Jamfile b/src/add-ons/kernel/drivers/graphics/tegra_dc/Jamfile
+index 1299df76fa..ff28148c1a 100644
+--- a/src/add-ons/kernel/drivers/graphics/tegra_dc/Jamfile
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/Jamfile
+@@ -6,6 +6,7 @@ UsePrivateKernelHeaders ;
+ UseLibraryHeaders [ FDirName libfdt ] ;
+ 
+ KernelAddon tegra_dc :
++	hdmi.cpp
+ 	tegra_dc.cpp
+ 	:
+ 	kernel_fdt.a
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
+new file mode 100644
+index 0000000000..5bf6f19bb7
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
+@@ -0,0 +1,1158 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++/*!	HDMI output of the Tegra 2: while a screen is plugged in, display
++	controller B scans out the panel's frame buffer, scaled to the screen's
++	mode, and the HDMI block sends it out as TMDS.
++
++	The register descriptions of the HDMI block are not in the public
++	Technical Reference Manual; the register layout and the power up
++	sequence follow the Linux tegra-drm driver, used as documentation only.
++	On the Toshiba AC100 the HDMI block is powered by LDO7 (AVDD_HDMI,
++	3.3 V) and LDO8 (AVDD_HDMI_PLL, 1.8 V) of the TPS6586x, the hot plug
++	detect line is GPIO N7 and the DDC bus is I2C2.
++*/
++
++
++#include "hdmi.h"
++
++#include <stdio.h>
++#include <string.h>
++
++#include <KernelExport.h>
++#include <OS.h>
++#include <driver_settings.h>
++#include <lock.h>
++#include <util/AutoLock.h>
++
++
++#define ERROR(x...) dprintf("tegra_dc: hdmi: " x)
++
++
++extern "C" status_t arm_dvc_i2c_read(uint8 address, uint8 reg, uint8* data,
++	uint32 length);
++extern "C" status_t arm_dvc_i2c_write(uint8 address, uint8 reg,
++	const uint8* data, uint32 length);
++
++
++// TPS6586x power management IC
++#define TPS6586X_ADDRESS			0x34
++#define TPS6586X_SUPPLYENC			0x12
++#define TPS6586X_SUPPLYEND			0x13
++#define TPS6586X_LDO7				(1 << 5)	// AVDD_HDMI
++#define TPS6586X_LDO8				(1 << 6)	// AVDD_HDMI_PLL
++
++// Clock and reset controller
++#define TEGRA20_CAR_BASE			0x60006000
++#define CAR_RST_DEVICES_L			0x004
++#define CAR_RST_DEVICES_H			0x008
++#define CAR_CLK_OUT_ENB_L			0x010
++#define CAR_CLK_OUT_ENB_H			0x014
++#define CAR_PLLD_BASE				0x0d0
++#define CAR_PLLD_MISC				0x0dc
++#define CAR_CLK_SOURCE_DISP2		0x13c
++#define CAR_CLK_SOURCE_HDMI			0x18c
++#define CAR_CLK_SOURCE_I2C2			0x198
++#define CAR_DISP2_BIT				(1u << 26)	// in the L registers
++#define CAR_HDMI_BIT				(1u << 19)	// in the H registers
++#define CAR_I2C2_BIT				(1u << 22)	// in the H registers
++#define CAR_SOURCE_PLL_D_OUT0		(1u << 30)
++#define CAR_SOURCE_PLL_P			(0u << 30)
++
++#define PLLD_BYPASS					(1u << 31)
++#define PLLD_ENABLE					(1u << 30)
++#define PLLD_LOCK					(1u << 27)
++#define PLLD_DIVN(n)				((uint32)(n) << 8)
++#define PLLD_DIVM(m)				((uint32)(m) << 0)
++#define PLLD_MISC_LOCK_ENABLE		(1u << 22)
++#define PLLD_MISC_CPCON(x)			((uint32)(x) << 8)
++#define PLLD_MISC_LFCON(x)			((uint32)(x) << 4)
++#define OSC_KHZ						12000
++
++// GPIO port N is in bank 3; the masked registers are 0x800 further
++#define TEGRA20_GPIO_BASE			0x6000d000
++#define GPIO_BANK3_PORT1			(0x180 + 0x04)
++#define GPIO_CNF					0x000
++#define GPIO_OE						0x010
++#define GPIO_IN						0x030
++#define GPIO_MASKED					0x800
++#define HOT_PLUG_BIT				7
++
++// I2C2, the DDC bus
++#define TEGRA20_I2C2_BASE			0x7000c400
++#define I2C_CNFG					0x000
++#define I2C_CNFG_PACKET_MODE		(1u << 10)
++#define I2C_CNFG_NEW_MASTER_FSM		(1u << 11)
++#define I2C_CNFG_DEBOUNCE(x)		((uint32)(x) << 12)
++#define I2C_SL_CNFG					0x020
++#define I2C_SL_CNFG_NACK			(1u << 1)
++#define I2C_SL_CNFG_NEWSL			(1u << 2)
++#define I2C_SL_ADDR1				0x02c
++#define I2C_SL_ADDR2				0x030
++#define I2C_TX_FIFO					0x050
++#define I2C_RX_FIFO					0x054
++#define I2C_FIFO_CONTROL			0x05c
++#define I2C_FIFO_FLUSH				0x03
++#define I2C_FIFO_STATUS				0x060
++#define I2C_FIFO_STATUS_RX(x)		((x) & 0xf)
++#define I2C_FIFO_STATUS_TX(x)		(((x) >> 4) & 0xf)
++#define I2C_INT_STATUS				0x068
++#define I2C_INT_ARBITRATION_LOST	(1u << 2)
++#define I2C_INT_NO_ACK				(1u << 3)
++#define I2C_INT_PACKET_COMPLETE		(1u << 7)
++#define I2C_PACKET_PROTOCOL_I2C		(1u << 4)
++#define I2C_PACKET_ID(id)			((uint32)(id) << 16)
++#define I2C_HEADER_REPEAT_START		(1u << 16)
++#define I2C_HEADER_IE_ENABLE		(1u << 17)
++#define I2C_HEADER_READ				(1u << 19)
++#define DDC_BUS_KHZ					100
++#define DDC_EDID_ADDRESS			0x50
++
++// Display controller B (word offsets)
++#define TEGRA20_DC_B_BASE			0x54240000
++#define TEGRA20_DC_SIZE				0x10000
++#define DC_CMD_DISPLAY_COMMAND		0x032
++#define DISPLAY_CTRL_C_DISPLAY		(1u << 5)
++#define DC_CMD_DISPLAY_POWER_CONTROL	0x036
++#define DISPLAY_POWER_ALL			0x00050155	// PW0-PW4, PM0, PM1
++#define DC_CMD_INT_MASK				0x038
++#define DC_CMD_INT_ENABLE			0x039
++#define DC_CMD_STATE_CONTROL		0x041
++#define STATE_GENERAL_ACT_REQ		(1u << 0)
++#define STATE_WIN_A_ACT_REQ			(1u << 1)
++#define STATE_GENERAL_UPDATE		(1u << 8)
++#define STATE_WIN_A_UPDATE			(1u << 9)
++#define DC_CMD_DISPLAY_WINDOW_HEADER	0x042
++#define WINDOW_A_SELECT				(1u << 4)
++#define WINDOW_B_SELECT				(1u << 5)
++#define WINDOW_C_SELECT				(1u << 6)
++#define DC_DISP_SIGNAL_OPTIONS0		0x400
++#define H_PULSE2_ENABLE				(1u << 12)
++#define DC_DISP_WIN_OPTIONS			0x402
++#define HDMI_ENABLE					(1u << 30)
++#define DC_DISP_MEM_HIGH_PRIORITY	0x403
++#define DC_DISP_MEM_HIGH_PRIORITY_TIMER	0x404
++#define DC_DISP_TIMING_OPTIONS		0x405
++#define DC_DISP_REF_TO_SYNC			0x406
++#define DC_DISP_SYNC_WIDTH			0x407
++#define DC_DISP_BACK_PORCH			0x408
++#define DC_DISP_ACTIVE				0x409
++#define DC_DISP_FRONT_PORCH			0x40a
++#define DC_DISP_H_PULSE2_CONTROL	0x415
++#define PULSE_QUAL_VACTIVE			(2u << 6)
++#define PULSE_LAST_END_A			(1u << 8)
++#define DC_DISP_H_PULSE2_POSITION_A	0x416
++#define DC_DISP_CLOCK_CONTROL		0x42e
++#define DC_DISP_INTERFACE_CONTROL	0x42f
++#define DC_DISP_COLOR_CONTROL		0x430
++#define BASE_COLOR_SIZE_888			8
++#define DC_DISP_BORDER_COLOR		0x435
++
++#define WIN_OPTIONS					0x700
++#define WIN_OPTIONS_COLOR_EXPAND	(1u << 6)
++#define WIN_OPTIONS_ENABLE			(1u << 30)
++#define WIN_BYTE_SWAP				0x701
++#define WIN_COLOR_DEPTH				0x703
++#define WIN_POSITION				0x704
++#define WIN_SIZE					0x705
++#define WIN_PRESCALED_SIZE			0x706
++#define WIN_H_INITIAL_DDA			0x707
++#define WIN_V_INITIAL_DDA			0x708
++#define WIN_DDA_INCREMENT			0x709
++#define WIN_LINE_STRIDE				0x70a
++#define WIN_BUF_STRIDE				0x70b
++#define WIN_BUFFER_ADDR_MODE		0x70d
++#define WIN_BLEND_NOKEY				0x70f
++#define WIN_BLEND_1WIN				0x710
++#define WIN_BLEND_2WIN_X			0x711
++#define WIN_BLEND_2WIN_Y			0x712
++#define WIN_BLEND_3WIN				0x713
++#define WINBUF_START_ADDR			0x800
++#define WINBUF_ADDR_H_OFFSET		0x806
++#define WINBUF_ADDR_V_OFFSET		0x808
++#define BLEND_FIX_255				0x00ffff00
++#define COLOR_DEPTH_B5G6R5			6
++
++// HDMI block (word offsets)
++#define TEGRA20_HDMI_BASE			0x54280000
++#define HDMI_SIZE					0x1000
++#define HDMI_SOR_STATE0				0x01
++#define SOR_STATE_UPDATE			(1u << 0)
++#define HDMI_SOR_STATE1				0x02
++#define SOR_STATE_HEAD_OPMODE_AWAKE	(2u << 0)
++#define SOR_STATE_ORMODE_NORMAL		(1u << 2)
++#define SOR_STATE_ATTACHED			(1u << 3)
++#define HDMI_SOR_STATE2				0x03
++#define SOR_STATE_OWNER_HEAD0		(1u << 0)
++#define SOR_STATE_SUBOWNER_BOTH		(3u << 4)
++#define SOR_STATE_CRCMODE_COMPLETE	(1u << 6)
++#define SOR_STATE_PROTOCOL_TMDS_A	(1u << 8)
++#define SOR_STATE_HSYNC_NEGATIVE	(1u << 12)
++#define SOR_STATE_VSYNC_NEGATIVE	(1u << 13)
++#define HDMI_AVI_INFOFRAME_CTRL		0x23
++#define INFOFRAME_CTRL_ENABLE		(1u << 0)
++#define HDMI_AVI_INFOFRAME_HEADER	0x25
++#define HDMI_CTRL					0x44
++#define HDMI_CTRL_REKEY(x)			((uint32)(x) & 0x7f)
++#define HDMI_CTRL_MAX_AC_PACKET(x)	(((uint32)(x) & 0x1f) << 16)
++#define HDMI_CTRL_ENABLE			(1u << 30)
++#define HDMI_REKEY					56
++#define HDMI_VSYNC_WINDOW			0x46
++#define VSYNC_WINDOW_END(x)			((uint32)(x) & 0x3ff)
++#define VSYNC_WINDOW_START(x)		(((uint32)(x) & 0x3ff) << 16)
++#define VSYNC_WINDOW_ENABLE			(1u << 31)
++#define HDMI_SOR_PWR				0x55
++#define SOR_PWR_NORMAL_STATE_PU		(1u << 0)
++#define SOR_PWR_SETTING_NEW			(1u << 31)	// trigger, then pending
++#define HDMI_SOR_PLL0				0x57
++#define SOR_PLL_PWR					(1u << 0)
++#define SOR_PLL_PDBG				(1u << 1)
++#define SOR_PLL_RESISTORSEL			(1u << 4)
++#define SOR_PLL_VCOCAP(x)			(((uint32)(x) & 0xf) << 8)
++#define SOR_PLL_BG_V17_S(x)			(((uint32)(x) & 0xf) << 12)
++#define SOR_PLL_ICHPMP(x)			(((uint32)(x) & 0xf) << 24)
++#define SOR_PLL_TX_REG_LOAD(x)		(((uint32)(x) & 0xf) << 28)
++#define HDMI_SOR_PLL1				0x58
++#define SOR_PLL_TMDS_TERM_ENABLE	(1u << 8)
++#define SOR_PLL_PE_EN				(1u << 28)
++#define HDMI_SOR_CSTM				0x5a
++#define SOR_CSTM_ROTCLK(x)			(((uint32)(x) & 0xf) << 24)
++#define SOR_CSTM_PLLDIV				(1u << 21)
++#define SOR_CSTM_LVDS_ENABLE		(1u << 16)
++#define SOR_CSTM_MODE_MASK			(3u << 12)
++#define SOR_CSTM_MODE_TMDS			(1u << 12)
++#define HDMI_SOR_SEQ_CTL			0x5f
++#define SOR_SEQ_PD_PC(x)			(((uint32)(x) & 0xf) << 8)
++#define SOR_SEQ_PD_PC_ALT(x)		(((uint32)(x) & 0xf) << 12)
++#define HDMI_SOR_SEQ_INST(x)		(0x60 + (x))
++#define SOR_SEQ_INST_WAIT_TIME(x)	((uint32)(x) & 0x3ff)
++#define SOR_SEQ_INST_WAIT_VSYNC		(2u << 12)
++#define SOR_SEQ_INST_HALT			(1u << 15)
++#define SOR_SEQ_INST_DRIVE_PWM_LOW	(1u << 23)
++#define HDMI_SOR_LANE_DRIVE_CURRENT	0x7e
++#define DRIVE_CURRENT_ALL(x)		((uint32)(x) * 0x01010101)
++#define DRIVE_CURRENT_7_125_MA		0x0f
++#define DRIVE_CURRENT_FUSE_OVERRIDE	(1u << 31)
++#define HDMI_SOR_REFCLK				0x95
++#define SOR_REFCLK_DIV_INT(x)		(((uint32)(x) & 0xff) << 8)
++#define SOR_REFCLK_DIV_FRAC(x)		(((uint32)(x) & 0x3) << 6)
++#define HDMI_INPUT_CONTROL			0x97
++#define HDMI_SOURCE_DISPLAY_B		(1u << 0)
++#define HDMI_VIDEO_RANGE_LIMITED	(1u << 1)
++#define HDMI_PE_CURRENT				0x99
++#define PE_CURRENT_ALL(x)			((uint32)(x) * 0x01010101)
++#define PE_CURRENT_6_MA				0x6
++
++#define POLL_INTERVAL				500000
++#define EDID_SIZE					256
++
++
++struct hdmi_mode {
++	uint32	pixel_clock;	// kHz
++	uint16	h_display, h_sync_start, h_sync_end, h_total;
++	uint16	v_display, v_sync_start, v_sync_end, v_total;
++	bool	h_sync_positive;
++	bool	v_sync_positive;
++	uint8	vic;			// CEA video identification code, or 0
++};
++
++
++// 1280x720 at 60 Hz (CEA-861 VIC 4), for screens without a usable EDID mode
++static const hdmi_mode k720p = {
++	74250, 1280, 1390, 1430, 1650, 720, 725, 730, 750, true, true, 4
++};
++
++
++static struct {
++	mutex			lock;
++	thread_id		thread;
++	volatile bool	quit;
++
++	area_id			car_area;
++	volatile uint32* car;
++	area_id			gpio_area;
++	volatile uint32* gpio;
++	area_id			i2c_area;
++	volatile uint32* i2c;
++	area_id			dc_area;
++	volatile uint32* dc;
++	area_id			hdmi_area;
++	volatile uint32* hdmi;
++
++	// what display controller B scans out
++	uint32			physical;
++	uint16			width;
++	uint16			height;
++	uint32			color_depth;
++	uint32			bytes_per_row;
++
++	bool			active;
++	hdmi_mode		mode;
++} sHdmi;
++
++
++static inline uint32
++read_car(uint32 offset)
++{
++	return sHdmi.car[offset / 4];
++}
++
++
++static inline void
++write_car(uint32 offset, uint32 value)
++{
++	sHdmi.car[offset / 4] = value;
++}
++
++
++static inline uint32
++read_dc(uint32 word)
++{
++	return sHdmi.dc[word];
++}
++
++
++static inline void
++write_dc(uint32 word, uint32 value)
++{
++	sHdmi.dc[word] = value;
++}
++
++
++static inline uint32
++read_hdmi(uint32 word)
++{
++	return sHdmi.hdmi[word];
++}
++
++
++static inline void
++write_hdmi(uint32 word, uint32 value)
++{
++	sHdmi.hdmi[word] = value;
++}
++
++
++static volatile uint32*
++map_registers(const char* name, phys_addr_t base, size_t size, area_id* _area)
++{
++	void* address;
++	*_area = map_physical_memory(name, base, size, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++	return *_area >= 0 ? (volatile uint32*)address : NULL;
++}
++
++
++/*!	Turns the clock of a block on and takes it out of reset, or puts it
++	back into reset and stops its clock.
++*/
++static void
++enable_block(uint32 enableRegister, uint32 resetRegister, uint32 bit,
++	bool enable)
++{
++	if (enable) {
++		write_car(resetRegister, read_car(resetRegister) | bit);
++		write_car(enableRegister, read_car(enableRegister) | bit);
++		snooze(1000);
++		write_car(resetRegister, read_car(resetRegister) & ~bit);
++		spin(10);
++	} else {
++		write_car(resetRegister, read_car(resetRegister) | bit);
++		write_car(enableRegister, read_car(enableRegister) & ~bit);
++	}
++}
++
++
++//	#pragma mark - power and hot plug
++
++
++static status_t
++set_hdmi_power(bool on)
++{
++	const uint8 supplies = TPS6586X_LDO7 | TPS6586X_LDO8;
++	const uint8 registers[] = { TPS6586X_SUPPLYENC, TPS6586X_SUPPLYEND };
++	for (size_t i = 0; i < B_COUNT_OF(registers); i++) {
++		uint8 value;
++		status_t status = arm_dvc_i2c_read(TPS6586X_ADDRESS, registers[i],
++			&value, 1);
++		if (status != B_OK)
++			return status;
++		uint8 newValue = on ? value | supplies : value & ~supplies;
++		if (newValue == value)
++			continue;
++		status = arm_dvc_i2c_write(TPS6586X_ADDRESS, registers[i], &newValue,
++			1);
++		if (status != B_OK)
++			return status;
++	}
++	if (on)
++		snooze(5000);
++	return B_OK;
++}
++
++
++static void
++setup_hot_plug_pin()
++{
++	// GPIO mode, input: the masked registers change only this pin
++	volatile uint32* port = sHdmi.gpio + GPIO_BANK3_PORT1 / 4;
++	port[(GPIO_MASKED + GPIO_OE) / 4] = 1u << (HOT_PLUG_BIT + 8);
++	port[(GPIO_MASKED + GPIO_CNF) / 4]
++		= (1u << (HOT_PLUG_BIT + 8)) | (1u << HOT_PLUG_BIT);
++}
++
++
++static bool
++screen_plugged()
++{
++	volatile uint32* port = sHdmi.gpio + GPIO_BANK3_PORT1 / 4;
++	return (port[GPIO_IN / 4] & (1u << HOT_PLUG_BIT)) != 0;
++}
++
++
++//	#pragma mark - DDC
++
++
++/*!	The tegra_i2c bus driver usually runs I2C2 already, at the 100 kHz of
++	the DDC bus and with no devices on it: then its clock and reset are left
++	alone.
++*/
++static void
++setup_ddc()
++{
++	if ((read_car(CAR_CLK_OUT_ENB_H) & CAR_I2C2_BIT) == 0
++		|| (read_car(CAR_RST_DEVICES_H) & CAR_I2C2_BIT) != 0) {
++		write_car(CAR_CLK_SOURCE_I2C2, CAR_SOURCE_PLL_P
++			| ((216000 + 8 * DDC_BUS_KHZ - 1) / (8 * DDC_BUS_KHZ) - 1));
++		enable_block(CAR_CLK_OUT_ENB_H, CAR_RST_DEVICES_H, CAR_I2C2_BIT,
++			true);
++	}
++
++	volatile uint32* i2c = sHdmi.i2c;
++	i2c[I2C_CNFG / 4] = I2C_CNFG_NEW_MASTER_FSM | I2C_CNFG_PACKET_MODE
++		| I2C_CNFG_DEBOUNCE(2);
++	// not a slave
++	i2c[I2C_SL_CNFG / 4] |= I2C_SL_CNFG_NACK | I2C_SL_CNFG_NEWSL;
++	i2c[I2C_SL_ADDR1 / 4] = 0xfc;
++	i2c[I2C_SL_ADDR2 / 4] = 0;
++}
++
++
++template<typename Condition>
++static bool
++ddc_wait(Condition condition)
++{
++	for (int32 i = 0; i < 50000; i++) {
++		if (condition())
++			return true;
++		spin(1);
++	}
++	return false;
++}
++
++
++/*!	One I2C message on the DDC bus: writes \a length bytes of \a data or
++	reads them into it. With \a repeatStart the bus is kept for the next one.
++*/
++static status_t
++ddc_transfer(uint8 address, uint8* data, uint32 length, bool read,
++	bool repeatStart)
++{
++	volatile uint32* i2c = sHdmi.i2c;
++	if (length == 0 || length > 32)
++		return B_BAD_VALUE;
++
++	i2c[I2C_FIFO_CONTROL / 4] |= I2C_FIFO_FLUSH;
++	if (!ddc_wait([i2c] {
++			return (i2c[I2C_FIFO_CONTROL / 4] & I2C_FIFO_FLUSH) == 0; })) {
++		return B_TIMED_OUT;
++	}
++	i2c[I2C_INT_STATUS / 4] = 0xffffffff;
++
++	uint32 words[3 + 8];
++	uint32 count = 0;
++	words[count++] = I2C_PACKET_PROTOCOL_I2C | I2C_PACKET_ID(1);
++	words[count++] = length - 1;
++	words[count++] = (address << 1) | I2C_HEADER_IE_ENABLE
++		| (read ? I2C_HEADER_READ : 0)
++		| (repeatStart ? I2C_HEADER_REPEAT_START : 0);
++	if (!read) {
++		for (uint32 i = 0; i < length; i += 4) {
++			uint32 word = 0;
++			for (uint32 j = 0; j < 4 && i + j < length; j++)
++				word |= (uint32)data[i + j] << (j * 8);
++			words[count++] = word;
++		}
++	}
++
++	for (uint32 i = 0; i < count; i++) {
++		if (!ddc_wait([i2c] {
++				return I2C_FIFO_STATUS_TX(i2c[I2C_FIFO_STATUS / 4]) > 0; })) {
++			return B_TIMED_OUT;
++		}
++		i2c[I2C_TX_FIFO / 4] = words[i];
++	}
++
++	if (read) {
++		for (uint32 i = 0; i < length; i += 4) {
++			if (!ddc_wait([i2c] {
++					return I2C_FIFO_STATUS_RX(i2c[I2C_FIFO_STATUS / 4]) > 0
++						|| (i2c[I2C_INT_STATUS / 4] & I2C_INT_NO_ACK) != 0;
++					})
++				|| I2C_FIFO_STATUS_RX(i2c[I2C_FIFO_STATUS / 4]) == 0) {
++				return B_IO_ERROR;
++			}
++			uint32 word = i2c[I2C_RX_FIFO / 4];
++			for (uint32 j = 0; j < 4 && i + j < length; j++)
++				data[i + j] = word >> (j * 8);
++		}
++	}
++
++	uint32 status = 0;
++	bool done = ddc_wait([i2c, &status] {
++		status = i2c[I2C_INT_STATUS / 4];
++		return (status & (I2C_INT_PACKET_COMPLETE | I2C_INT_NO_ACK
++			| I2C_INT_ARBITRATION_LOST)) != 0; });
++	i2c[I2C_INT_STATUS / 4] = status;
++	if (!done)
++		return B_TIMED_OUT;
++	if ((status & (I2C_INT_NO_ACK | I2C_INT_ARBITRATION_LOST)) != 0)
++		return B_IO_ERROR;
++	return B_OK;
++}
++
++
++/*!	Reads the base EDID block and, if there is one, the first extension. */
++static status_t
++read_edid(uint8* edid, uint32* _size)
++{
++	uint32 size = 128;
++	for (uint32 offset = 0; offset < size; offset += 32) {
++		uint8 start = offset;
++		status_t status = ddc_transfer(DDC_EDID_ADDRESS, &start, 1, false,
++			true);
++		if (status == B_OK) {
++			status = ddc_transfer(DDC_EDID_ADDRESS, edid + offset, 32, true,
++				false);
++		}
++		if (status != B_OK)
++			return status;
++		if (offset == 96 && edid[126] > 0)
++			size = EDID_SIZE;
++	}
++
++	static const uint8 kHeader[] = { 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0 };
++	if (memcmp(edid, kHeader, sizeof(kHeader)) != 0)
++		return B_BAD_DATA;
++	*_size = size;
++	return B_OK;
++}
++
++
++//	#pragma mark - modes
++
++
++static uint8
++cea_vic(const hdmi_mode& mode)
++{
++	uint32 refresh = (mode.pixel_clock * 1000 + mode.h_total * mode.v_total / 2)
++		/ (mode.h_total * mode.v_total);
++	struct { uint16 width, height; uint32 refresh; uint8 vic; } kModes[] = {
++		{ 640, 480, 60, 1 }, { 720, 480, 60, 2 }, { 1280, 720, 60, 4 },
++		{ 1920, 1080, 60, 16 }, { 720, 576, 50, 17 }, { 1280, 720, 50, 19 },
++		{ 1920, 1080, 50, 31 },
++	};
++	for (size_t i = 0; i < B_COUNT_OF(kModes); i++) {
++		if (kModes[i].width == mode.h_display
++			&& kModes[i].height == mode.v_display
++			&& kModes[i].refresh == refresh) {
++			return kModes[i].vic;
++		}
++	}
++	return 0;
++}
++
++
++/*!	A detailed timing descriptor of an EDID, if it is one this hardware can
++	drive: progressive, separate sync, up to 1920x1200 and 148.5 MHz.
++*/
++static bool
++parse_detailed_timing(const uint8* d, hdmi_mode& mode)
++{
++	uint32 pixelClock = (d[0] | (d[1] << 8)) * 10;
++	if (pixelClock == 0)
++		return false;
++
++	uint32 hActive = d[2] | ((d[4] >> 4) << 8);
++	uint32 hBlank = d[3] | ((d[4] & 0xf) << 8);
++	uint32 vActive = d[5] | ((d[7] >> 4) << 8);
++	uint32 vBlank = d[6] | ((d[7] & 0xf) << 8);
++	uint32 hSyncOffset = d[8] | (((d[11] >> 6) & 3) << 8);
++	uint32 hSyncWidth = d[9] | (((d[11] >> 4) & 3) << 8);
++	uint32 vSyncOffset = (d[10] >> 4) | (((d[11] >> 2) & 3) << 4);
++	uint32 vSyncWidth = (d[10] & 0xf) | ((d[11] & 3) << 4);
++	uint8 flags = d[17];
++
++	if ((flags & 0x80) != 0 || (flags & 0x18) != 0x18
++		|| pixelClock > 148500 || hActive > 1920 || vActive > 1200
++		|| hActive < 640 || vActive < 480) {
++		return false;
++	}
++
++	mode.pixel_clock = pixelClock;
++	mode.h_display = hActive;
++	mode.h_sync_start = hActive + hSyncOffset;
++	mode.h_sync_end = mode.h_sync_start + hSyncWidth;
++	mode.h_total = hActive + hBlank;
++	mode.v_display = vActive;
++	mode.v_sync_start = vActive + vSyncOffset;
++	mode.v_sync_end = mode.v_sync_start + vSyncWidth;
++	mode.v_total = vActive + vBlank;
++	mode.h_sync_positive = (flags & 0x02) != 0;
++	mode.v_sync_positive = (flags & 0x04) != 0;
++	mode.vic = cea_vic(mode);
++	return true;
++}
++
++
++/*!	A screen is an HDMI sink, rather than a DVI one, if its CEA extension
++	has the HDMI vendor specific data block.
++*/
++static bool
++is_hdmi_sink(const uint8* edid, uint32 size)
++{
++	if (size < 256 || edid[128] != 0x02)
++		return false;
++	const uint8* cea = edid + 128;
++	uint32 end = cea[2];
++	for (uint32 i = 4; i < end && i < 127;) {
++		uint32 tag = cea[i] >> 5;
++		uint32 length = cea[i] & 0x1f;
++		if (tag == 3 && length >= 3 && cea[i + 1] == 0x03
++			&& cea[i + 2] == 0x0c && cea[i + 3] == 0x00) {
++			return true;
++		}
++		i += 1 + length;
++	}
++	return false;
++}
++
++
++//	#pragma mark - display controller B
++
++
++/*!	PLL_D runs at twice the pixel clock: display controller B and the HDMI
++	block take its output divided by two.
++*/
++static status_t
++set_pll_d(uint32 pixelClock)
++{
++	uint32 target = pixelClock * 2;
++	uint32 bestM = 0, bestN = 0, bestError = ~0u;
++	// comparison frequency 1 - 6 MHz
++	for (uint32 m = 2; m <= OSC_KHZ / 1000; m++) {
++		uint32 n = (target * m + OSC_KHZ / 2) / OSC_KHZ;
++		if (n < 1 || n > 1023)
++			continue;
++		uint32 rate = OSC_KHZ * n / m;
++		uint32 error = rate > target ? rate - target : target - rate;
++		if (error < bestError) {
++			bestError = error;
++			bestM = m;
++			bestN = n;
++		}
++	}
++	if (bestM == 0 || bestError * 200 > target)
++		return B_BAD_VALUE;
++
++	// Charge pump current by the feedback divider (TRM table 17)
++	uint32 cpcon = bestN < 150 ? 2 : bestN < 450 ? 4 : bestN < 800 ? 8 : 12;
++
++	write_car(CAR_PLLD_BASE, PLLD_BYPASS | PLLD_DIVN(bestN)
++		| PLLD_DIVM(bestM));
++	write_car(CAR_PLLD_MISC, PLLD_MISC_LOCK_ENABLE | PLLD_MISC_CPCON(cpcon)
++		| PLLD_MISC_LFCON(bestN >= 600 ? 1 : 0));
++	write_car(CAR_PLLD_BASE, read_car(CAR_PLLD_BASE) | PLLD_ENABLE);
++
++	bigtime_t timeout = system_time() + 10000;
++	while ((read_car(CAR_PLLD_BASE) & PLLD_LOCK) == 0) {
++		if (system_time() > timeout) {
++			ERROR("PLL_D does not lock (n %" B_PRIu32 ", m %" B_PRIu32 ")\n",
++				bestN, bestM);
++			write_car(CAR_PLLD_BASE, 0);
++			return B_TIMED_OUT;
++		}
++		spin(10);
++	}
++	write_car(CAR_PLLD_BASE, read_car(CAR_PLLD_BASE) & ~PLLD_BYPASS);
++
++	dprintf("tegra_dc: hdmi: PLL_D %" B_PRIu32 " kHz (n %" B_PRIu32 ", m %"
++		B_PRIu32 ")\n", OSC_KHZ * bestN / bestM, bestN, bestM);
++	return B_OK;
++}
++
++
++static uint32
++dda_increment(uint32 source, uint32 target)
++{
++	if (target <= 1 || source <= 1)
++		return 0x1000;
++	return ((source - 1) * 0x1000 + (target - 1) / 2) / (target - 1);
++}
++
++
++/*!	Window A of display controller B shows the panel's frame buffer, scaled
++	to fill the screen without changing its proportions.
++*/
++static void
++program_mirror_window()
++{
++	const hdmi_mode& mode = sHdmi.mode;
++	uint32 bytesPerPixel = sHdmi.color_depth == COLOR_DEPTH_B5G6R5 ? 2 : 4;
++
++	uint32 width = mode.h_display;
++	uint32 height = (uint32)sHdmi.height * width / sHdmi.width;
++	if (height > mode.v_display) {
++		height = mode.v_display;
++		width = (uint32)sHdmi.width * height / sHdmi.height;
++	}
++	uint32 x = (mode.h_display - width) / 2;
++	uint32 y = (mode.v_display - height) / 2;
++
++	write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_A_SELECT);
++	write_dc(WIN_COLOR_DEPTH, sHdmi.color_depth);
++	write_dc(WIN_BYTE_SWAP, 0);
++	write_dc(WIN_POSITION, (y << 16) | x);
++	write_dc(WIN_SIZE, (height << 16) | width);
++	write_dc(WIN_PRESCALED_SIZE, ((uint32)sHdmi.height << 16)
++		| (sHdmi.width * bytesPerPixel));
++	write_dc(WIN_H_INITIAL_DDA, 0);
++	write_dc(WIN_V_INITIAL_DDA, 0);
++	write_dc(WIN_DDA_INCREMENT, (dda_increment(sHdmi.height, height) << 16)
++		| dda_increment(sHdmi.width, width));
++	write_dc(WIN_LINE_STRIDE, sHdmi.bytes_per_row);
++	write_dc(WIN_BUF_STRIDE, 0);
++	write_dc(WIN_BUFFER_ADDR_MODE, 0);
++	write_dc(WIN_BLEND_NOKEY, BLEND_FIX_255);
++	write_dc(WIN_BLEND_1WIN, BLEND_FIX_255);
++	write_dc(WINBUF_START_ADDR, sHdmi.physical);
++	write_dc(WINBUF_ADDR_H_OFFSET, 0);
++	write_dc(WINBUF_ADDR_V_OFFSET, 0);
++	write_dc(WIN_OPTIONS, WIN_OPTIONS_ENABLE
++		| (bytesPerPixel == 2 ? WIN_OPTIONS_COLOR_EXPAND : 0));
++
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_UPDATE | STATE_WIN_A_UPDATE);
++	read_dc(DC_CMD_STATE_CONTROL);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_ACT_REQ
++		| STATE_WIN_A_ACT_REQ);
++}
++
++
++static void
++start_display_controller()
++{
++	const hdmi_mode& mode = sHdmi.mode;
++
++	write_car(CAR_CLK_SOURCE_DISP2, CAR_SOURCE_PLL_D_OUT0);
++	enable_block(CAR_CLK_OUT_ENB_L, CAR_RST_DEVICES_L, CAR_DISP2_BIT, true);
++
++	write_dc(DC_CMD_INT_ENABLE, 0);
++	write_dc(DC_CMD_INT_MASK, 0);
++	write_dc(DC_DISP_MEM_HIGH_PRIORITY, 0x00202020);
++	write_dc(DC_DISP_MEM_HIGH_PRIORITY_TIMER, 0x00010101);
++	write_dc(DC_DISP_BORDER_COLOR, 0);
++
++	// Pixel clock = the controller clock (shift clock divider 0)
++	write_dc(DC_DISP_CLOCK_CONTROL, 0);
++	write_dc(DC_DISP_INTERFACE_CONTROL, 0);
++	write_dc(DC_DISP_TIMING_OPTIONS, 1);	// vsync at the first pixel
++	write_dc(DC_DISP_REF_TO_SYNC, (1 << 16) | 1);
++	write_dc(DC_DISP_SYNC_WIDTH, ((mode.v_sync_end - mode.v_sync_start) << 16)
++		| (mode.h_sync_end - mode.h_sync_start));
++	write_dc(DC_DISP_BACK_PORCH, ((mode.v_total - mode.v_sync_end) << 16)
++		| (mode.h_total - mode.h_sync_end));
++	write_dc(DC_DISP_FRONT_PORCH, ((mode.v_sync_start - mode.v_display) << 16)
++		| (mode.h_sync_start - mode.h_display));
++	write_dc(DC_DISP_ACTIVE, ((uint32)mode.v_display << 16) | mode.h_display);
++	write_dc(DC_DISP_COLOR_CONTROL, BASE_COLOR_SIZE_888);
++
++	// The HDMI video preamble comes from H pulse 2
++	uint32 pulseStart = 1 + (mode.h_sync_end - mode.h_sync_start)
++		+ (mode.h_total - mode.h_sync_end) - 10;
++	write_dc(DC_DISP_SIGNAL_OPTIONS0, H_PULSE2_ENABLE);
++	write_dc(DC_DISP_H_PULSE2_CONTROL, PULSE_QUAL_VACTIVE | PULSE_LAST_END_A);
++	write_dc(DC_DISP_H_PULSE2_POSITION_A, ((pulseStart + 8) << 16)
++		| pulseStart);
++
++	static const uint32 kOtherWindows[] = { WINDOW_B_SELECT,
++		WINDOW_C_SELECT };
++	for (size_t i = 0; i < B_COUNT_OF(kOtherWindows); i++) {
++		write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, kOtherWindows[i]);
++		write_dc(WIN_OPTIONS, 0);
++	}
++	program_mirror_window();
++
++	write_dc(DC_CMD_DISPLAY_COMMAND, DISPLAY_CTRL_C_DISPLAY);
++	write_dc(DC_CMD_DISPLAY_POWER_CONTROL, DISPLAY_POWER_ALL);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_UPDATE);
++	read_dc(DC_CMD_STATE_CONTROL);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_ACT_REQ);
++}
++
++
++static void
++stop_display_controller()
++{
++	write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_A_SELECT);
++	write_dc(WIN_OPTIONS, 0);
++	write_dc(DC_DISP_WIN_OPTIONS, 0);
++	write_dc(DC_CMD_DISPLAY_COMMAND, 0);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_UPDATE | STATE_WIN_A_UPDATE);
++	read_dc(DC_CMD_STATE_CONTROL);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_ACT_REQ
++		| STATE_WIN_A_ACT_REQ);
++	snooze(40000);
++	write_dc(DC_CMD_DISPLAY_POWER_CONTROL, 0);
++
++	enable_block(CAR_CLK_OUT_ENB_L, CAR_RST_DEVICES_L, CAR_DISP2_BIT, false);
++}
++
++
++//	#pragma mark - HDMI block
++
++
++/*!	The AVI infoframe: RGB, 16:9 or 4:3 picture, the CEA mode if it is one. */
++static void
++write_avi_infoframe()
++{
++	const hdmi_mode& mode = sHdmi.mode;
++	uint8 frame[17] = {};
++	frame[0] = 0x82;	// type
++	frame[1] = 2;		// version
++	frame[2] = 13;		// length
++	frame[4] = 0x10;	// RGB, active format present
++	bool wide = mode.h_display * 3 > mode.v_display * 4 + mode.v_display / 2;
++	frame[5] = (wide ? 0x20 : 0x10) | 0x08;	// picture aspect, same active
++	frame[7] = mode.vic;
++	uint8 sum = 0;
++	for (size_t i = 0; i < sizeof(frame); i++)
++		sum += frame[i];
++	frame[3] = 0x100 - sum;
++
++	write_hdmi(HDMI_AVI_INFOFRAME_HEADER, frame[0] | (frame[1] << 8)
++		| (frame[2] << 16));
++	// two subpacks of 7 bytes: 4 in the low word, 3 in the high one
++	uint32 word = HDMI_AVI_INFOFRAME_HEADER + 1;
++	for (size_t i = 3; i < sizeof(frame); i += 7) {
++		uint32 low = 0, high = 0;
++		for (size_t j = 0; j < 4 && i + j < sizeof(frame); j++)
++			low |= (uint32)frame[i + j] << (j * 8);
++		for (size_t j = 0; j < 3 && i + 4 + j < sizeof(frame); j++)
++			high |= (uint32)frame[i + 4 + j] << (j * 8);
++		write_hdmi(word++, low);
++		write_hdmi(word++, high);
++	}
++	write_hdmi(HDMI_AVI_INFOFRAME_CTRL, INFOFRAME_CTRL_ENABLE);
++}
++
++
++static status_t
++start_hdmi(bool hdmiSink)
++{
++	const hdmi_mode& mode = sHdmi.mode;
++
++	write_car(CAR_CLK_SOURCE_HDMI, CAR_SOURCE_PLL_D_OUT0);
++	enable_block(CAR_CLK_OUT_ENB_H, CAR_RST_DEVICES_H, CAR_HDMI_BIT, true);
++
++	// Power the serializer's PLL up
++	write_hdmi(HDMI_SOR_PLL0, read_hdmi(HDMI_SOR_PLL0) & ~SOR_PLL_PDBG);
++	spin(20);
++	write_hdmi(HDMI_SOR_PLL0, read_hdmi(HDMI_SOR_PLL0) & ~SOR_PLL_PWR);
++
++	write_hdmi(HDMI_VSYNC_WINDOW, VSYNC_WINDOW_ENABLE | VSYNC_WINDOW_START(0x200)
++		| VSYNC_WINDOW_END(0x210));
++	write_hdmi(HDMI_INPUT_CONTROL, HDMI_SOURCE_DISPLAY_B
++		| (mode.vic > 1 ? HDMI_VIDEO_RANGE_LIMITED : 0));
++
++	// Reference clock in quarters of MHz
++	uint32 quarters = mode.pixel_clock / 1000 * 4;
++	write_hdmi(HDMI_SOR_REFCLK, SOR_REFCLK_DIV_INT(quarters >> 2)
++		| SOR_REFCLK_DIV_FRAC(quarters));
++
++	uint32 hBlank = mode.h_total - mode.h_display;
++	uint32 control = HDMI_CTRL_REKEY(HDMI_REKEY)
++		| HDMI_CTRL_MAX_AC_PACKET((hBlank - HDMI_REKEY - 18) / 32);
++	if (hdmiSink)
++		control |= HDMI_CTRL_ENABLE;
++	write_hdmi(HDMI_CTRL, control);
++	if (hdmiSink)
++		write_avi_infoframe();
++	else
++		write_hdmi(HDMI_AVI_INFOFRAME_CTRL, 0);
++
++	// TMDS settings of the Tegra 2: pre-emphasis above 27 MHz
++	bool slow = mode.pixel_clock <= 27000;
++	write_hdmi(HDMI_SOR_PLL0, SOR_PLL_BG_V17_S(3) | SOR_PLL_ICHPMP(1)
++		| SOR_PLL_RESISTORSEL | SOR_PLL_VCOCAP(slow ? 0 : 1)
++		| SOR_PLL_TX_REG_LOAD(3));
++	write_hdmi(HDMI_SOR_PLL1, SOR_PLL_TMDS_TERM_ENABLE
++		| (slow ? 0 : SOR_PLL_PE_EN));
++	write_hdmi(HDMI_PE_CURRENT, slow ? 0 : PE_CURRENT_ALL(PE_CURRENT_6_MA));
++	write_hdmi(HDMI_SOR_LANE_DRIVE_CURRENT,
++		DRIVE_CURRENT_ALL(DRIVE_CURRENT_7_125_MA)
++			| DRIVE_CURRENT_FUSE_OVERRIDE);
++
++	write_hdmi(HDMI_SOR_SEQ_CTL, SOR_SEQ_PD_PC(8) | SOR_SEQ_PD_PC_ALT(8));
++	uint32 instruction = SOR_SEQ_INST_WAIT_TIME(1) | SOR_SEQ_INST_WAIT_VSYNC
++		| SOR_SEQ_INST_HALT | SOR_SEQ_INST_DRIVE_PWM_LOW;
++	write_hdmi(HDMI_SOR_SEQ_INST(0), instruction);
++	write_hdmi(HDMI_SOR_SEQ_INST(8), instruction);
++
++	uint32 custom = read_hdmi(HDMI_SOR_CSTM);
++	custom &= ~(SOR_CSTM_ROTCLK(0xf) | SOR_CSTM_LVDS_ENABLE
++		| SOR_CSTM_MODE_MASK);
++	custom |= SOR_CSTM_ROTCLK(2) | SOR_CSTM_PLLDIV | SOR_CSTM_MODE_TMDS;
++	write_hdmi(HDMI_SOR_CSTM, custom);
++
++	// Start the serializer
++	write_hdmi(HDMI_SOR_PWR, SOR_PWR_NORMAL_STATE_PU | SOR_PWR_SETTING_NEW);
++	write_hdmi(HDMI_SOR_PWR, SOR_PWR_NORMAL_STATE_PU);
++	bigtime_t timeout = system_time() + 100000;
++	while ((read_hdmi(HDMI_SOR_PWR) & SOR_PWR_SETTING_NEW) != 0) {
++		if (system_time() > timeout) {
++			ERROR("the serializer does not power up\n");
++			return B_TIMED_OUT;
++		}
++		spin(10);
++	}
++
++	uint32 state = SOR_STATE_CRCMODE_COMPLETE | SOR_STATE_OWNER_HEAD0
++		| SOR_STATE_SUBOWNER_BOTH | SOR_STATE_PROTOCOL_TMDS_A;
++	if (!mode.h_sync_positive)
++		state |= SOR_STATE_HSYNC_NEGATIVE;
++	if (!mode.v_sync_positive)
++		state |= SOR_STATE_VSYNC_NEGATIVE;
++	write_hdmi(HDMI_SOR_STATE2, state);
++
++	state = SOR_STATE_HEAD_OPMODE_AWAKE | SOR_STATE_ORMODE_NORMAL;
++	write_hdmi(HDMI_SOR_STATE1, state);
++	write_hdmi(HDMI_SOR_STATE0, 0);
++	write_hdmi(HDMI_SOR_STATE0, SOR_STATE_UPDATE);
++	write_hdmi(HDMI_SOR_STATE1, state | SOR_STATE_ATTACHED);
++	write_hdmi(HDMI_SOR_STATE0, 0);
++
++	// Display controller B feeds the HDMI block
++	write_dc(DC_DISP_WIN_OPTIONS, HDMI_ENABLE);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_UPDATE);
++	read_dc(DC_CMD_STATE_CONTROL);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_ACT_REQ);
++	return B_OK;
++}
++
++
++static void
++stop_hdmi()
++{
++	write_hdmi(HDMI_AVI_INFOFRAME_CTRL, 0);
++	write_hdmi(HDMI_SOR_PLL0, read_hdmi(HDMI_SOR_PLL0) | SOR_PLL_PWR
++		| SOR_PLL_PDBG);
++	enable_block(CAR_CLK_OUT_ENB_H, CAR_RST_DEVICES_H, CAR_HDMI_BIT, false);
++}
++
++
++//	#pragma mark - connect and disconnect
++
++
++static void
++disconnect()
++{
++	if (!sHdmi.active)
++		return;
++
++	stop_display_controller();
++	stop_hdmi();
++	write_car(CAR_PLLD_BASE, 0);
++	set_hdmi_power(false);
++	sHdmi.active = false;
++	dprintf("tegra_dc: hdmi: screen unplugged\n");
++}
++
++
++static void
++connect()
++{
++	status_t status = set_hdmi_power(true);
++	if (status != B_OK) {
++		ERROR("cannot power the HDMI block: %s\n", strerror(status));
++		return;
++	}
++
++	uint8 edid[EDID_SIZE];
++	uint32 edidSize = 0;
++	setup_ddc();
++	status = read_edid(edid, &edidSize);
++
++	bool hdmiSink = true;
++	sHdmi.mode = k720p;
++	if (status == B_OK) {
++		hdmiSink = is_hdmi_sink(edid, edidSize);
++		hdmi_mode preferred;
++		if (parse_detailed_timing(edid + 0x36, preferred))
++			sHdmi.mode = preferred;
++		dprintf("tegra_dc: hdmi: EDID of \"%.13s\", %s sink\n",
++			(const char*)edid + 0x5f, hdmiSink ? "HDMI" : "DVI");
++	} else
++		ERROR("no EDID (%s), trying 1280x720\n", strerror(status));
++
++	const hdmi_mode& mode = sHdmi.mode;
++	status = set_pll_d(mode.pixel_clock);
++	if (status != B_OK) {
++		set_hdmi_power(false);
++		return;
++	}
++
++	sHdmi.active = true;
++	start_display_controller();
++	status = start_hdmi(hdmiSink);
++	if (status != B_OK) {
++		disconnect();
++		return;
++	}
++
++	dprintf("tegra_dc: hdmi: %ux%u, %" B_PRIu32 " kHz, totals %ux%u, VIC %u\n",
++		mode.h_display, mode.v_display, mode.pixel_clock, mode.h_total,
++		mode.v_total, mode.vic);
++}
++
++
++static status_t
++hot_plug_thread(void*)
++{
++	bool plugged = false;
++	int32 stable = 0;
++	while (!sHdmi.quit) {
++		bool now = screen_plugged();
++		stable = now != plugged ? stable + 1 : 0;
++		if (stable >= 2) {
++			// the line kept its new level for two polls
++			plugged = now;
++			stable = 0;
++			MutexLocker locker(sHdmi.lock);
++			if (plugged)
++				connect();
++			else
++				disconnect();
++		}
++		snooze(POLL_INTERVAL);
++	}
++	return B_OK;
++}
++
++
++//	#pragma mark - interface
++
++
++static void
++unmap_all()
++{
++	delete_area(sHdmi.hdmi_area);
++	delete_area(sHdmi.dc_area);
++	delete_area(sHdmi.i2c_area);
++	delete_area(sHdmi.gpio_area);
++	delete_area(sHdmi.car_area);
++	sHdmi.hdmi_area = sHdmi.dc_area = sHdmi.i2c_area = sHdmi.gpio_area
++		= sHdmi.car_area = -1;
++}
++
++
++status_t
++hdmi_start(uint32 physical, uint16 width, uint16 height, uint32 colorDepth,
++	uint32 bytesPerRow)
++{
++	memset(&sHdmi, 0, sizeof(sHdmi));
++	sHdmi.thread = -1;
++
++	// "hdmi false" in the driver settings leaves the HDMI block off
++	void* settings = load_driver_settings("tegra_dc");
++	bool enabled = get_driver_boolean_parameter(settings, "hdmi", true, true);
++	unload_driver_settings(settings);
++	if (!enabled)
++		return B_OK;
++
++	sHdmi.car_area = sHdmi.gpio_area = sHdmi.i2c_area = sHdmi.dc_area
++		= sHdmi.hdmi_area = -1;
++	mutex_init(&sHdmi.lock, "tegra_dc hdmi");
++	sHdmi.physical = physical;
++	sHdmi.width = width;
++	sHdmi.height = height;
++	sHdmi.color_depth = colorDepth;
++	sHdmi.bytes_per_row = bytesPerRow;
++
++	sHdmi.car = map_registers("tegra_dc hdmi car", TEGRA20_CAR_BASE,
++		B_PAGE_SIZE, &sHdmi.car_area);
++	sHdmi.gpio = map_registers("tegra_dc hdmi gpio", TEGRA20_GPIO_BASE,
++		B_PAGE_SIZE, &sHdmi.gpio_area);
++	sHdmi.i2c = map_registers("tegra_dc ddc", TEGRA20_I2C2_BASE & ~0xfff,
++		B_PAGE_SIZE, &sHdmi.i2c_area);
++	sHdmi.dc = map_registers("tegra_dc b registers", TEGRA20_DC_B_BASE,
++		TEGRA20_DC_SIZE, &sHdmi.dc_area);
++	sHdmi.hdmi = map_registers("tegra_dc hdmi registers", TEGRA20_HDMI_BASE,
++		HDMI_SIZE, &sHdmi.hdmi_area);
++	if (sHdmi.car == NULL || sHdmi.gpio == NULL || sHdmi.i2c == NULL
++		|| sHdmi.dc == NULL || sHdmi.hdmi == NULL) {
++		unmap_all();
++		mutex_destroy(&sHdmi.lock);
++		return B_NO_MEMORY;
++	}
++	sHdmi.i2c += (TEGRA20_I2C2_BASE & 0xfff) / 4;
++
++	setup_hot_plug_pin();
++	sHdmi.thread = spawn_kernel_thread(&hot_plug_thread, "tegra_dc hot plug",
++		B_LOW_PRIORITY, NULL);
++	if (sHdmi.thread < 0) {
++		status_t status = sHdmi.thread;
++		unmap_all();
++		mutex_destroy(&sHdmi.lock);
++		return status;
++	}
++	resume_thread(sHdmi.thread);
++	return B_OK;
++}
++
++
++void
++hdmi_stop()
++{
++	// thread ids are positive; before hdmi_start() it is 0
++	if (sHdmi.thread <= 0)
++		return;
++
++	sHdmi.quit = true;
++	status_t result;
++	wait_for_thread(sHdmi.thread, &result);
++	sHdmi.thread = -1;
++
++	mutex_lock(&sHdmi.lock);
++	disconnect();
++	mutex_unlock(&sHdmi.lock);
++	unmap_all();
++	mutex_destroy(&sHdmi.lock);
++}
++
++
++void
++hdmi_set_source(uint32 colorDepth, uint32 bytesPerRow)
++{
++	// thread ids are positive; before hdmi_start() it is 0
++	if (sHdmi.thread <= 0)
++		return;
++
++	MutexLocker locker(sHdmi.lock);
++	sHdmi.color_depth = colorDepth;
++	sHdmi.bytes_per_row = bytesPerRow;
++	if (sHdmi.active)
++		program_mirror_window();
++}
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.h b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.h
+new file mode 100644
+index 0000000000..d77bdb7a5d
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.h
+@@ -0,0 +1,22 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef TEGRA_DC_HDMI_H
++#define TEGRA_DC_HDMI_H
++
++
++#include <SupportDefs.h>
++
++
++// The second display controller and the HDMI block show the panel's frame
++// buffer on an external screen while one is plugged in. The color depth is
++// a window color depth code of the display controller.
++
++status_t hdmi_start(uint32 physical, uint16 width, uint16 height,
++	uint32 colorDepth, uint32 bytesPerRow);
++void hdmi_stop();
++void hdmi_set_source(uint32 colorDepth, uint32 bytesPerRow);
++
++
++#endif	// TEGRA_DC_HDMI_H
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp b/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
+index 889ef4622f..a87979b0e0 100644
+--- a/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
+@@ -33,6 +33,7 @@
+ 
+ #include <libfdt.h>
+ 
++#include "hdmi.h"
+ #include "tegra_dc_info.h"
+ 
+ 
+@@ -393,6 +394,7 @@ program_display_mode(const display_mode& mode)
+ 	tegra_dc_shared_info& info = *sDevice.shared_info;
+ 	fill_mode(info.current_mode, (color_space)mode.space);
+ 	info.bytes_per_row = bytesPerRow;
++	hdmi_set_source(colorDepth, bytesPerRow);
+ 
+ 	// The kernel debugger writes the screen too
+ 	frame_buffer_update((addr_t)sDevice.scanout, PANEL_WIDTH, PANEL_HEIGHT,
+@@ -933,6 +935,8 @@ enable_vblank_interrupt(bool enable)
+ static void
+ uninit_device()
+ {
++	hdmi_stop();
++
+ 	if (sDevice.overlay_ready) {
+ 		tegra_dc_overlay_config hide = {};
+ 		configure_overlay(hide);
+@@ -1043,6 +1047,12 @@ init_device()
+ 	}
+ 	enable_vblank_interrupt(true);
+ 
++	// An external screen shows the same frame buffer
++	status = hdmi_start(SCANOUT_BASE, PANEL_WIDTH, PANEL_HEIGHT,
++		depth32 ? COLOR_DEPTH_B8G8R8A8 : COLOR_DEPTH_B5G6R5, info.bytes_per_row);
++	if (status != B_OK)
++		ERROR("no HDMI output: %s\n", strerror(status));
++
+ 	dprintf("tegra_dc: %" B_PRIu32 "x%" B_PRIu32 " panel, pixel clock %"
+ 		B_PRIu32 " kHz, totals %" B_PRIu32 "x%" B_PRIu32 ", %s\n",
+ 		(uint32)info.timing.h_display, (uint32)info.timing.v_display,

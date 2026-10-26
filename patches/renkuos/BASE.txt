@@ -1,1 +1,2 @@
-base: 22ecd712c50aa99ee2a05ffd9a759bd851f987a5 (Merge pull request #133 from RenkuOS/macbook71-efi-boot)
+base: aae7d9f7be7c430ac0fcb52f8239ad72e1207021 (RenkuOS/Source main, Merge pull request #156 from linkslice/pi400/usb-xhci-noncoherent)
+apply: git checkout -b ac100 aae7d9f7be && git am patches/renkuos/*.patch

@@ -1,7 +1,7 @@
-From fa90913b43c138df694d607d66b2fd9a04b47e45 Mon Sep 17 00:00:00 2001
+From cf6fd8bd3f30931181d9c52a27d9480dea897942 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 14:29:35 +0200
-Subject: [PATCH 092/203] arm: report CPU vendor, model and measured frequency
+Subject: [PATCH 092/270] arm: report CPU vendor, model and measured frequency
 
 ---
  .../private/shared/arch/arm64/arch_cpu_type.h | 16 +++-

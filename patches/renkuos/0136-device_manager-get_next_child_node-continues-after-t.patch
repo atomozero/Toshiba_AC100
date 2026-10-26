@@ -1,7 +1,7 @@
-From eeecb5c622ff4c8283b3f7de315474752aeb3e4e Mon Sep 17 00:00:00 2001
+From 132b161e67dcdeef167c7b7fb4fb4e01cc64d210 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Mon, 19 Oct 2026 19:44:38 +0200
-Subject: [PATCH 136/203] device_manager: get_next_child_node() continues after
+Subject: [PATCH 136/270] device_manager: get_next_child_node() continues after
  the last node
 
 The loop that skips the children already traversed never stopped at the

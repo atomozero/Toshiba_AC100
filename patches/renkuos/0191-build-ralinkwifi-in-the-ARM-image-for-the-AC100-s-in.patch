@@ -1,7 +1,7 @@
-From ce4bfd9d4263dfd7a2b59b0db9e60b3b0174cffa Mon Sep 17 00:00:00 2001
+From 77254b206be7e25d98f223fa87a863181cd28ab6 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Fri, 23 Oct 2026 22:58:31 +0200
-Subject: [PATCH 191/203] build: ralinkwifi in the ARM image, for the AC100's
+Subject: [PATCH 191/270] build: ralinkwifi in the ARM image, for the AC100's
  internal RT3070
 
 ---
@@ -9,7 +9,7 @@ Subject: [PATCH 191/203] build: ralinkwifi in the ARM image, for the AC100's
  1 file changed, 2 insertions(+)
 
 diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
-index 1f3c5e5a54..85b25dcaaa 100644
+index ed4d76bd16..1f4e3f4216 100644
 --- a/build/jam/images/definitions/minimum
 +++ b/build/jam/images/definitions/minimum
 @@ -369,6 +369,8 @@ SYSTEM_ADD_ONS_DRIVERS_NET = [ FFilterByBuildFeatures

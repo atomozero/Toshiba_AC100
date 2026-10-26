@@ -1,7 +1,7 @@
-From eb6f25579d1a7b6246ed43730bfdae383ae0816b Mon Sep 17 00:00:00 2001
+From 80f2cae9dc75c26b10d13678b9a02832ac32e52d Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sun, 18 Oct 2026 21:25:59 +0200
-Subject: [PATCH 117/203] nvec: reset the touchpad before enabling it
+Subject: [PATCH 117/270] nvec: reset the touchpad before enabling it
 
 It keeps its state while the machine is off: after a warm boot it
 acknowledged the commands but sent no packets. Reset it first, as Linux'

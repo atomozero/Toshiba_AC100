@@ -1,7 +1,7 @@
-From e586e5bd7fdbb66fe4aad27f726b04e61ad110ad Mon Sep 17 00:00:00 2001
+From b4d31d4195b37109e4778cba85a07bdc9f8cd01b Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 20:55:31 +0200
-Subject: [PATCH 045/203] kernel/vfs: wait for the boot device to show up
+Subject: [PATCH 045/270] kernel/vfs: wait for the boot device to show up
 
 Devices on buses that are scanned asynchronously, like SD cards behind
 the MMC bus, may not be published yet when the boot partition is looked

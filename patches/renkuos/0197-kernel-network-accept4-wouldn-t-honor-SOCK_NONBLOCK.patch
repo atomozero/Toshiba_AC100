@@ -1,7 +1,7 @@
-From 2549d92132188b77ed80f5335b1d34374e5b96a5 Mon Sep 17 00:00:00 2001
+From 504ca4869d058f28e00da7f1a717c5a5c807eeb2 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?J=C3=A9r=C3=B4me=20Duval?= <jerome.duval@gmail.com>
 Date: Mon, 14 Sep 2026 17:16:12 +0200
-Subject: [PATCH 197/203] kernel/network: accept4 wouldn't honor SOCK_NONBLOCK
+Subject: [PATCH 197/270] kernel/network: accept4 wouldn't honor SOCK_NONBLOCK
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -44,7 +44,7 @@ index 0000000000..339dae940b
 +
 +#endif	/* _SYSTEM_SOCKET_DEFS_H */
 diff --git a/src/system/kernel/fs/socket.cpp b/src/system/kernel/fs/socket.cpp
-index 468b85b80f..be93d65780 100644
+index 7f88705e52..02e2238ef1 100644
 --- a/src/system/kernel/fs/socket.cpp
 +++ b/src/system/kernel/fs/socket.cpp
 @@ -15,6 +15,7 @@

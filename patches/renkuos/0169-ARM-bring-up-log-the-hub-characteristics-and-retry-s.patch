@@ -1,7 +1,7 @@
-From 0b09645d04e863b1e69d94dd4b6a5104e713117d Mon Sep 17 00:00:00 2001
+From 65c69cc245e638cc8d99c562d0ebd02c78cc8e00 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Tue, 20 Oct 2026 19:10:38 +0200
-Subject: [PATCH 169/203] ARM bring-up: log the hub characteristics and retry
+Subject: [PATCH 169/270] ARM bring-up: log the hub characteristics and retry
  state of new hub ports (not for merging)
 
 ---

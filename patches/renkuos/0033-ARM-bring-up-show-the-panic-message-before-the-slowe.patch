@@ -1,7 +1,7 @@
-From 9e401e7857e2558aa74702a0628952449987cb85 Mon Sep 17 00:00:00 2001
+From 285b5d5874d2a676f52abad1c5a845ab2c5737f3 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Sat, 17 Oct 2026 18:35:01 +0200
-Subject: [PATCH 033/203] ARM bring-up: show the panic message before the
+Subject: [PATCH 033/270] ARM bring-up: show the panic message before the
  slower checks (not for merging)
 
 ---

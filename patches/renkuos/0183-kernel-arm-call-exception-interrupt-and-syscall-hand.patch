@@ -1,7 +1,7 @@
-From a05cb578a2118245daf491ca45032c7aaaa11796 Mon Sep 17 00:00:00 2001
+From 0fd8405c351e37267e8a79159c38e65033defccd Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
 Date: Fri, 23 Oct 2026 19:00:40 +0200
-Subject: [PATCH 183/203] kernel/arm: call exception, interrupt and syscall
+Subject: [PATCH 183/270] kernel/arm: call exception, interrupt and syscall
  handlers with an 8 byte aligned stack
 
 The AAPCS requires the stack to be 8 byte aligned at public interfaces.
