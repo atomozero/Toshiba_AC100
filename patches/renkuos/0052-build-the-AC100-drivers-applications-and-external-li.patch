@@ -1,0 +1,538 @@
+From ba7f9b50129ac0baa7499d2f49c82194d4f80a7a Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 27 Oct 2026 07:20:31 +0100
+Subject: [PATCH 52/63] build: the AC100 drivers, applications and external
+ libraries in the ARM images
+
+- the GL kit and GLU, FFmpeg, libpng, libjpeg and OpenSSL from external
+  directories, with the GL demos, the media plugins and translators
+- the applications, preferences and add-ons of the regular image in the
+  minimum image on ARM; ralinkwifi, ASIX and Pegasus USB network
+  drivers, the Bluetooth stack
+- the Tegra 2 and AC100 drivers in the Haiku package; no i2c_hid and no
+  usb_webcam on 32-bit ARM
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ build/jam/BuildFeatures                       |  66 +++++-
+ build/jam/images/definitions/minimum          | 215 +++++++++++++++++-
+ build/jam/packages/Haiku                      |  13 +-
+ .../Persistence/Wrappers/MediaFormatIO.cpp    |   6 +-
+ src/preferences/media/Jamfile                 |  13 +-
+ 5 files changed, 299 insertions(+), 14 deletions(-)
+
+diff --git a/build/jam/BuildFeatures b/build/jam/BuildFeatures
+index 0f2fce8265..585b900496 100644
+--- a/build/jam/BuildFeatures
++++ b/build/jam/BuildFeatures
+@@ -19,7 +19,17 @@ if [ IsHaikuImagePackageAdded openssl3 ] {
+ 	HAIKU_BUILD_FEATURE_SSL = 1 ;
+ }
+ 
+-if $(HAIKU_BUILD_FEATURE_SSL) {
++if $(HAIKU_EXTERNAL_OPENSSL_DIR) && ! [ IsPackageAvailable openssl3_devel ] {
++	# An OpenSSL built elsewhere for the target (extracted package), when the
++	# repositories have none for it: the network kit gets HTTPS support, the
++	# image must then contain the package that provides libssl.so.3.
++	SetBuildFeatureAttribute openssl : headers
++		: [ FDirName $(HAIKU_EXTERNAL_OPENSSL_DIR) develop headers ] ;
++	SetBuildFeatureAttribute openssl : libraries
++		: [ FDirName $(HAIKU_EXTERNAL_OPENSSL_DIR) develop lib libcrypto.so ]
++		  [ FDirName $(HAIKU_EXTERNAL_OPENSSL_DIR) develop lib libssl.so ] ;
++	EnableBuildFeatures openssl ;
++} else if $(HAIKU_BUILD_FEATURE_SSL) {
+ 	if [ IsPackageAvailable openssl3_devel ] {
+ 		ExtractBuildFeatureArchives openssl :
+ 			file: base openssl3
+@@ -182,7 +192,23 @@ if [ IsPackageAvailable glu_devel ] {
+ 
+ 
+ # GL (GL Kit, Mesa3D)
+-if [ IsPackageAvailable mesa_devel ] {
++# HAIKU_EXTERNAL_GL_DIR: Mesa (legacy, with the GL kit) and GLU built outside
++# of the package repositories, extracted to <dir>/mesa and <dir>/glu, like
++# for the Toshiba AC100 (ARM, VFPv3-D16)
++if $(HAIKU_EXTERNAL_GL_DIR) && ! [ IsPackageAvailable mesa_devel ] {
++	local glDir = $(HAIKU_EXTERNAL_GL_DIR) ;
++	SetBuildFeatureAttribute mesa : headers
++		: [ FDirName $(glDir) mesa develop headers os opengl ]
++		  [ FDirName $(glDir) mesa develop headers ] ;
++	SetBuildFeatureAttribute mesa : library
++		: [ FDirName $(glDir) mesa lib libGL.so ] ;
++	EnableBuildFeatures mesa ;
++	SetBuildFeatureAttribute glu : headers
++		: [ FDirName $(glDir) glu develop headers ] ;
++	SetBuildFeatureAttribute glu : library
++		: [ FDirName $(glDir) glu lib libGLU.so ] ;
++	EnableBuildFeatures glu ;
++} else if [ IsPackageAvailable mesa_devel ] {
+ 	ExtractBuildFeatureArchives mesa :
+ 		file: base mesa
+ 			runtime: lib
+@@ -199,7 +225,21 @@ if [ IsPackageAvailable mesa_devel ] {
+ 
+ 
+ # FFmpeg
+-if [ IsPackageAvailable ffmpeg6_devel ] {
++if $(HAIKU_EXTERNAL_FFMPEG_DIR) && ! [ IsPackageAvailable ffmpeg6_devel ] {
++	# An FFmpeg built elsewhere for the target (extracted package), when the
++	# repositories have none for it.
++	local ffmpegDir = $(HAIKU_EXTERNAL_FFMPEG_DIR) ;
++	SetBuildFeatureAttribute ffmpeg : headers
++		: [ FDirName $(ffmpegDir) develop headers ] ;
++	local ffmpegLib ;
++	local ffmpegLibraries ;
++	for ffmpegLib in libavformat.so libavcodec.so libavfilter.so libswscale.so
++			libavutil.so libswresample.so {
++		ffmpegLibraries += [ FDirName $(ffmpegDir) lib $(ffmpegLib) ] ;
++	}
++	SetBuildFeatureAttribute ffmpeg : libraries : $(ffmpegLibraries) ;
++	EnableBuildFeatures ffmpeg ;
++} else if [ IsPackageAvailable ffmpeg6_devel ] {
+ 	local ffmpegLibs = libavformat.so libavcodec.so libavfilter.so libswscale.so
+ 		libavutil.so libswresample.so ;
+ 
+@@ -318,7 +358,15 @@ if [ IsPackageAvailable haikuwebkit_devel ] {
+ 
+ 
+ # libpng
+-if [ IsPackageAvailable libpng16_devel ] {
++if $(HAIKU_EXTERNAL_LIBPNG_DIR) && ! [ IsPackageAvailable libpng16_devel ] {
++	# A libpng built elsewhere for the target (extracted package), when the
++	# repositories have none for it.
++	SetBuildFeatureAttribute libpng : headers
++		: [ FDirName $(HAIKU_EXTERNAL_LIBPNG_DIR) develop headers ] ;
++	SetBuildFeatureAttribute libpng : library
++		: [ FDirName $(HAIKU_EXTERNAL_LIBPNG_DIR) lib libpng16.so ] ;
++	EnableBuildFeatures libpng ;
++} else if [ IsPackageAvailable libpng16_devel ] {
+ 	ExtractBuildFeatureArchives libpng :
+ 		file: base libpng16
+ 			runtime: lib
+@@ -369,7 +417,15 @@ if [ IsPackageAvailable jasper_devel ] {
+ 
+ 
+ # jpeg
+-if [ IsPackageAvailable libjpeg_turbo_devel ] {
++if $(HAIKU_EXTERNAL_JPEG_DIR) && ! [ IsPackageAvailable libjpeg_turbo_devel ] {
++	# A libjpeg built elsewhere for the target (extracted package), when the
++	# repositories have none for it.
++	SetBuildFeatureAttribute jpeg : headers
++		: [ FDirName $(HAIKU_EXTERNAL_JPEG_DIR) develop headers ] ;
++	SetBuildFeatureAttribute jpeg : library
++		: [ FDirName $(HAIKU_EXTERNAL_JPEG_DIR) lib libjpeg.so ] ;
++	EnableBuildFeatures jpeg ;
++} else if [ IsPackageAvailable libjpeg_turbo_devel ] {
+ 	ExtractBuildFeatureArchives jpeg :
+ 		file: base libjpeg_turbo
+ 			runtime: lib
+diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
+index 01fc18c38e..99f7238a41 100644
+--- a/build/jam/images/definitions/minimum
++++ b/build/jam/images/definitions/minimum
+@@ -37,6 +37,7 @@ SYSTEM_BIN = [ FFilterByBuildFeatures
+ 	groupmod
+ 	hd
+ 	hey
++	<bin>i2c@arm
+ 	ifconfig
+ 	iroster
+ 	isvolume
+@@ -127,6 +128,7 @@ SYSTEM_BIN = [ FFilterByBuildFeatures
+ 
+ SYSTEM_APPS = [ FFilterByBuildFeatures
+ 	AboutSystem
++	ActivityMonitor@arm
+ 	BootManager@x86,x86_64
+ 	CharacterMap
+ 	Debugger@libedit
+@@ -137,8 +139,11 @@ SYSTEM_APPS = [ FFilterByBuildFeatures
+ 	DriveSetup
+ 	Expander
+ 	Installer
++	Magnify@arm
+ 	NetworkStatus
++	PowerStatus@arm
+ 	ProcessController
++	Screenshot@arm
+ 	ShowImage
+ 	StyledEdit
+ 	Terminal
+@@ -159,11 +164,12 @@ DESKBAR_APPLICATIONS =
+ 	Terminal
+ ;
+ 
+-DESKBAR_DESKTOP_APPLETS =
++DESKBAR_DESKTOP_APPLETS = [ FFilterByBuildFeatures
+ 	NetworkStatus
++	PowerStatus@arm
+ 	ProcessController
+ 	Workspaces
+-;
++] ;
+ 
+ SYSTEM_PREFERENCES = [ FFilterByBuildFeatures
+ 	Appearance
+@@ -182,7 +188,16 @@ SYSTEM_PREFERENCES = [ FFilterByBuildFeatures
+ 	VirtualMemory
+ ] ;
+ 
+-SYSTEM_DEMOS = ;
++SYSTEM_DEMOS = [ FFilterByBuildFeatures
++	Chart@arm
++	Clock@arm
++	FontDemo@arm
++	Mandelbrot@arm
++	Pairs@arm
++	Playground@arm
++	Pulse@arm
++	Sudoku@arm
++] ;
+ 
+ 
+ rule HaikuImageGetSystemLibs
+@@ -199,9 +214,16 @@ rule HaikuImageGetSystemLibs
+ 			libdebug.so
+ 			libdebugger.so@primary
+ 			libdevice.so
++			libbluetooth.so@arm
++			libgame.so@arm
++			libglut.so@mesa
+ 			libgnu.so
++			libmail.so@arm
++			libmedia.so@arm
++			libmidi2.so@arm
+ 			libnetwork.so
+ 			libpackage.so
++			libscreensaver.so@arm
+ 			libtextencoding.so
+ 			libtracker.so
+ 			libtranslation.so
+@@ -342,6 +364,14 @@ SYSTEM_ADD_ONS_DRIVERS_NET = [ FFilterByBuildFeatures
+ 	usb_davicom
+ 	usb_rndis
+ 	wb840
++
++	# USB network adapters for machines without a usable network otherwise
++	arm @{
++		asix88xxx
++		pegasus
++		# USB Wi-Fi (the Toshiba AC100 has an internal RT3070)
++		ralinkwifi
++	}@ # arm
+ ] ;
+ 
+ SYSTEM_ADD_ONS_DRIVERS_POWER = [ FFilterByBuildFeatures
+@@ -363,7 +393,7 @@ SYSTEM_ADD_ONS_BUS_MANAGERS = [ FFilterByBuildFeatures
+ 	agp_gart@x86,x86_64
+ 	ata
+ 	hyperv@x86,x86_64
+-	i2c@x86,x86_64
++	i2c@x86,x86_64,arm
+ 	isa@x86,x86_64
+ 	mmc
+ 	scsi
+@@ -458,3 +488,180 @@ if $(HAIKU_IS_BOOTSTRAP) != 1 {
+ 	AddFilesToHaikuImage system settings package-repositories
+ 		: $(thirdPartyRepositoryConfigs) ;
+ }
++
++# The Toshiba AC100 (ARM) gets the applications of the regular image that can
++# be built for it: nothing needing OpenGL or ffmpeg, and of the image
++# translators needing a library only those whose library is available for ARM
++# (PNG and JPEG, through HAIKU_EXTERNAL_LIBPNG_DIR and HAIKU_EXTERNAL_JPEG_DIR).
++if arm in $(HAIKU_PACKAGING_ARCHS) {
++	SYSTEM_BIN += [ FFilterByBuildFeatures
++		cddb_lookup
++		clipboard
++		CortexAddOnHost@expat
++		dpms
++		installsound
++		mail
++		mail2mbox
++		mbox2mail
++		media_client
++		pidof
++		recover
++		screenshot
++		setcontrollook
++		setdecor
++		spamdbm
++		translate
++		WindowShade
++	] ;
++
++	SYSTEM_APPS += [ FFilterByBuildFeatures
++		AutoRaise
++		CodyCam
++		GLInfo@mesa
++		HaikuDepot
++		Icon-O-Matic@expat
++		LaunchBox
++		LegacyPackageInstaller
++		Mail
++		MediaConverter
++		MediaPlayer
++		People
++		PoorMan
++		RemoteDesktop
++		SerialConnect
++		SoftwareUpdater
++		SoundRecorder
++	] ;
++
++	DESKBAR_APPLICATIONS +=
++		ActivityMonitor
++		CodyCam
++		HaikuDepot
++		Icon-O-Matic
++		Magnify
++		Mail
++		MediaConverter
++		MediaPlayer
++		People
++		PoorMan
++		SerialConnect
++		SoftwareUpdater
++		SoundRecorder
++	;
++
++	DESKBAR_DESKTOP_APPLETS +=
++		AutoRaise
++		LaunchBox
++	;
++
++	SYSTEM_PREFERENCES += [ FFilterByBuildFeatures
++		Bluetooth
++		DataTranslations
++		E-mail
++		Media
++		Printers
++		Repositories
++		ScreenSaver
++		Sounds
++	] ;
++
++	SYSTEM_DEMOS += [ FFilterByBuildFeatures
++		Cortex@expat
++		GLTeapot@mesa
++		$(HAIKU_INCLUDE_TRADEMARKS)Haiku3d@mesa
++		OverlayImage
++	] ;
++
++	SYSTEM_SERVERS += [ FFilterByBuildFeatures
++		bluetooth_server
++		mail_daemon
++		media_addon_server
++		media_server
++		midi_server
++		print_server
++		print_addon_server
++	] ;
++
++	# Bluetooth stack + drivers, for the Bluetooth preferences above
++	SYSTEM_NETWORK_PROTOCOLS +=
++		bluetooth
++		l2cap
++	;
++	SYSTEM_BT_STACK =
++		hci
++		btCoreData
++	;
++	SYSTEM_ADD_ONS_DRIVERS_BT_H2 +=
++		h2generic
++	;
++
++	SYSTEM_ADD_ONS_TRANSLATORS += [ FFilterByBuildFeatures
++		BMPTranslator
++		GIFTranslator
++		HVIFTranslator
++		ICOTranslator
++		JPEGTranslator@jpeg
++		PCXTranslator
++		PNGTranslator@libpng
++		PPMTranslator
++		PSDTranslator
++		RAWTranslator
++		RTFTranslator
++		SGITranslator
++		TGATranslator
++	] ;
++
++	SYSTEM_ADD_ONS_MEDIA += [ FFilterByBuildFeatures
++		cortex_audioadapter.media_addon
++		cortex_flanger.media_addon
++		cortex_logging_consumer.media_addon
++		equalizer.media_addon
++		hdmi.media_addon@arm
++		hmulti_audio.media_addon
++		mixer.media_addon
++		tone_producer_demo.media_addon
++		video_mixer.media_addon
++		video_producer_demo.media_addon
++		video_window_demo.media_addon
++	] ;
++
++	SYSTEM_ADD_ONS_MEDIA_PLUGINS += [ FFilterByBuildFeatures
++		au_reader
++		ffmpeg@ffmpeg
++		http_streamer
++		raw_decoder
++	] ;
++
++	SYSTEM_ADD_ONS_PRINT +=
++		Canon\ LIPS3\ Compatible
++		Canon\ LIPS4\ Compatible
++		PCL5\ Compatible
++		PCL6\ Compatible
++		PS\ Compatible
++		Preview
++	;
++
++	SYSTEM_ADD_ONS_PRINT_TRANSPORT +=
++		HP\ JetDirect
++		IPP
++		LPR
++		Print\ To\ File
++		Serial\ Port
++		USB\ Port
++	;
++
++	SYSTEM_ADD_ONS_SCREENSAVERS += [ FFilterByBuildFeatures
++		Butterfly
++		DebugNow
++		Flurry@mesa
++		GLife@mesa
++		Gravity@mesa
++		Icons
++		IFS
++		Leaves
++		Message
++		Nebula
++		Shelf
++		Spider
++	] ;
++}
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index 3738e66c10..ba6e888cf8 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -37,6 +37,8 @@ AddFilesToPackage add-ons kernel busses ata :
+ 	;
+ 
+ AddFilesToPackage add-ons kernel busses i2c :
++	nvec@arm
++	tegra_i2c@arm
+ 	pch_i2c@x86,x86_64
+ 	;
+ AddFilesToPackage add-ons kernel busses mmc :
+@@ -148,13 +150,14 @@ AddNewDriversToPackage network :
+ AddNewDriversToPackage input :
+ 	hyperv_hid@x86,x86_64
+ 	i2c_elan
+-	i2c_hid
++	i2c_hid@!arm
+ 	virtio_input
+ 	;
+ AddNewDriversToPackage display :
+ #	display_adapter@x86
+ 	;
+ AddNewDriversToPackage audio hmulti :
++	tegra_audio@arm
+ #	virtio_sound
+ 	;
+ AddNewDriversToPackage hyperv :
+@@ -188,6 +191,7 @@ AddDriversToPackage dvb :
+ 	;
+ AddDriversToPackage graphics
+ 	: $(SYSTEM_ADD_ONS_DRIVERS_GRAPHICS) ;
++AddDriversToPackage graphics : tegra_dc@arm ;
+ AddDriversToPackage input :
+ 	ps2_hid
+ 	usb_hid
+@@ -198,6 +202,12 @@ AddDriversToPackage misc :
+ 	<driver>mem
+ 	nvmm@x86_64
+ 	;
++AddDriversToPackage sensor :
++	adt7461@arm
++	;
++AddDriversToPackage power :
++	tegra_dvfs@arm
++	;
+ AddDriversToPackage net
+ 	: $(SYSTEM_ADD_ONS_DRIVERS_NET) ;
+ AddDriversToPackage ports :
+@@ -378,6 +388,7 @@ AddBootModuleSymlinksToPackage
+ # add-ons
+ AddFilesToPackage add-ons accelerants :
+ 	framebuffer.accelerant
++	tegra_dc.accelerant@arm
+ 	virtio_gpu.accelerant
+ 	$(SYSTEM_ADD_ONS_ACCELERANTS) ;
+ AddFilesToPackage add-ons locale catalogs :
+diff --git a/src/apps/cortex/Persistence/Wrappers/MediaFormatIO.cpp b/src/apps/cortex/Persistence/Wrappers/MediaFormatIO.cpp
+index 381231ed87..4c4e703074 100644
+--- a/src/apps/cortex/Persistence/Wrappers/MediaFormatIO.cpp
++++ b/src/apps/cortex/Persistence/Wrappers/MediaFormatIO.cpp
+@@ -552,7 +552,7 @@ void export_raw_audio_attr(
+ 	if(f.channel_count != w.channel_count)
+ 		context.writeAttr(gKey_channel_count, f.channel_count);
+ 	if(f.buffer_size != w.buffer_size)
+-		context.writeAttr(gKey_buffer_size, f.buffer_size);
++		context.writeAttr(gKey_buffer_size, (uint32)f.buffer_size);
+ 
+ 	switch(f.format) {
+ 		case media_raw_audio_format::B_AUDIO_UCHAR:
+@@ -827,7 +827,7 @@ void export_encoded_audio_attr(
+ 		context.writeAttr(gKey_bit_rate, f.bit_rate);
+ 
+ 	if(f.frame_size != w.frame_size)
+-		context.writeAttr(gKey_frame_size, f.frame_size);
++		context.writeAttr(gKey_frame_size, (uint32)f.frame_size);
+ }
+ 
+ void export_encoded_audio_content(
+@@ -863,7 +863,7 @@ void export_encoded_video_attr(
+ 	if(f.max_bit_rate != w.max_bit_rate)
+ 		context.writeAttr(gKey_max_bit_rate, f.max_bit_rate);
+ 	if(f.frame_size != w.frame_size)
+-		context.writeAttr(gKey_frame_size, f.frame_size);
++		context.writeAttr(gKey_frame_size, (uint32)f.frame_size);
+ 	if(f.forward_history != w.forward_history)
+ 		context.writeAttr(gKey_forward_history, (int32)f.forward_history);
+ 	if(f.backward_history != w.backward_history)
+diff --git a/src/preferences/media/Jamfile b/src/preferences/media/Jamfile
+index 79bc24c51b..bb9542faae 100644
+--- a/src/preferences/media/Jamfile
++++ b/src/preferences/media/Jamfile
+@@ -2,6 +2,16 @@ SubDir HAIKU_TOP src preferences media ;
+ 
+ UsePrivateHeaders media midi shared ;
+ 
++# libmidi needs fluidlite, which is not available everywhere (e.g. ARM): the
++# MIDI settings view only needs its settings functions then
++local midiSources ;
++local midiLibrary = midi ;
++if ! [ FIsBuildFeatureEnabled fluidlite ] {
++	SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src kits midi ] ;
++	midiSources = MidiSettings.cpp ;
++	midiLibrary = ;
++}
++
+ Application Media :
+ 	Media.cpp
+ 	MediaIcons.cpp
+@@ -9,7 +19,8 @@ Application Media :
+ 	MediaViews.cpp
+ 	MediaWindow.cpp
+ 	MidiSettingsView.cpp
+-	: media midi be localestub [ TargetLibsupc++ ]
++	$(midiSources)
++	: media $(midiLibrary) be localestub [ TargetLibsupc++ ]
+ 	: media.rdef
+ 	;
+ 
+-- 
+2.39.5
+

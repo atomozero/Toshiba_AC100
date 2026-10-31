@@ -1,0 +1,1290 @@
+From 75eb8cfdb20b77d63e4ef20628dcc573f552f26d Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 27 Oct 2026 07:20:22 +0100
+Subject: [PATCH 27/63] kernel/arm: exceptions, signals, syscalls and debugging
+
+- call the exception, interrupt and syscall handlers with an 8 byte
+  aligned stack, and save the VFP registers around them
+- write all of the SPSR when restoring it; keep r1 and a sane CPSR when
+  returning from a signal handler; reset the kernel stack on the way back
+  to userland
+- fix the syscall arguments and the signal handling on return to
+  userland; return the upper half of 64 bit syscall results in r1
+- SIGILL for undefined instructions and SIGBUS for unaligned accesses in
+  userland, instead of a panic
+- an access flag fault on an unmapped page is a page fault; retry
+  spurious faults
+- fix user TLB invalidation and make the ARMv7 atomics lock-free
+- give debuggers the userland registers of a thread; libdebug reads the
+  instruction pointer and stack frames
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../kernel/arch/arm/arch_thread_types.h       |   4 +
+ .../private/system/arch/arm/arch_cpu_defs.h   |   7 +
+ .../debug/arch/arm/arch_debug_support.cpp     | 126 ++++++++++-
+ src/system/kernel/arch/arm/arch_asm.S         |  37 +++-
+ src/system/kernel/arch/arm/arch_atomic32.cpp  |  58 +++++
+ src/system/kernel/arch/arm/arch_exceptions.S  | 117 +++++-----
+ src/system/kernel/arch/arm/arch_int.cpp       | 203 +++++++++++++++---
+ src/system/kernel/arch/arm/arch_thread.cpp    | 118 +++++++---
+ .../kernel/arch/arm/arch_user_debugger.cpp    |  58 ++++-
+ 9 files changed, 602 insertions(+), 126 deletions(-)
+
+diff --git a/headers/private/kernel/arch/arm/arch_thread_types.h b/headers/private/kernel/arch/arm/arch_thread_types.h
+index 5a9efc4ebb..8436a8c97e 100644
+--- a/headers/private/kernel/arch/arm/arch_thread_types.h
++++ b/headers/private/kernel/arch/arm/arch_thread_types.h
+@@ -52,7 +52,11 @@ struct arch_thread {
+ 	struct iframe_stack	iframes;
+ 
+ 	struct iframe*	userFrame;
++	struct arch_fpu_context* userFPU;
++		// the VFP registers of userland saved on exception entry, while
++		// signals are handled; NULL after a syscall (they are live then)
+ 	uint32	oldR0;
++	uint32	oldR1;
+ };
+ 
+ struct arch_team {
+diff --git a/headers/private/system/arch/arm/arch_cpu_defs.h b/headers/private/system/arch/arm/arch_cpu_defs.h
+index f5e50dbf0c..9b879d7ce6 100644
+--- a/headers/private/system/arch/arm/arch_cpu_defs.h
++++ b/headers/private/system/arch/arm/arch_cpu_defs.h
+@@ -23,6 +23,13 @@
+ #define CPSR_T				0x20
+ #define CPSR_F				0x40
+ #define CPSR_I				0x80
++#define CPSR_E				0x200
++#define CPSR_IT_MASK		0x0600fc00	// Thumb If-Then state
++#define CPSR_GE_MASK		0x000f0000
++#define CPSR_FLAGS_MASK		0xf8000000	// N, Z, C, V, Q
++// the bits userland may set when returning from a signal handler
++#define CPSR_USER_MASK		(CPSR_FLAGS_MASK | CPSR_GE_MASK | CPSR_IT_MASK \
++	| CPSR_E | CPSR_T)
+ 
+ #define SCTLR_HIGH_VECTORS	0x00002000
+ 
+diff --git a/src/kits/debug/arch/arm/arch_debug_support.cpp b/src/kits/debug/arch/arm/arch_debug_support.cpp
+index ee287bb6e4..5706d0483e 100644
+--- a/src/kits/debug/arch/arm/arch_debug_support.cpp
++++ b/src/kits/debug/arch/arm/arch_debug_support.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2012, Haiku, Inc.
++ * Copyright 2012-2026, Haiku, Inc.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -11,11 +11,100 @@
+ 
+ #include "arch_debug_support.h"
+ 
++
++/*!	Code built without frame pointers leaves no chain of frames to follow, so
++	the stack is scanned instead: a frame is reported for every word on it
++	that points just behind a call instruction (BL or BLX). That may also
++	report stale return addresses, but it does not depend on how the code
++	was compiled.
++*/
++
++
++static const int32 kMaxScanWords = 2048;
++static const int32 kChunkWords = 64;
++static const int32 kMaxCodeAreas = 128;
++
++
++struct code_areas {
++	int32	count;
++	addr_t	start[kMaxCodeAreas];
++	addr_t	end[kMaxCodeAreas];
++
++	void Init(team_id team)
++	{
++		count = 0;
++		area_info info;
++		ssize_t cookie = 0;
++		while (count < kMaxCodeAreas
++			&& get_next_area_info(team, &cookie, &info) == B_OK) {
++			if ((info.protection & B_EXECUTE_AREA) == 0)
++				continue;
++			start[count] = (addr_t)info.address;
++			end[count] = (addr_t)info.address + info.size;
++			count++;
++		}
++	}
++
++	bool Contains(addr_t address) const
++	{
++		for (int32 i = 0; i < count; i++) {
++			if (address >= start[i] && address < end[i])
++				return true;
++		}
++		return false;
++	}
++};
++
++
++static bool
++is_call_instruction(uint32 instruction)
++{
++	// BL <label> (any condition but "never")
++	if ((instruction & 0x0f000000) == 0x0b000000
++		&& (instruction & 0xf0000000) != 0xf0000000) {
++		return true;
++	}
++	// BLX <label>
++	if ((instruction & 0xfe000000) == 0xfa000000)
++		return true;
++	// BLX <register>
++	if ((instruction & 0x0ffffff0) == 0x012fff30)
++		return true;
++
++	return false;
++}
++
++
++static bool
++is_return_address(debug_context *context, const code_areas& areas,
++	uint32 address)
++{
++	if ((address & 3) != 0 || !areas.Contains(address - 4))
++		return false;
++
++	uint32 instruction;
++	if (debug_read_memory(context, (const void*)(address - 4), &instruction,
++			sizeof(instruction)) != sizeof(instruction)) {
++		return false;
++	}
++
++	return is_call_instruction(instruction);
++}
++
++
+ status_t
+ arch_debug_get_instruction_pointer(debug_context *context, thread_id thread,
+ 	void **ip, void **stackFrameAddress)
+ {
+-	return B_ERROR;
++	debug_cpu_state cpuState;
++	status_t error = debug_get_cpu_state(context, thread, NULL, &cpuState);
++	if (error != B_OK)
++		return error;
++
++	*ip = (void*)cpuState.r15;
++	*stackFrameAddress = (void*)cpuState.r13;
++
++	return B_OK;
+ }
+ 
+ 
+@@ -23,5 +112,36 @@ status_t
+ arch_debug_get_stack_frame(debug_context *context, void *stackFrameAddress,
+ 	debug_stack_frame_info *stackFrameInfo)
+ {
+-	return B_ERROR;
++	uint32* address = (uint32*)stackFrameAddress;
++	if (address == NULL || ((addr_t)address & 3) != 0)
++		return B_BAD_VALUE;
++
++	// only look at what could point into code
++	code_areas areas;
++	areas.Init(context->team);
++
++	for (int32 scanned = 0; scanned < kMaxScanWords;
++			scanned += kChunkWords) {
++		uint32 words[kChunkWords];
++		ssize_t bytesRead = debug_read_memory(context, address + scanned,
++			words, sizeof(words));
++		if (bytesRead < (ssize_t)sizeof(uint32))
++			return bytesRead < 0 ? bytesRead : B_ERROR;
++
++		int32 count = bytesRead / sizeof(uint32);
++		for (int32 i = 0; i < count; i++) {
++			if (!is_return_address(context, areas, words[i]))
++				continue;
++
++			stackFrameInfo->frame = address + scanned + i;
++			stackFrameInfo->parent_frame = address + scanned + i + 1;
++			stackFrameInfo->return_address = (void*)words[i];
++			return B_OK;
++		}
++
++		if (count < kChunkWords)
++			break;
++	}
++
++	return B_ENTRY_NOT_FOUND;
+ }
+diff --git a/src/system/kernel/arch/arm/arch_asm.S b/src/system/kernel/arch/arm/arch_asm.S
+index e93a1c258a..b540fef868 100644
+--- a/src/system/kernel/arch/arm/arch_asm.S
++++ b/src/system/kernel/arch/arm/arch_asm.S
+@@ -69,16 +69,27 @@ FUNCTION(arm_context_switch):
+ 	stmfd   sp!, { r0-r12, lr }
+ 	str	sp, [r0]
+ 	ldr	sp, [r1]
++	/* drop any exclusive access of the previous thread (ldrex/strex) */
++	clrex
+ 	ldmfd   sp!, { r0-r12, lr }
+ 	bx	lr
+ FUNCTION_END(arm_context_switch)
+ 
+ 
++/* d16-d31 are only touched when gARMHasVFPD32 is set, see arch_cpu.cpp */
++.fpu vfpv3
++
+ /* void arm_save_fpu(struct arch_fpu_context* context); */
+ FUNCTION(arm_save_fpu):
+ 	fstmiad		r0!, {d0-d15}
++	ldr			r1, =gARMHasVFPD32
++	ldrb		r1, [r1]
++	cmp			r1, #0
++	beq			1f
+ 	fstmiad		r0!, {d16-d31}
+-	vmrs		r1, fpscr
++	b			2f
++1:	add			r0, r0, #128		/* keep fpscr at its fixed offset */
++2:	vmrs		r1, fpscr
+ 	str			r1, [r0]
+ 	bx			lr
+ FUNCTION_END(arm_save_fpu)
+@@ -87,8 +98,14 @@ FUNCTION_END(arm_save_fpu)
+ /* void arm_restore_fpu(struct arch_fpu_context* context); */
+ FUNCTION(arm_restore_fpu):
+ 	fldmiad		r0!, {d0-d15}
++	ldr			r1, =gARMHasVFPD32
++	ldrb		r1, [r1]
++	cmp			r1, #0
++	beq			1f
+ 	fldmiad		r0!, {d16-d31}
+-	ldr			r1, [r0]
++	b			2f
++1:	add			r0, r0, #128		/* keep fpscr at its fixed offset */
++2:	ldr			r1, [r0]
+ 	vmsr		fpscr, r1
+ 	bx			lr
+ FUNCTION_END(arm_restore_fpu)
+@@ -250,7 +267,7 @@ FUNCTION(arch_return_to_userland):
+ 	mrs		ip, cpsr
+ 	bic		ip, ip, #(CPSR_MODE_MASK | CPSR_T | CPSR_F | CPSR_I)
+ 	orr		ip, ip, #(CPSR_MODE_USR | CPSR_F)
+-	msr		spsr, ip
++	msr		spsr_fsxc, ip
+ 
+ 	// use system mode to load user mode SP and LR
+ 	ldr		r4, [r0, #IFRAME_usr_sp]
+@@ -268,10 +285,16 @@ FUNCTION(arch_return_to_userland):
+ 	// load user mode entry point in LR
+ 	ldr		lr, [r0, #IFRAME_pc]
+ 
+-	// load general purpose registers
+-	mov		sp, r0
+-	add		sp, sp, #4
+-	ldmfd	sp!, { r0-r12 }
++	// The next exception from userland starts on the SVC stack: reset it to
++	// the top of the thread's kernel stack. The frame may sit deep inside it
++	// (exec(), fork()), and that whole call chain is dead from here on;
++	// leaving SP there leaks it on every exec() until the stack overflows.
++	mrc		p15, 0, ip, c13, c0, 4		// TPIDRPRW: current Thread*
++	ldr		sp, [ip, #THREAD_kernel_stack_top]
++
++	// load general purpose registers (base in the list, no writeback)
++	add		r0, r0, #4
++	ldmia	r0, { r0-r12 }
+ 
+ 	// jump to user mode entry point
+ 	movs	pc, lr
+diff --git a/src/system/kernel/arch/arm/arch_atomic32.cpp b/src/system/kernel/arch/arm/arch_atomic32.cpp
+index 12038f7506..01b45107ac 100644
+--- a/src/system/kernel/arch/arm/arch_atomic32.cpp
++++ b/src/system/kernel/arch/arm/arch_atomic32.cpp
+@@ -15,6 +15,62 @@
+ 
+ #ifdef ATOMIC_FUNCS_ARE_SYSCALLS
+ 
++#if defined(__ARM_ARCH) && __ARM_ARCH >= 7
++
++/*
++ * ARMv7 has exclusive load/store instructions, so these do not need to disable
++ * interrupts. That matters: user_mutex.cpp runs them on user memory inside
++ * user_access(), and a page fault (e.g. on a copy-on-write page after fork())
++ * taken with interrupts disabled cannot be resolved and would make the operation
++ * fail (user_access() returns false).
++ */
++
++void
++atomic_set(int32 *value, int32 newValue)
++{
++	__atomic_store_n(value, newValue, __ATOMIC_SEQ_CST);
++}
++
++int32
++atomic_get_and_set(int32 *value, int32 newValue)
++{
++	return __atomic_exchange_n(value, newValue, __ATOMIC_SEQ_CST);
++}
++
++int32
++atomic_test_and_set(int32 *value, int32 newValue, int32 testAgainst)
++{
++	__atomic_compare_exchange_n(value, &testAgainst, newValue, false,
++		__ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
++	return testAgainst;
++}
++
++int32
++atomic_add(int32 *value, int32 addValue)
++{
++	return __atomic_fetch_add(value, addValue, __ATOMIC_SEQ_CST);
++}
++
++int32
++atomic_and(int32 *value, int32 andValue)
++{
++	return __atomic_fetch_and(value, andValue, __ATOMIC_SEQ_CST);
++}
++
++int32
++atomic_or(int32 *value, int32 orValue)
++{
++	return __atomic_fetch_or(value, orValue, __ATOMIC_SEQ_CST);
++}
++
++int32
++atomic_get(int32 *value)
++{
++	return __atomic_load_n(value, __ATOMIC_SEQ_CST);
++}
++
++#else	// __ARM_ARCH < 7
++
+ /*
+  * NOTE: These functions are _intentionally_ not using spinlocks, unlike
+  * the 64 bit versions. The reason for this is that they are used by the
+@@ -90,6 +146,8 @@ atomic_get(int32 *value)
+ 	return oldValue;
+ }
+ 
++#endif	// __ARM_ARCH < 7
++
+ void
+ _user_atomic_set(int32 *value, int32 newValue)
+ {
+diff --git a/src/system/kernel/arch/arm/arch_exceptions.S b/src/system/kernel/arch/arm/arch_exceptions.S
+index 2ee1347613..5a9474f648 100644
+--- a/src/system/kernel/arch/arm/arch_exceptions.S
++++ b/src/system/kernel/arch/arm/arch_exceptions.S
+@@ -18,6 +18,28 @@
+ 	msr		cpsr_c, r0
+ .endm
+ 
++/* Calls \handler with the iframe, around it saves and restores the VFP
++   registers: the kernel uses them too (the compiler does for 64 bit
++   copies), and an exception may interrupt code using them at any point.
++   The saved registers are right below the iframe, aligned down to 8 bytes
++   like the stack the handler is called with, see
++   arm_exception_fpu_context(). */
++#define EXCEPTION_FPU_AREA_SIZE	264		/* sizeof(arch_fpu_context) */
++.macro CALL_HANDLER_SAVING_VFP handler
++	mov		r4, sp						/* iframe */
++	sub		sp, sp, #EXCEPTION_FPU_AREA_SIZE
++	bic		sp, sp, #7					/* the AAPCS wants 8 byte alignment */
++	mov		r0, sp
++	bl		arm_save_fpu
++	mov		r0, r4
++	mov		fp, r0
++	bl		\handler
++	DISABLE_INTERRUPTS
++	mov		r0, sp
++	bl		arm_restore_fpu
++	mov		sp, r4
++.endm
++
+ /* The following two macros are taken from FreeBSD... */
+ 
+ .macro PUSH_FRAME_IN_SVC
+@@ -33,7 +55,7 @@
+ 	str		r0, [sp, #-4]!				/* Push return address */
+ 	str		lr, [sp, #-4]!				/* Push SVC lr */
+ 	str		r2, [sp, #-4]!				/* Push SVC sp */
+-	msr		spsr, r3					/* Restore correct spsr */
++	msr		spsr_fsxc, r3				/* Restore correct spsr */
+ 	ldmdb	r1, {r0-r3}					/* Restore 4 regs from xxx mode */
+ 	sub		sp, sp, #(4*15)				/* Adjust the stack pointer */
+ 	stmia	sp, {r0-r12}				/* Push the user mode registers */
+@@ -46,7 +68,7 @@
+ 
+ .macro PULL_FRAME_FROM_SVC_AND_EXIT
+ 	ldr		r0, [sp], #0x0004			/* Get the SPSR from stack */
+-	msr		spsr, r0					/* restore SPSR */
++	msr		spsr_fsxc, r0				/* restore SPSR */
+ 	ldmia	sp, {r0-r14}^				/* Restore registers (usr mode) */
+ 	mov		r0, r0						/* NOP for previous instruction */
+ 	add		sp, sp, #(4*15)				/* Adjust the stack pointer */
+@@ -70,7 +92,7 @@
+ 
+ .macro	PULL_FRAME_AND_EXIT
+ 	ldr		r0, [sp], #4				/* Get SPSR from stack */
+-	msr		spsr, r0
++	msr		spsr_fsxc, r0
+ 	ldmia	sp, {r0-r14}^				/* Restore user mode registers */
+ 	add		sp, sp, #(4*17)				/* Adjust the stack pointer */
+ 	ldr		lr, [sp], #4				/* Pull the return address */
+@@ -121,48 +143,22 @@ _vectors_end:
+ 
+ .data
+ 
+-	.rept	64
+-	.word	0xdeadbeef
+-	.endr
+-
+-abort_stack:
+-	.word	. - 4
+-	.word	0xdeadbeef
+-
+-	.rept	64
+-	.word	0xcafebabe
+-	.endr
+-
+-irq_stack:
+-	.word	. - 4
+-	.word	0xcafebabe
+-
+-	.rept	64
+-	.word	0xaaaabbbb
+-	.endr
+-
+-fiq_stack:
+-	.word	. - 4
+-	.word	0xaaaabbbb
+-
+-	.rept	64
+-	.word	0xccccdddd
+-	.endr
+-
+-und_stack:
+-	.word	. - 4
+-	.word	0xccccdddd
++/* Exception mode stacks, per CPU, aligned as required by the AAPCS: the
++   handlers only keep a few registers on them before switching to SVC mode,
++   but two CPUs must not share them. */
++#define EXCEPTION_STACK_SIZE	256
++#define EXCEPTION_STACK_CPUS	4
++.balign 8
++arm_exception_stacks:
++	.space	EXCEPTION_STACK_CPUS * 4 * EXCEPTION_STACK_SIZE
+ 
+ .text
+ 
+ FUNCTION(arm_undefined):
+ 	PUSH_FRAME_IN_SVC
+ 
+-	mov		r0, sp		/* iframe */
+-	mov		fp, r0
+-	bl		arch_arm_undefined
++	CALL_HANDLER_SAVING_VFP arch_arm_undefined
+ 
+-	DISABLE_INTERRUPTS
+ 	PULL_FRAME_FROM_SVC_AND_EXIT
+ FUNCTION_END(arm_undefined)
+ 
+@@ -172,9 +168,12 @@ FUNCTION(arm_syscall):
+ 
+ 	mov		r0, sp		/* iframe */
+ 	mov		fp, r0
++	mov		r4, sp
++	bic		sp, sp, #7	/* the AAPCS wants 8 byte alignment */
+ 	bl		arch_arm_syscall
+ 
+ 	DISABLE_INTERRUPTS
++	mov		sp, r4
+ 	PULL_FRAME_AND_EXIT
+ FUNCTION_END(arm_syscall)
+ 
+@@ -187,11 +186,8 @@ FUNCTION(arm_prefetch_abort):
+ 	sub		lr, lr, #4	/* Adjust LR */
+ 	PUSH_FRAME_IN_SVC
+ 
+-	mov		r0, sp		/* iframe */
+-	mov		fp, r0
+-	bl		arch_arm_prefetch_abort
++	CALL_HANDLER_SAVING_VFP arch_arm_prefetch_abort
+ 
+-	DISABLE_INTERRUPTS
+ 	PULL_FRAME_FROM_SVC_AND_EXIT
+ FUNCTION_END(arm_prefetch_abort)
+ 
+@@ -204,11 +200,8 @@ FUNCTION(arm_data_abort):
+ 	sub		lr, lr, #8	/* Adjust LR */
+ 	PUSH_FRAME_IN_SVC
+ 
+-	mov		r0, sp		/* iframe */
+-	mov		fp, r0
+-	bl		arch_arm_data_abort
++	CALL_HANDLER_SAVING_VFP arch_arm_data_abort
+ 
+-	DISABLE_INTERRUPTS
+ 	PULL_FRAME_FROM_SVC_AND_EXIT
+ FUNCTION_END(arm_data_abort)
+ 
+@@ -222,11 +215,8 @@ FUNCTION(arm_irq):
+ 	sub		lr, lr, #4	/* Adjust LR */
+ 	PUSH_FRAME_IN_SVC
+ 
+-	mov		r0, sp		/* iframe */
+-	mov		fp, r0
+-	bl		arch_arm_irq
++	CALL_HANDLER_SAVING_VFP arch_arm_irq
+ 
+-	DISABLE_INTERRUPTS
+ 	PULL_FRAME_FROM_SVC_AND_EXIT
+ FUNCTION_END(arm_irq)
+ 
+@@ -235,17 +225,18 @@ FUNCTION(arm_fiq):
+ 	sub		lr, lr, #4	/* Adjust LR */
+ 	PUSH_FRAME_IN_SVC
+ 
+-	mov		r0, sp		/* iframe */
+-	mov		fp, r0
+-	bl		arch_arm_fiq
++	CALL_HANDLER_SAVING_VFP arch_arm_fiq
+ 
+-	DISABLE_INTERRUPTS
+ 	PULL_FRAME_FROM_SVC_AND_EXIT
+ FUNCTION_END(arm_fiq)
+ 
+ 
+ 
+ FUNCTION(arm_vector_init):
++	/* r0: the CPU number; FIQ, IRQ, abort, undefined stacks follow */
++	ldr	r2, =arm_exception_stacks
++	add	r2, r2, r0, lsl #10		/* 4 * EXCEPTION_STACK_SIZE per CPU */
++
+ 	mrs	r1, cpsr
+ 	bic	r1, r1, #CPSR_MODE_MASK
+ 
+@@ -253,26 +244,26 @@ FUNCTION(arm_vector_init):
+ 	mov	r0, r1
+ 	orr	r0, r0, #CPSR_MODE_FIQ
+ 	msr	cpsr_c, r0
+-	ldr r2, =fiq_stack
+-	ldr sp, [r2]
++	add	r2, r2, #EXCEPTION_STACK_SIZE
++	mov	sp, r2
+ 
+ 	mov	r0, r1
+ 	orr	r0, r0, #CPSR_MODE_IRQ
+ 	msr	cpsr_c, r0
+-	ldr r2, =irq_stack
+-	ldr sp, [r2]
++	add	r2, r2, #EXCEPTION_STACK_SIZE
++	mov	sp, r2
+ 
+ 	mov	r0, r1
+ 	orr	r0, r0, #CPSR_MODE_ABT
+ 	msr	cpsr_c, r0
+-	ldr r2, =abort_stack
+-	ldr sp, [r2]
++	add	r2, r2, #EXCEPTION_STACK_SIZE
++	mov	sp, r2
+ 
+ 	mov	r0, r1
+ 	orr	r0, r0, #CPSR_MODE_UND
+ 	msr	cpsr_c, r0
+-	ldr r2, =und_stack
+-	ldr sp, [r2]
++	add	r2, r2, #EXCEPTION_STACK_SIZE
++	mov	sp, r2
+ 
+ 	/* ... and return back to supervisor mode */
+ 	mov	r0, r1
+@@ -281,3 +272,5 @@ FUNCTION(arm_vector_init):
+ 
+ 	bx	lr
+ FUNCTION_END(arm_vector_init)
++
++.ltorg
+diff --git a/src/system/kernel/arch/arm/arch_int.cpp b/src/system/kernel/arch/arm/arch_int.cpp
+index aa985794a4..a912ec1d1d 100644
+--- a/src/system/kernel/arch/arm/arch_int.cpp
++++ b/src/system/kernel/arch/arm/arch_int.cpp
+@@ -19,9 +19,11 @@
+ #include <arch/smp.h>
+ #include <boot/kernel_args.h>
+ #include <device_manager.h>
++#include <driver_settings.h>
+ #include <kscheduler.h>
+ #include <interrupt_controller.h>
+ #include <ksyscalls.h>
++#include <signal.h>
+ #include <smp.h>
+ #include <syscall_numbers.h>
+ #include <thread.h>
+@@ -89,13 +91,21 @@ arch_int_disable_io_interrupt(int32 irq)
+ }
+ 
+ 
++// "arm_spread_interrupts false" in the kernel settings keeps all device
++// interrupts on the boot CPU
++static bool sSpreadInterrupts = true;
++
++
+ /* arch_int_*_interrupts() and friends are in arch_asm.S */
+ 
+ int32
+ arch_int_assign_to_cpu(int32 irq, int32 cpu)
+ {
+-	// Not yet supported.
+-	return 0;
++	InterruptController *ic = InterruptController::Get();
++	if (ic == NULL || !sSpreadInterrupts)
++		return 0;
++
++	return ic->AssignToCpu(irq, cpu);
+ }
+ 
+ 
+@@ -118,7 +128,7 @@ print_iframe(const char *event, struct iframe *frame)
+ }
+ 
+ 
+-extern "C" void arm_vector_init(void);
++extern "C" void arm_vector_init(int32 cpu);
+ 
+ 
+ status_t
+@@ -130,7 +140,7 @@ arch_int_init(kernel_args *args)
+ 	memcpy((void*)USER_VECTOR_ADDR_HIGH, &_vectors_start, VECTORPAGE_SIZE);
+ 
+ 	// initialize stack for vectors
+-	arm_vector_init();
++	arm_vector_init(0);
+ 
+ 	// enable high vectors
+ 	arm_set_sctlr(arm_get_sctlr() | SCTLR_HIGH_VECTORS);
+@@ -139,6 +149,17 @@ arch_int_init(kernel_args *args)
+ }
+ 
+ 
++/*!	The exception setup of the other CPUs, once the boot CPU did
++	arch_int_init(): their own exception mode stacks, and the vector page.
++*/
++void
++arch_int_init_secondary_cpu(int32 cpu)
++{
++	arm_vector_init(cpu);
++	arm_set_sctlr(arm_get_sctlr() | SCTLR_HIGH_VECTORS);
++}
++
++
+ status_t
+ arch_int_init_post_vm(kernel_args *args)
+ {
+@@ -153,8 +174,12 @@ arch_int_init_post_vm(kernel_args *args)
+ 		panic("user vector page @ %p could not be created (%x)!",
+ 			sUserVectorPageAddress, sUserVectorPageArea);
+ 
++	// The GICv1 of Cortex-A9 MPCore (e.g. Tegra 2) is programmed the same way
++	// for everything the GICv2 driver uses
+ 	if (strncmp(args->arch_args.interrupt_controller.kind, INTC_KIND_GICV2,
+-		sizeof(args->arch_args.interrupt_controller.kind)) == 0) {
++			sizeof(args->arch_args.interrupt_controller.kind)) == 0
++		|| strncmp(args->arch_args.interrupt_controller.kind, INTC_KIND_GICV1,
++			sizeof(args->arch_args.interrupt_controller.kind)) == 0) {
+ 		InterruptController *ic = new(std::nothrow) GICv2InterruptController(
+ 			args->arch_args.interrupt_controller.regs1.start,
+ 			args->arch_args.interrupt_controller.regs2.start);
+@@ -182,6 +207,11 @@ arch_int_init_post_vm(kernel_args *args)
+ 		panic("No interrupt controllers found!\n");
+ 	}
+ 
++	void* settings = load_driver_settings("kernel");
++	sSpreadInterrupts = get_driver_boolean_parameter(settings,
++		"arm_spread_interrupts", true, true);
++	unload_driver_settings(settings);
++
+ 	return B_OK;
+ }
+ 
+@@ -224,13 +254,69 @@ private:
+ };
+ 
+ 
++/*!	The VFP registers the exception entry saved below \a iframe, see
++	CALL_HANDLER_SAVING_VFP in arch_exceptions.S.
++*/
++static inline arch_fpu_context*
++arm_exception_fpu_context(struct iframe* iframe)
++{
++	return (arch_fpu_context*)(((addr_t)iframe - 264) & ~(addr_t)7);
++}
++
++static_assert(sizeof(arch_fpu_context) == 264,
++	"see EXCEPTION_FPU_AREA_SIZE in arch_exceptions.S");
++
++
++/*!	The kernel exit work before returning to userland: handles the pending
++	signals, setting up their frames on \a iframe.
++	Interrupts must be disabled; they still are on return.
++*/
++extern "C" void
++arm_kernel_exit_to_userland(Thread* thread, struct iframe* iframe,
++	arch_fpu_context* fpu)
++{
++	thread->arch_info.userFrame = iframe;
++	thread->arch_info.userFPU = fpu;
++	if ((thread->flags & (THREAD_FLAGS_SIGNALS_PENDING
++			| THREAD_FLAGS_DEBUG_THREAD
++			| THREAD_FLAGS_TRAP_FOR_CORE_DUMP)) != 0) {
++		enable_interrupts();
++		thread_at_kernel_exit();
++	} else
++		thread_at_kernel_exit_no_signals();
++	thread->arch_info.userFrame = NULL;
++	thread->arch_info.userFPU = NULL;
++}
++
++
+ extern "C" void
+ arch_arm_undefined(struct iframe *iframe)
+ {
++	if ((iframe->spsr & CPSR_MODE_MASK) == CPSR_MODE_USR) {
++		// An instruction the CPU does not implement, e.g. a VFP register a
++		// VFPv3-D16 unit does not have: only the offending team has to go.
++		Thread* thread = thread_get_current_thread();
++		thread->arch_info.userFrame = iframe;
++		thread_at_kernel_entry(system_time());
++
++		enable_interrupts();
++
++		// the saved PC points behind the undefined instruction
++		Signal signal(SIGILL, ILL_ILLOPC, B_OK, thread->team->id);
++		signal.SetAddress((void*)(iframe->pc - 4));
++		send_signal_to_thread(thread, signal, 0);
++
++		disable_interrupts();
++		arm_kernel_exit_to_userland(thread, iframe,
++			arm_exception_fpu_context(iframe));
++		return;
++	}
++
+ 	print_iframe("Undefined Instruction", iframe);
+ 	IFrameScope scope(iframe); // push/pop iframe
+ 
+-	panic("not handled!");
++	panic("undefined instruction in kernel mode at %#" B_PRIx32 "\n",
++		iframe->pc - 4);
+ }
+ 
+ 
+@@ -246,7 +332,18 @@ arch_arm_syscall(struct iframe *iframe)
+ 	uint32_t syscall = *(uint32_t *)(iframe->pc-4) & 0x00ffffff;
+ 	TRACE("syscall number: %d\n", syscall);
+ 
++	thread_get_current_thread()->arch_info.userFrame = iframe;
++	thread_get_current_thread()->arch_info.oldR0 = iframe->r0;
++	thread_get_current_thread()->arch_info.oldR1 = iframe->r1;
++	thread_at_kernel_entry(system_time());
++
++	enable_interrupts();
++
++	// The arguments past the fourth are on the user stack: copy them with
++	// interrupts enabled, since its page may need to be faulted in (after a
++	// fork(), or to set the access flag).
+ 	uint32_t args[20];
++	status_t argsStatus = B_OK;
+ 	if (syscall < kSyscallCount) {
+ 		TRACE("syscall(%s,%d)\n",
+ 			kExtendedSyscallInfos[syscall].name,
+@@ -255,27 +352,21 @@ arch_arm_syscall(struct iframe *iframe)
+ 		int argSize = kSyscallInfos[syscall].parameter_size;
+ 		memcpy(args, &iframe->r0, std::min<int>(argSize, 4 * sizeof(uint32)));
+ 		if (argSize > 4 * sizeof(uint32)) {
+-			status_t res = user_memcpy(&args[4], (void *)iframe->usr_sp,
++			argsStatus = user_memcpy(&args[4], (void *)iframe->usr_sp,
+ 				(argSize - 4 * sizeof(uint32)));
+-			if (res < B_OK) {
++			if (argsStatus < B_OK)
+ 				dprintf("can't read syscall arguments on user stack\n");
+-				iframe->r0 = res;
+-				return;
+-			}
+ 		}
+ 	}
+ 
+-	thread_get_current_thread()->arch_info.userFrame = iframe;
+-	thread_get_current_thread()->arch_info.oldR0 = iframe->r0;
+-	thread_at_kernel_entry(system_time());
+-
+-	enable_interrupts();
+-
+-	uint64 returnValue = 0;
+-	syscall_dispatcher(syscall, (void*)args, &returnValue);
++	uint64 returnValue = (uint64)(int64)argsStatus;
++	if (argsStatus == B_OK)
++		syscall_dispatcher(syscall, (void*)args, &returnValue);
+ 
+ 	TRACE("returning %" B_PRId64 "\n", returnValue);
+-	iframe->r0 = returnValue;
++	// 64 bit results (system_time(), seek(), ...) come back in r0:r1
++	iframe->r0 = (uint32)returnValue;
++	iframe->r1 = (uint32)(returnValue >> 32);
+ 
+ 	disable_interrupts();
+ 	atomic_and(&thread_get_current_thread()->flags, ~THREAD_FLAGS_SYSCALL_RESTARTED);
+@@ -290,6 +381,7 @@ arch_arm_syscall(struct iframe *iframe)
+ 		atomic_and(&thread_get_current_thread()->flags, ~THREAD_FLAGS_RESTART_SYSCALL);
+ 		atomic_or(&thread_get_current_thread()->flags, THREAD_FLAGS_SYSCALL_RESTARTED);
+ 		iframe->r0 = thread_get_current_thread()->arch_info.oldR0;
++		iframe->r1 = thread_get_current_thread()->arch_info.oldR1;
+ 		iframe->pc -= 4;
+ 	}
+ 
+@@ -303,8 +395,13 @@ arch_arm_handle_access_flag_fault(addr_t far, uint32 fsr, bool isWrite, bool isE
+ 	VMAddressSpacePutter addressSpace;
+ 	if (IS_KERNEL_ADDRESS(far))
+ 		addressSpace.SetTo(VMAddressSpace::GetKernel());
+-	else if (IS_USER_ADDRESS(far))
+-		addressSpace.SetTo(VMAddressSpace::GetCurrent());
++	else if (IS_USER_ADDRESS(far)) {
++		// During early boot the current (idle) thread has no team yet, and
++		// VMAddressSpace::GetCurrent() would dereference it.
++		Thread* thread = thread_get_current_thread();
++		if (thread != NULL && thread->team != NULL)
++			addressSpace.SetTo(VMAddressSpace::GetCurrent());
++	}
+ 
+ 	if (!addressSpace.IsSet())
+ 		return false;
+@@ -317,6 +414,8 @@ arch_arm_handle_access_flag_fault(addr_t far, uint32 fsr, bool isWrite, bool isE
+ 
+ 		map->QueryInterrupt(far, &physAddr, &pageFlags);
+ 
++		// another CPU may have unmapped the page meanwhile: then it is an
++		// ordinary page fault
+ 		if ((PAGE_PRESENT & pageFlags) == 0)
+ 			return false;
+ 
+@@ -324,6 +423,10 @@ arch_arm_handle_access_flag_fault(addr_t far, uint32 fsr, bool isWrite, bool isE
+ 			map->SetFlags(far, PAGE_ACCESSED);
+ 			return true;
+ 		}
++
++		// the entry was fixed already, the TLB held the old one
++		arch_cpu_invalidate_TLB_page(far & ~(B_PAGE_SIZE - 1));
++		return true;
+ 	}
+ 
+ 	if (isWrite && ((fsr & (FSR_FS_MASK | FSR_LPAE_MASK)) == FSR_FS_PERMISSION_FAULT_L2)) {
+@@ -339,6 +442,15 @@ arch_arm_handle_access_flag_fault(addr_t far, uint32 fsr, bool isWrite, bool isE
+ 			map->SetFlags(far, PAGE_MODIFIED);
+ 			return true;
+ 		}
++
++		// writable and dirty already: the TLB held the old, read only entry
++		bool userWritable = (pageFlags & B_WRITE_AREA) != 0;
++		if ((pageFlags & PAGE_MODIFIED) != 0
++			&& (pageFlags & B_KERNEL_WRITE_AREA) != 0
++			&& (userWritable || IS_KERNEL_ADDRESS(far))) {
++			arch_cpu_invalidate_TLB_page(far & ~(B_PAGE_SIZE - 1));
++			return true;
++		}
+ 	}
+ 
+ 	return false;
+@@ -395,9 +507,23 @@ arch_arm_page_fault(struct iframe *frame, addr_t far, uint32 fsr, bool isWrite,
+ 		panic("PXN violation trying to execute user-mapped address 0x%08" B_PRIxADDR " from kernel mode\n",
+ 			far);
+ 	} else if (!isExec && ((fsr & 0x060f) == FSR_FS_ALIGNMENT_FAULT)) {
+-		panic("unhandled alignment exception\n");
+-	} else if ((fsr & 0x060f) == FSR_FS_ACCESS_FLAG_FAULT) {
+-		panic("unhandled access flag fault\n");
++		if (!isUser)
++			panic("unhandled alignment exception\n");
++
++		// e.g. a floating point load from an unaligned address, which ARM
++		// does not do: only the offending team has to go, as in Linux
++		thread->arch_info.userFrame = frame;
++		thread_at_kernel_entry(system_time());
++		enable_interrupts();
++
++		Signal signal(SIGBUS, BUS_ADRALN, B_OK, thread->team->id);
++		signal.SetAddress((void*)far);
++		send_signal_to_thread(thread, signal, 0);
++
++		disable_interrupts();
++		arm_kernel_exit_to_userland(thread, frame,
++			arm_exception_fpu_context(frame));
++		return;
+ 	} else if ((frame->spsr & CPSR_I) != 0) {
+ 		// interrupts disabled
+ 
+@@ -430,6 +556,11 @@ arch_arm_page_fault(struct iframe *frame, addr_t far, uint32 fsr, bool isWrite,
+ 		return;
+ 	}
+ 
++	if (isUser) {
++		thread->arch_info.userFrame = frame;
++		thread_at_kernel_entry(system_time());
++	}
++
+ 	enable_interrupts();
+ 
+ 	vm_page_fault(far, frame->pc, isWrite, isExec, isUser, &newip);
+@@ -439,6 +570,13 @@ arch_arm_page_fault(struct iframe *frame, addr_t far, uint32 fsr, bool isWrite,
+ 		// IP the cpu will return to to be this ip
+ 		frame->pc = newip;
+ 	}
++
++	if (isUser) {
++		// e.g. deliver the SIGSEGV of an unresolved fault right away
++		disable_interrupts();
++		arm_kernel_exit_to_userland(thread, frame,
++			arm_exception_fpu_context(frame));
++	}
+ }
+ 
+ 
+@@ -468,6 +606,13 @@ arch_arm_irq(struct iframe *iframe)
+ {
+ 	IFrameScope scope(iframe);
+ 
++	bool fromUser = (iframe->spsr & CPSR_MODE_MASK) == CPSR_MODE_USR;
++	if (fromUser) {
++		Thread* current = thread_get_current_thread();
++		current->arch_info.userFrame = iframe;
++		thread_at_kernel_entry(system_time());
++	}
++
+ 	InterruptController *ic = InterruptController::Get();
+ 	if (ic != NULL)
+ 		ic->HandleInterrupt();
+@@ -489,6 +634,14 @@ arch_arm_irq(struct iframe *iframe)
+ 		scheduler_reschedule(B_THREAD_READY);
+ 		schedulerLocker.Unlock();
+ 		restore_interrupts(state);
++	} else
++		restore_interrupts(state);
++
++	if (fromUser) {
++		// signals sent to a thread running in userland are handled here
++		disable_interrupts();
++		arm_kernel_exit_to_userland(thread_get_current_thread(), iframe,
++			arm_exception_fpu_context(iframe));
+ 	}
+ }
+ 
+diff --git a/src/system/kernel/arch/arm/arch_thread.cpp b/src/system/kernel/arch/arm/arch_thread.cpp
+index 4a3a01f1cb..26e8c15bc5 100644
+--- a/src/system/kernel/arch/arm/arch_thread.cpp
++++ b/src/system/kernel/arch/arm/arch_thread.cpp
+@@ -16,6 +16,7 @@
+ #include <arch_thread.h>
+ 
+ #include <arch_cpu.h>
++#include <arch_cpu_defs.h>
+ #include <arch/thread.h>
+ #include <boot/stage2.h>
+ #include <commpage.h>
+@@ -31,6 +32,11 @@
+ #include "ARMPagingStructures.h"
+ #include "ARMVMTranslationMap.h"
+ 
++
++extern "C" void arm_kernel_exit_to_userland(Thread* thread, iframe* frame,
++	arch_fpu_context* fpu);
++
++
+ //#define TRACE_ARCH_THREAD
+ #ifdef TRACE_ARCH_THREAD
+ #	define TRACE(x...) dprintf(x)
+@@ -122,13 +128,21 @@ arch_thread_init_tls(Thread *thread)
+ }
+ 
+ 
++// the paging structures each CPU currently uses, referenced
++static ARMPagingStructures* sActivePagingStructures[SMP_MAX_CPUS];
++
++
+ void
+ arm_swap_pgdir(uint32_t pageDirectoryAddress)
+ {
+-	arm_set_ttbr0(pageDirectoryAddress);
++	// table walks are inner and outer write-back cacheable and shareable, as
++	// set up by the boot loader: they see the page table updates in the
++	// caches, which only reach the outer cache
++	arm_set_ttbr0(pageDirectoryAddress | 0x5b);
+ 	isb();
+ 
+-	arch_cpu_global_tlb_invalidate();
++	// only this CPU switches to the new page tables
++	arm_local_tlb_invalidate();
+ 
+ 	//TODO: update Context ID (incl. ASID)
+ 	//TODO: check if any additional TLB or Cache maintenance is needed
+@@ -140,21 +154,37 @@ arch_thread_context_switch(Thread *from, Thread *to)
+ {
+ 	arm_set_tpidruro(to->user_local_storage);
+ 
+-	VMAddressSpace *oldAddressSpace = from->team->address_space;
+-	VMTranslationMap *oldTranslationMap = oldAddressSpace->TranslationMap();
+-	phys_addr_t oldPageDirectoryAddress =
+-		((ARMVMTranslationMap *)oldTranslationMap)->PagingStructures()->pgdir_phys;
+-
+-	VMAddressSpace *newAddressSpace = to->team->address_space;
+-	VMTranslationMap *newTranslationMap = newAddressSpace->TranslationMap();
+-	phys_addr_t newPageDirectoryAddress =
+-		((ARMVMTranslationMap *)newTranslationMap)->PagingStructures()->pgdir_phys;
+-
+-	if (oldPageDirectoryAddress != newPageDirectoryAddress) {
+-		TRACE("arch_thread_context_switch: swap pgdir: "
+-			"0x%08" B_PRIxPHYSADDR " -> 0x%08" B_PRIxPHYSADDR "\n",
+-			oldPageDirectoryAddress, newPageDirectoryAddress);
+-		arm_swap_pgdir(newPageDirectoryAddress);
++	// Keep track of which paging structures are active on this CPU: the
++	// translation maps only invalidate the TLB entries of user pages on the
++	// CPUs in their active_on_cpus set, so with an empty set changes to user
++	// mappings (like making the pages of a forking team copy-on-write) were
++	// never seen by the CPU running the team, until it switched teams.
++	int cpu = smp_get_current_cpu();
++	ARMPagingStructures* activePagingStructures
++		= sActivePagingStructures[cpu];
++	ARMPagingStructures* toPagingStructures
++		= ((ARMVMTranslationMap*)to->team->address_space->TranslationMap())
++			->PagingStructures();
++
++	if (toPagingStructures != activePagingStructures) {
++		if (activePagingStructures != NULL)
++			activePagingStructures->active_on_cpus.ClearBitAtomic(cpu);
++		toPagingStructures->active_on_cpus.SetBitAtomic(cpu);
++
++		toPagingStructures->AddReference();
++		sActivePagingStructures[cpu] = toPagingStructures;
++
++		if (activePagingStructures == NULL
++			|| activePagingStructures->pgdir_phys
++				!= toPagingStructures->pgdir_phys) {
++			TRACE("arch_thread_context_switch: swap pgdir: "
++				"0x%08" B_PRIxPHYSADDR "\n", toPagingStructures->pgdir_phys);
++			arm_swap_pgdir(toPagingStructures->pgdir_phys);
++		}
++
++		// this CPU does not use the previous paging structures anymore
++		if (activePagingStructures != NULL)
++			activePagingStructures->RemoveReference();
+ 	}
+ 
+ 	TRACE("arch_thread_context_switch: %p(%s/%p) -> %p(%s/%p)\n",
+@@ -191,20 +221,32 @@ arch_thread_enter_userspace(Thread *thread, addr_t entry,
+ 	// Copy the address of the stub that calls exit_thread() when the thread
+ 	// entry function returns to LR to act as the return address.
+ 	// The stub is inside commpage.
++	// The commpage is user memory: read it while page faults can still be
++	// handled, i.e. before disabling interrupts.
+ 	addr_t commPageAddress = (addr_t)thread->team->commpage_address;
++	addr_t threadExitAddress
++		= ((addr_t*)commPageAddress)[COMMPAGE_ENTRY_ARM_THREAD_EXIT]
++			+ commPageAddress;
+ 
+ 	disable_interrupts();
+ 
++	// No kernel frame survives the jump to userland. After an exec() the
++	// frame of the syscall that got us here is still on the iframe stack,
++	// since that syscall never returns: drop it, or every exec() leaks a slot
++	// and a few of them in a row make arm_push_iframe() panic.
++	thread->arch_info.iframes.index = 0;
++
+ 	// prepare the user iframe
+ 	iframe frame = {};
+ 	frame.r0 = (uint32)args1;
+ 	frame.r1 = (uint32)args2;
+ 	frame.usr_sp = stackTop;
+-	frame.usr_lr = ((addr_t*)commPageAddress)[COMMPAGE_ENTRY_ARM_THREAD_EXIT]
+-		+ commPageAddress;
++	frame.usr_lr = threadExitAddress;
+ 	frame.pc = entry;
+ 
+-	// return to userland
++	// handle the signals sent before the thread started (like the
++	// SIGNAL_CONTINUE_THREAD of resume_thread()), then return to userland
++	arm_kernel_exit_to_userland(thread, &frame, NULL);
+ 	arch_return_to_userland(&frame);
+ 
+ 	// normally we don't get here
+@@ -272,13 +314,21 @@ arch_setup_signal_frame(Thread *thread, struct sigaction *sa,
+ 	signalFrameData->context.uc_mcontext.r15  = frame->pc;
+ 	signalFrameData->context.uc_mcontext.cpsr = frame->spsr;
+ 
+-	arm_save_fpu((arch_fpu_context*)&signalFrameData->context.uc_mcontext.d[0]);
++	// the registers of the interrupted code: saved by the exception entry
++	// (the kernel used them since), or live after a syscall
++	if (thread->arch_info.userFPU != NULL) {
++		memcpy(&signalFrameData->context.uc_mcontext.d[0],
++			thread->arch_info.userFPU, sizeof(arch_fpu_context));
++	} else
++		arm_save_fpu((arch_fpu_context*)&signalFrameData->context.uc_mcontext.d[0]);
+ 
+ 	// Fill in signalFrameData->context.uc_stack
+ 	signal_get_user_stack(frame->usr_sp, &signalFrameData->context.uc_stack);
+ 
+-	// store oldR0 in syscall_restart_return_value
+-	signalFrameData->syscall_restart_return_value = thread->arch_info.oldR0;
++	// store oldR0 and oldR1 (the syscall's first arguments, needed to
++	// restart it) in syscall_restart_return_value
++	signalFrameData->syscall_restart_return_value
++		= ((uint64)thread->arch_info.oldR1 << 32) | thread->arch_info.oldR0;
+ 
+ 	// get the stack to use -- that's either the current one or a special signal stack
+ 	uint8* userStack = get_signal_stack(thread, frame, sa,
+@@ -293,15 +343,19 @@ arch_setup_signal_frame(Thread *thread, struct sigaction *sa,
+ 	// prepare the user stack frame for a function call to the signal handler wrapper function
+ 	addr_t commpageAddr = (addr_t)thread->team->commpage_address;
+ 	addr_t signalHandlerAddr;
+-	ASSERT(user_memcpy(&signalHandlerAddr,
++	res = user_memcpy(&signalHandlerAddr,
+ 		&((addr_t*)commpageAddr)[COMMPAGE_ENTRY_ARM_SIGNAL_HANDLER],
+-		sizeof(signalHandlerAddr)) >= B_OK);
++		sizeof(signalHandlerAddr));
++	if (res < B_OK)
++		return res;
+ 	signalHandlerAddr += commpageAddr;
+ 
+ 	frame->usr_lr = frame->pc;
+ 	frame->usr_sp = (addr_t)userStack;
+ 	frame->pc = signalHandlerAddr;
+ 	frame->r0 = frame->usr_sp;
++	// the handler wrapper is ARM code, even if a signal interrupted Thumb code
++	frame->spsr &= ~(CPSR_T | CPSR_IT_MASK);
+ 
+ 	return B_OK;
+ }
+@@ -317,7 +371,9 @@ arch_restore_signal_frame(struct signal_frame_data* signalFrameData)
+ 	}
+ 
+ 	thread_get_current_thread()->arch_info.oldR0
+-		= signalFrameData->syscall_restart_return_value;
++		= (uint32)signalFrameData->syscall_restart_return_value;
++	thread_get_current_thread()->arch_info.oldR1
++		= (uint32)(signalFrameData->syscall_restart_return_value >> 32);
+ 
+ 	frame->r0     = signalFrameData->context.uc_mcontext.r0;
+ 	frame->r1     = signalFrameData->context.uc_mcontext.r1;
+@@ -335,11 +391,15 @@ arch_restore_signal_frame(struct signal_frame_data* signalFrameData)
+ 	frame->usr_sp = signalFrameData->context.uc_mcontext.r13;
+ 	frame->usr_lr = signalFrameData->context.uc_mcontext.r14;
+ 	frame->pc     = signalFrameData->context.uc_mcontext.r15;
+-	frame->spsr   = signalFrameData->context.uc_mcontext.cpsr;
++	// the CPSR comes from the user stack: only take what userland may change
++	frame->spsr   = (signalFrameData->context.uc_mcontext.cpsr
++		& CPSR_USER_MASK) | CPSR_MODE_USR;
+ 
+ 	arm_restore_fpu((arch_fpu_context*)&signalFrameData->context.uc_mcontext.d[0]);
+ 
+-	return frame->r0;
++	// The syscall returns r0 and r1 (for 64 bit results): give both back, a
++	// signal may have interrupted userland code using r1.
++	return ((uint64)frame->r1 << 32) | frame->r0;
+ }
+ 
+ 
+@@ -371,5 +431,7 @@ void
+ arch_restore_fork_frame(struct arch_fork_arg *arg)
+ {
+ 	disable_interrupts();
++	arm_kernel_exit_to_userland(thread_get_current_thread(), &arg->frame,
++		NULL);
+ 	arch_return_to_userland(&arg->frame);
+ }
+diff --git a/src/system/kernel/arch/arm/arch_user_debugger.cpp b/src/system/kernel/arch/arm/arch_user_debugger.cpp
+index 8721605a06..c6468c7931 100644
+--- a/src/system/kernel/arch/arm/arch_user_debugger.cpp
++++ b/src/system/kernel/arch/arm/arch_user_debugger.cpp
+@@ -12,6 +12,10 @@
+ #include <thread.h>
+ #include <arch/user_debugger.h>
+ 
++#include <string.h>
++
++#include <arch_cpu_defs.h>
++
+ 
+ #warning ARM: WRITEME
+ 
+@@ -48,6 +52,48 @@ arch_update_thread_single_step()
+ }
+ 
+ 
++/*!	Returns the frame the thread entered the kernel with from userland: the
++	innermost frame on its stack of exception frames whose saved mode is user
++	mode, or the frame of its last syscall.
++*/
++static struct iframe*
++get_user_iframe(Thread* thread)
++{
++	struct iframe_stack& frames = thread->arch_info.iframes;
++	for (int32 i = frames.index - 1; i >= 0; i--) {
++		struct iframe* frame = frames.frames[i];
++		if (frame != NULL && (frame->spsr & CPSR_MODE_MASK) == CPSR_MODE_USR)
++			return frame;
++	}
++
++	return thread->arch_info.userFrame;
++}
++
++
++static void
++get_cpu_state(const struct iframe* frame, debug_cpu_state* cpuState)
++{
++	memset(cpuState, 0, sizeof(*cpuState));
++	cpuState->r0 = frame->r0;
++	cpuState->r1 = frame->r1;
++	cpuState->r2 = frame->r2;
++	cpuState->r3 = frame->r3;
++	cpuState->r4 = frame->r4;
++	cpuState->r5 = frame->r5;
++	cpuState->r6 = frame->r6;
++	cpuState->r7 = frame->r7;
++	cpuState->r8 = frame->r8;
++	cpuState->r9 = frame->r9;
++	cpuState->r10 = frame->r10;
++	cpuState->r11 = frame->r11;
++	cpuState->r12 = frame->r12;
++	cpuState->r13 = frame->usr_sp;
++	cpuState->r14 = frame->usr_lr;
++	cpuState->r15 = frame->pc;
++	cpuState->cpsr = frame->spsr;
++}
++
++
+ void
+ arch_set_debug_cpu_state(const debug_cpu_state *cpuState)
+ {
+@@ -57,13 +103,23 @@ arch_set_debug_cpu_state(const debug_cpu_state *cpuState)
+ void
+ arch_get_debug_cpu_state(debug_cpu_state *cpuState)
+ {
++	struct iframe* frame = get_user_iframe(thread_get_current_thread());
++	if (frame != NULL)
++		get_cpu_state(frame, cpuState);
++	else
++		memset(cpuState, 0, sizeof(*cpuState));
+ }
+ 
+ 
+ status_t
+ arch_get_thread_debug_cpu_state(Thread *thread, debug_cpu_state *cpuState)
+ {
+-	return B_ERROR;
++	struct iframe* frame = get_user_iframe(thread);
++	if (frame == NULL)
++		return B_BAD_VALUE;
++
++	get_cpu_state(frame, cpuState);
++	return B_OK;
+ }
+ 
+ 
+-- 
+2.39.5
+

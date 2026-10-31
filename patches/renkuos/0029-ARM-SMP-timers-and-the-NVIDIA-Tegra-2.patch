@@ -1,0 +1,1155 @@
+From 2889764cbc0458d392d5921bb4b9cb7eb6e80486 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 27 Oct 2026 07:20:24 +0100
+Subject: [PATCH 29/63] ARM: SMP, timers and the NVIDIA Tegra 2
+
+- bring up the other CPUs, keep track of the paging structures active
+  on each of them, switch branch prediction on for every CPU
+- route device interrupts to the CPUs the kernel assigns them to
+  ("arm_spread_interrupts false" in the kernel settings keeps them on the
+  boot CPU)
+- a timer driver for the Cortex-A9 private timer, and the Tegra 2 timers;
+  do not handle ICIs while waiting for the time
+- reset and switch off NVIDIA Tegra machines through the power
+  management controller (the AC100 is switched off instead of reset)
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/system/kernel/arch/arm/Jamfile            |   3 +
+ src/system/kernel/arch/arm/arch_cpu.cpp       | 214 +++++++++++++++--
+ src/system/kernel/arch/arm/arch_int_gicv2.cpp |  14 ++
+ src/system/kernel/arch/arm/arch_int_gicv2.h   |   1 +
+ src/system/kernel/arch/arm/arch_smp.cpp       |  31 ++-
+ src/system/kernel/arch/arm/arch_timer.cpp     |  15 ++
+ .../kernel/arch/arm/arch_timer_a9_twd.cpp     | 191 +++++++++++++++
+ .../kernel/arch/arm/arch_timer_a9_twd.h       |  58 +++++
+ .../kernel/arch/arm/arch_timer_generic.cpp    |  10 +
+ .../kernel/arch/arm/arch_timer_generic.h      |   1 +
+ src/system/kernel/arch/arm/soc.h              |  10 +
+ src/system/kernel/arch/arm/soc_tegra.cpp      | 227 ++++++++++++++++++
+ src/system/kernel/arch/arm/soc_tegra.h        |  67 ++++++
+ 13 files changed, 815 insertions(+), 27 deletions(-)
+ create mode 100644 src/system/kernel/arch/arm/arch_timer_a9_twd.cpp
+ create mode 100644 src/system/kernel/arch/arm/arch_timer_a9_twd.h
+ create mode 100644 src/system/kernel/arch/arm/soc_tegra.cpp
+ create mode 100644 src/system/kernel/arch/arm/soc_tegra.h
+
+diff --git a/src/system/kernel/arch/arm/Jamfile b/src/system/kernel/arch/arm/Jamfile
+index 17839c7427..a0ccc589ee 100644
+--- a/src/system/kernel/arch/arm/Jamfile
++++ b/src/system/kernel/arch/arm/Jamfile
+@@ -12,6 +12,7 @@ KernelMergeObject kernel_arch_arm.o :
+ 	acpi_irq_routing_table.cpp
+ 	arch_commpage.cpp
+ 	arch_cpu.cpp
++	arch_l2_cache.cpp
+ 	arch_debug_console.cpp
+ 	arch_debug.cpp
+ 	arch_elf.cpp
+@@ -41,6 +42,7 @@ KernelMergeObject kernel_arch_arm.o :
+ 
+ 	arch_int_gicv2.cpp
+ 	arch_timer_generic.cpp
++	arch_timer_a9_twd.cpp
+ 
+ 	# SoC minimal kernel-required support
+ 	# (timers, interrupts, rtc?)
+@@ -48,6 +50,7 @@ KernelMergeObject kernel_arch_arm.o :
+ 	soc_pxa.cpp
+ 	soc_omap3.cpp
+ 	soc_sun4i.cpp
++	soc_tegra.cpp
+ 
+ 	# paging
+ 	arm_physical_page_mapper_large_memory.cpp
+diff --git a/src/system/kernel/arch/arm/arch_cpu.cpp b/src/system/kernel/arch/arm/arch_cpu.cpp
+index ae8f1c9630..9a46e96bbd 100644
+--- a/src/system/kernel/arch/arm/arch_cpu.cpp
++++ b/src/system/kernel/arch/arm/arch_cpu.cpp
+@@ -11,14 +11,33 @@
+ 
+ 
+ #include <KernelExport.h>
++#include <driver_settings.h>
+ 
+ #include <arch/cpu.h>
++#include <cpu.h>
+ #include <boot/kernel_args.h>
+ 
+ 
++bool gARMHasVFPD32 = true;
++
++
++void arch_int_init_secondary_cpu(int32 cpu);
++status_t arm_l2_cache_init(kernel_args* args);
++
++
+ status_t
+ arch_cpu_preboot_init_percpu(kernel_args *args, int curr_cpu)
+ {
++	// Haiku does not use ASIDs: user mappings are not global and are tagged
++	// with CONTEXTIDR.ASID, which the firmware may have left non-zero
++	asm volatile ("mcr p15, 0, %0, c13, c0, 1" : : "r" (0));
++	asm volatile ("isb");
++
++	if (curr_cpu == 0) {
++		// MVFR0[3:0]: 1 = 16 double registers (e.g. Tegra 2), 2 = 32
++		gARMHasVFPD32 = (arm_get_mvfr0() & 0xf) == 2;
++	}
++
+ 	return B_OK;
+ }
+ 
+@@ -26,23 +45,86 @@ arch_cpu_preboot_init_percpu(kernel_args *args, int curr_cpu)
+ status_t
+ arch_cpu_init_percpu(kernel_args *args, int curr_cpu)
+ {
++	// the boot CPU sets its exceptions up in arch_int_init()
+ 	if (curr_cpu != 0)
+-		panic("No SMP support on ARM yet!\n");
++		arch_int_init_secondary_cpu(curr_cpu);
++
++	// Branch prediction: the firmware switches it on for the boot CPU only,
++	// the others come out of reset without; a busy loop then runs about
++	// three times slower on them
++	uint32 control;
++	asm volatile("mrc p15, 0, %0, c1, c0, 0" : "=r" (control));
++	uint32 auxControl;
++	asm volatile("mrc p15, 0, %0, c1, c0, 1" : "=r" (auxControl));
++	if ((control & (1 << 11)) == 0) {
++		asm volatile("mcr p15, 0, %0, c7, c5, 6; dsb; isb" : : "r" (0));
++			// BPIALL
++		asm volatile("mcr p15, 0, %0, c1, c0, 0; isb"
++			: : "r" (control | (1 << 11)));
++	}
++	dprintf("arm: CPU %d: SCTLR 0x%08" B_PRIx32 " (branch prediction %s),"
++		" ACTLR 0x%08" B_PRIx32 "\n", curr_cpu, control,
++		(control & (1 << 11)) != 0 ? "on" : "switched on", auxControl);
+ 
+-	return 0;
++	return B_OK;
+ }
+ 
+ 
+ status_t
+ arch_cpu_init(kernel_args *args)
+ {
++	// one package of single threaded cores, as on all ARMv7 multiprocessors
++	for (uint32 i = 0; i < args->num_cpus; i++) {
++		cpu_ent* cpu = &gCPU[i];
++		cpu->topology_id[CPU_TOPOLOGY_PACKAGE] = 0;
++		cpu->topology_id[CPU_TOPOLOGY_CORE] = i;
++		cpu->topology_id[CPU_TOPOLOGY_SMT] = 0;
++	}
+ 	return B_OK;
+ }
+ 
+ 
++// NVIDIA Tegra power management controller: a write of MAIN_RST to its
++// control register resets the whole chip
++#define TEGRA_PMC_CNTRL				0x00
++#define TEGRA_PMC_CNTRL_MAIN_RST	(1 << 4)
++
++static volatile uint32* sTegraPMC;
++// After a chip reset the Toshiba AC100 starts its stock bootloader from the
++// eMMC; Haiku only comes back if U-Boot is loaded again over USB (RCM). So a
++// reboot switches the machine off instead, unless "arm_reboot_resets true"
++// is in the kernel settings (for U-Boot installed on the eMMC).
++static bool sRebootResets = true;
++
++// set by the driver that can switch the machine off, like the embedded
++// controller of the Toshiba AC100
++extern "C" {
++void (*gArmPowerOffHook)(void) = NULL;
++}
++
++
+ status_t
+ arch_cpu_init_post_vm(kernel_args *args)
+ {
++	arm_l2_cache_init(args);
++
++	void* settings = load_driver_settings("kernel");
++	sRebootResets = get_driver_boolean_parameter(settings, "arm_reboot_resets",
++		false, true);
++	unload_driver_settings(settings);
++
++	if (args->arch_args.pmc.start != 0) {
++		void* address;
++		area_id area = map_physical_memory("tegra pmc",
++			args->arch_args.pmc.start & ~(phys_addr_t)(B_PAGE_SIZE - 1),
++			B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++		if (area >= B_OK) {
++			sTegraPMC = (volatile uint32*)((addr_t)address
++				+ (args->arch_args.pmc.start & (B_PAGE_SIZE - 1)));
++		}
++	}
++
+ 	return B_OK;
+ }
+ 
+@@ -57,6 +139,21 @@ arch_cpu_init_post_modules(kernel_args *args)
+ status_t
+ arch_cpu_shutdown(bool reboot)
+ {
++	if (reboot && !sRebootResets && gArmPowerOffHook != NULL) {
++		dprintf("reboot: switching off instead (\"arm_reboot_resets true\" "
++			"resets the chip)\n");
++		reboot = false;
++	}
++
++	if (reboot && sTegraPMC != NULL) {
++		disable_interrupts();
++		sTegraPMC[TEGRA_PMC_CNTRL / 4] |= TEGRA_PMC_CNTRL_MAIN_RST;
++		spin(100000);
++	}
++
++	if (!reboot && gArmPowerOffHook != NULL)
++		gArmPowerOffHook();
++
+ 	while(1)
+ 		arch_cpu_idle();
+ 
+@@ -65,12 +162,78 @@ arch_cpu_shutdown(bool reboot)
+ }
+ 
+ 
++/*!	Makes code written through the data cache visible to instruction fetches:
++	cleans the whole level 1 data cache to the point of unification (which is
++	level 1 on the supported CPUs), then invalidates the instruction cache and
++	the branch predictor. This only affects the current CPU.
++*/
++void
++arm_sync_icache_all(void)
++{
++	// select the level 1 data cache and read its geometry
++	asm volatile ("mcr p15, 2, %0, c0, c0, 0" : : "r" (0));
++	asm volatile ("isb");
++	uint32 ccsidr;
++	asm volatile ("mrc p15, 1, %0, c0, c0, 0" : "=r" (ccsidr));
++
++	uint32 lineShift = (ccsidr & 7) + 4;
++	uint32 ways = ((ccsidr >> 3) & 0x3ff) + 1;
++	uint32 sets = ((ccsidr >> 13) & 0x7fff) + 1;
++	uint32 wayShift = ways > 1 ? __builtin_clz(ways - 1) : 0;
++
++	dsb();
++	for (uint32 way = 0; way < ways; way++) {
++		for (uint32 set = 0; set < sets; set++) {
++			// DCCSW: clean by set/way
++			uint32 value = (way << wayShift) | (set << lineShift);
++			asm volatile ("mcr p15, 0, %0, c7, c10, 2" : : "r" (value)
++				: "memory");
++		}
++	}
++	dsb();
++
++	// ICIALLUIS and BPIALLIS: the code may run on any CPU
++	asm volatile ("mcr p15, 0, %0, c7, c1, 0" : : "r" (0) : "memory");
++	asm volatile ("mcr p15, 0, %0, c7, c1, 6" : : "r" (0) : "memory");
++	dsb();
++	isb();
++}
++
++
++/*!	Writes back and discards the whole level 1 data cache of the current CPU,
++	e.g. before memory that was cached is accessed through a non-cacheable
++	mapping, so that no dirty line can be evicted over it later.
++*/
++void
++arm_clean_invalidate_dcache_all(void)
++{
++	asm volatile ("mcr p15, 2, %0, c0, c0, 0" : : "r" (0));
++	asm volatile ("isb");
++	uint32 ccsidr;
++	asm volatile ("mrc p15, 1, %0, c0, c0, 0" : "=r" (ccsidr));
++
++	uint32 lineShift = (ccsidr & 7) + 4;
++	uint32 ways = ((ccsidr >> 3) & 0x3ff) + 1;
++	uint32 sets = ((ccsidr >> 13) & 0x7fff) + 1;
++	uint32 wayShift = ways > 1 ? __builtin_clz(ways - 1) : 0;
++
++	dsb();
++	for (uint32 way = 0; way < ways; way++) {
++		for (uint32 set = 0; set < sets; set++) {
++			// DCCISW: clean and invalidate by set/way
++			uint32 value = (way << wayShift) | (set << lineShift);
++			asm volatile ("mcr p15, 0, %0, c7, c14, 2" : : "r" (value)
++				: "memory");
++		}
++	}
++	dsb();
++}
++
++
+ void
+ arch_cpu_sync_icache(void *address, size_t len)
+ {
+-	uint32 Rd = 0;
+-	asm volatile ("mcr p15, 0, %[c7format], c7, c5, 0"
+-		: : [c7format] "r" (Rd) );
++	arm_sync_icache_all();
+ }
+ 
+ 
+@@ -80,8 +243,8 @@ arch_cpu_invalidate_TLB_page(addr_t page)
+ 	// ensure visibility of the update to translation table walks
+ 	dsb();
+ 
+-	// TLBIMVAIS(page)
+-	asm volatile ("mcr p15, 0, %0, c8, c3, 1"
++	// TLBIMVAAIS(page): for all ASIDs, user mappings are not global
++	asm volatile ("mcr p15, 0, %0, c8, c3, 3"
+ 		: : "r" (page));
+ 
+ 	// ensure completion of TLB invalidation
+@@ -95,9 +258,11 @@ arch_cpu_invalidate_tlb_range(intptr_t, addr_t start, addr_t end)
+ 	// ensure visibility of the update to translation table walks
+ 	dsb();
+ 
++	// TLBIMVAAIS: by address for all ASIDs (user mappings are not global),
++	// on all CPUs (early during boot the others ignore the ICIs)
+ 	int32 num_pages = end / B_PAGE_SIZE - start / B_PAGE_SIZE;
+ 	while (num_pages-- >= 0) {
+-		asm volatile ("mcr p15, 0, %[c8format], c8, c6, 1"
++		asm volatile ("mcr p15, 0, %[c8format], c8, c3, 3"
+ 			: : [c8format] "r" (start) );
+ 		start += B_PAGE_SIZE;
+ 	}
+@@ -114,8 +279,10 @@ arch_cpu_invalidate_tlb_list(intptr_t, addr_t pages[], int num_pages)
+ 	// ensure visibility of the update to translation table walks
+ 	dsb();
+ 
++	// TLBIMVAAIS: by address for all ASIDs (user mappings are not global),
++	// on all CPUs (early during boot the others ignore the ICIs)
+ 	for (int i = 0; i < num_pages; i++) {
+-		asm volatile ("mcr p15, 0, %[c8format], c8, c6, 1":
++		asm volatile ("mcr p15, 0, %[c8format], c8, c3, 3":
+ 			: [c8format] "r" (pages[i]) );
+ 	}
+ 
+@@ -125,15 +292,17 @@ arch_cpu_invalidate_tlb_list(intptr_t, addr_t pages[], int num_pages)
+ }
+ 
+ 
++/*!	Drops all TLB entries of all CPUs (TLBIALLIS): the other CPUs may hold
++	translations of kernel mappings that changed, e.g. while they wait for
++	the boot CPU early during boot, ignoring the ICIs.
++*/
+ void
+ arch_cpu_global_tlb_invalidate(void)
+ {
+ 	// ensure visibility of the update to translation table walks
+ 	dsb();
+ 
+-	uint32 Rd = 0;
+-	asm volatile ("mcr p15, 0, %[c8format], c8, c7, 0"
+-		: : [c8format] "r" (Rd) );
++	asm volatile ("mcr p15, 0, %0, c8, c3, 0" : : "r" (0) : "memory");
+ 
+ 	// ensure completion of TLB invalidation
+ 	dsb();
+@@ -141,12 +310,21 @@ arch_cpu_global_tlb_invalidate(void)
+ }
+ 
+ 
++/*!	Drops all TLB entries of the current CPU only (TLBIALL). */
++void
++arm_local_tlb_invalidate(void)
++{
++	dsb();
++	asm volatile ("mcr p15, 0, %0, c8, c7, 0" : : "r" (0) : "memory");
++	dsb();
++	isb();
++}
++
++
+ void
+ arch_cpu_user_tlb_invalidate(intptr_t)
+-{/*
+-	cpu_ops.flush_insn_pipeline();
+-	cpu_ops.flush_atc_user();
+-	cpu_ops.flush_insn_pipeline();
+-*/
+-#warning WRITEME
++{
++	// User mappings are not tagged with an ASID, so drop all TLB entries;
++	// every CPU running the address space gets this through an ICI
++	arm_local_tlb_invalidate();
+ }
+diff --git a/src/system/kernel/arch/arm/arch_int_gicv2.cpp b/src/system/kernel/arch/arm/arch_int_gicv2.cpp
+index 77c67f2b5c..e3a86bc47a 100644
+--- a/src/system/kernel/arch/arm/arch_int_gicv2.cpp
++++ b/src/system/kernel/arch/arm/arch_int_gicv2.cpp
+@@ -116,6 +116,20 @@ GICv2InterruptController::DisableInterrupt(int32 irq)
+ }
+ 
+ 
++int32
++GICv2InterruptController::AssignToCpu(int32 irq, int32 cpu)
++{
++	// SGIs and PPIs belong to each CPU, only SPIs can be routed
++	if (irq < 32 || cpu < 0 || cpu >= 8)
++		return 0;
++
++	// the target registers are byte accessible, one byte per interrupt
++	volatile uint8* targets = (volatile uint8*)&fGicdRegs[GICD_REG_ITARGETSR];
++	targets[irq] = 1 << cpu;
++	return cpu;
++}
++
++
+ void GICv2InterruptController::HandleInterrupt()
+ {
+ 	uint32_t iar = fGiccRegs[GICC_REG_IAR];
+diff --git a/src/system/kernel/arch/arm/arch_int_gicv2.h b/src/system/kernel/arch/arm/arch_int_gicv2.h
+index 40e2c3bce1..7ce6c1c53d 100644
+--- a/src/system/kernel/arch/arm/arch_int_gicv2.h
++++ b/src/system/kernel/arch/arm/arch_int_gicv2.h
+@@ -18,6 +18,7 @@ public:
+ 	void SendMulticastIci(CPUSet& cpuSet);
+ 	void SendBroadcastIci();
+ 	status_t PerCpuInit();
++	int32 AssignToCpu(int32 irq, int32 cpu);
+ private:
+ 	volatile uint32_t *fGicdRegs;
+ 	volatile uint32_t *fGiccRegs;
+diff --git a/src/system/kernel/arch/arm/arch_smp.cpp b/src/system/kernel/arch/arm/arch_smp.cpp
+index b45fd9bf8e..59201f8545 100644
+--- a/src/system/kernel/arch/arm/arch_smp.cpp
++++ b/src/system/kernel/arch/arm/arch_smp.cpp
+@@ -1,11 +1,5 @@
+ /*
+- * Copyright 2007, Haiku Inc. All rights reserved.
+- * Distributed under the terms of the MIT License.
+- *
+- * Authors:
+- * 		François Revol <revol@free.fr>
+- *
+- * Copyright 2004, Axel Dörfler, axeld@pinc-software.de
++ * Copyright 2007-2026, Haiku, Inc. All rights reserved.
+  * Distributed under the terms of the MIT License.
+  */
+ 
+@@ -17,6 +11,8 @@
+ #include <debug.h>
+ #include <interrupts.h>
+ 
++#include "soc.h"
++
+ 
+ status_t
+ arch_smp_init(kernel_args *args)
+@@ -25,9 +21,24 @@ arch_smp_init(kernel_args *args)
+ }
+ 
+ 
++/*!	Called on each CPU but the boot one: the banked parts of the interrupt
++	controller (its CPU interface, the inter-processor and the timer
++	interrupts) and the private timer must be set up on it.
++*/
+ status_t
+ arch_smp_per_cpu_init(kernel_args *args, int32 cpu)
+ {
++	if (cpu == 0)
++		return B_OK;
++
++	InterruptController* controller = InterruptController::Get();
++	if (controller != NULL)
++		controller->PerCpuInit();
++
++	HardwareTimer* timer = HardwareTimer::Get();
++	if (timer != NULL)
++		timer->PerCpuInit();
++
+ 	return B_OK;
+ }
+ 
+@@ -39,18 +50,20 @@ arch_smp_send_multicast_ici(CPUSet& cpuSet)
+ 	if (are_interrupts_enabled())
+ 		panic("arch_smp_send_multicast_ici: called with interrupts enabled");
+ #endif
++
++	InterruptController::Get()->SendMulticastIci(cpuSet);
+ }
+ 
+ 
+ void
+ arch_smp_send_ici(int32 target_cpu)
+ {
+-	panic("called arch_smp_send_ici!\n");
++	InterruptController::Get()->SendUnicastIci(target_cpu);
+ }
+ 
+ 
+ void
+ arch_smp_send_broadcast_ici()
+ {
+-	panic("called arch_smp_send_broadcast_ici\n");
++	InterruptController::Get()->SendBroadcastIci();
+ }
+diff --git a/src/system/kernel/arch/arm/arch_timer.cpp b/src/system/kernel/arch/arm/arch_timer.cpp
+index f0fabbd963..9392aba0f9 100644
+--- a/src/system/kernel/arch/arm/arch_timer.cpp
++++ b/src/system/kernel/arch/arm/arch_timer.cpp
+@@ -25,6 +25,8 @@
+ 
+ #include "soc_pxa.h"
+ #include "soc_omap3.h"
++#include "soc_tegra.h"
++#include "arch_timer_a9_twd.h"
+ 
+ //#define TRACE_ARCH_TIMER
+ #ifdef TRACE_ARCH_TIMER
+@@ -66,6 +68,19 @@ arch_init_timer(kernel_args *args)
+ 	} else if (strncmp(args->arch_args.timer.kind, TIMER_KIND_PXA,
+ 		sizeof(args->arch_args.timer.kind)) == 0) {
+ 		PXATimer::Init(args->arch_args.timer.regs.start);
++	} else if (strncmp(args->arch_args.timer.kind, TIMER_KIND_TEGRA,
++		sizeof(args->arch_args.timer.kind)) == 0) {
++		// with several CPUs, each takes its events from its private timer
++		bool perCPUEvents = args->num_cpus > 1
++			&& args->arch_args.twd.start != 0;
++		TegraTimer::Init(args->arch_args.timer.regs.start,
++			args->arch_args.timer.interrupt,
++			perCPUEvents ? args->arch_args.twd.start : 0,
++			args->arch_args.twdInterrupt, args->arch_args.timerFrequency);
++	} else if (strncmp(args->arch_args.timer.kind, TIMER_KIND_A9_TWD,
++		sizeof(args->arch_args.timer.kind)) == 0) {
++		A9TWDTimer::Init(args->arch_args.timer.regs.start,
++			args->arch_args.timer.interrupt, args->arch_args.timerFrequency);
+ 	} else {
+ 		panic("No hardware timer found!\n");
+ 	}
+diff --git a/src/system/kernel/arch/arm/arch_timer_a9_twd.cpp b/src/system/kernel/arch/arm/arch_timer_a9_twd.cpp
+new file mode 100644
+index 0000000000..949a267107
+--- /dev/null
++++ b/src/system/kernel/arch/arm/arch_timer_a9_twd.cpp
+@@ -0,0 +1,191 @@
++/*
++ * Copyright 2026, Haiku, Inc. All rights reserved.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "arch_timer_a9_twd.h"
++
++#include <KernelExport.h>
++#include <timer.h>
++#include <vm/vm.h>
++
++
++// Register offsets, in bytes, from the private timer base
++#define TWD_LOAD				0x00
++#define TWD_COUNTER				0x04
++#define TWD_CONTROL				0x08
++#define TWD_INTERRUPT_STATUS	0x0c
++
++#define TWD_CONTROL_ENABLE		(1U << 0)
++#define TWD_CONTROL_IRQ_ENABLE	(1U << 2)
++
++#define TWD_MAX_LOAD			0xffffffffU
++
++
++static inline uint32
++read_reg(volatile uint32* regs, uint32 offset)
++{
++	return regs[offset / sizeof(uint32)];
++}
++
++
++static inline void
++write_reg(volatile uint32* regs, uint32 offset, uint32 value)
++{
++	regs[offset / sizeof(uint32)] = value;
++}
++
++
++A9TWDTimer::A9TWDTimer(phys_addr_t regBase, uint32 interrupt,
++	uint32 frequency)
++	:
++	fInterrupt(interrupt),
++	fFrequency(frequency),
++	fLock(B_SPINLOCK_INITIALIZER),
++	fBaseTicks(0),
++	fLoaded(0),
++	fEventArmed(false),
++	fEventTicks(0)
++{
++	if (fFrequency == 0)
++		panic("A9 TWD timer: unknown frequency!");
++
++	fRegArea = vm_map_physical_memory(B_SYSTEM_TEAM, "timer-a9-twd",
++		(void**)&fRegs, B_ANY_KERNEL_ADDRESS, B_PAGE_SIZE,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++		ROUNDDOWN(regBase, B_PAGE_SIZE), false);
++	if (fRegArea < 0)
++		panic("Cannot map A9 TWD timer registers!");
++	fRegs += (regBase % B_PAGE_SIZE) / sizeof(uint32);
++
++	dprintf("A9 TWD: timer @ %#" B_PRIxPHYSADDR ", IRQ %" B_PRId32 ", %" B_PRIu32
++		" Hz\n", regBase, fInterrupt, fFrequency);
++
++	write_reg(fRegs, TWD_CONTROL, 0);
++	write_reg(fRegs, TWD_INTERRUPT_STATUS, 1);
++	install_io_interrupt_handler(fInterrupt, &A9TWDTimer::_HandleInterrupt,
++		this, 0);
++
++	// start counting right away, the clock must run even without events
++	cpu_status state = disable_interrupts();
++	acquire_spinlock(&fLock);
++	_LoadLocked(TWD_MAX_LOAD);
++	write_reg(fRegs, TWD_CONTROL, TWD_CONTROL_ENABLE | TWD_CONTROL_IRQ_ENABLE);
++	release_spinlock(&fLock);
++	restore_interrupts(state);
++}
++
++
++void
++A9TWDTimer::SetTimeout(bigtime_t timeout)
++{
++	cpu_status state = disable_interrupts();
++	acquire_spinlock(&fLock);
++
++	uint64 ticks;
++	if (timeout >= _ToTime(TWD_MAX_LOAD))
++		ticks = TWD_MAX_LOAD;
++	else if (timeout <= 0)
++		ticks = 1;
++	else
++		ticks = max_c(_ToTicks(timeout), 1);
++
++	_LoadLocked((uint32)ticks);
++	fEventArmed = true;
++	fEventTicks = fBaseTicks + ticks;
++
++	release_spinlock(&fLock);
++	restore_interrupts(state);
++}
++
++
++bigtime_t
++A9TWDTimer::Time()
++{
++	cpu_status state = disable_interrupts();
++	acquire_spinlock(&fLock);
++
++	uint64 ticks = _TicksLocked();
++
++	release_spinlock(&fLock);
++	restore_interrupts(state);
++
++	return _ToTime(ticks);
++}
++
++
++void
++A9TWDTimer::Clear()
++{
++	cpu_status state = disable_interrupts();
++	acquire_spinlock(&fLock);
++
++	fEventArmed = false;
++	_LoadLocked(TWD_MAX_LOAD);
++
++	release_spinlock(&fLock);
++	restore_interrupts(state);
++}
++
++
++uint64
++A9TWDTimer::_TicksLocked()
++{
++	// In single shot mode the counter stops at 0 once the load has elapsed
++	return fBaseTicks + (fLoaded - read_reg(fRegs, TWD_COUNTER));
++}
++
++
++void
++A9TWDTimer::_LoadLocked(uint32 ticks)
++{
++	fBaseTicks = _TicksLocked();
++	fLoaded = ticks;
++	// writing the load register also reloads the counter
++	write_reg(fRegs, TWD_LOAD, ticks);
++}
++
++
++uint64
++A9TWDTimer::_ToTicks(bigtime_t time) const
++{
++	return (uint64)time / 1000000 * fFrequency
++		+ (uint64)time % 1000000 * fFrequency / 1000000;
++}
++
++
++bigtime_t
++A9TWDTimer::_ToTime(uint64 ticks) const
++{
++	return ticks / fFrequency * 1000000
++		+ ticks % fFrequency * 1000000 / fFrequency;
++}
++
++
++int32
++A9TWDTimer::_HandleInterrupt(void* data)
++{
++	A9TWDTimer* timer = (A9TWDTimer*)data;
++
++	acquire_spinlock(&timer->fLock);
++
++	write_reg(timer->fRegs, TWD_INTERRUPT_STATUS, 1);
++
++	// The interrupt may be stale if the counter was reloaded meanwhile; only
++	// act on an expired load.
++	bool expired = read_reg(timer->fRegs, TWD_COUNTER) == 0;
++	bool eventDue = timer->fEventArmed
++		&& timer->_TicksLocked() >= timer->fEventTicks;
++
++	if (eventDue)
++		timer->fEventArmed = false;
++	if (expired) {
++		// keep the clock running until the next SetTimeout()
++		timer->_LoadLocked(TWD_MAX_LOAD);
++	}
++
++	release_spinlock(&timer->fLock);
++
++	return eventDue ? timer_interrupt() : B_HANDLED_INTERRUPT;
++}
+diff --git a/src/system/kernel/arch/arm/arch_timer_a9_twd.h b/src/system/kernel/arch/arm/arch_timer_a9_twd.h
+new file mode 100644
+index 0000000000..ae1b8b6401
+--- /dev/null
++++ b/src/system/kernel/arch/arm/arch_timer_a9_twd.h
+@@ -0,0 +1,58 @@
++/*
++ * Copyright 2026, Haiku, Inc. All rights reserved.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef ARCH_ARM_TIMER_A9_TWD_H
++#define ARCH_ARM_TIMER_A9_TWD_H
++
++
++#include "soc.h"
++
++#include <new>
++
++
++// Private timer of the Cortex-A9 MPCore ("arm,cortex-a9-twd-timer"). It has a
++// single 32-bit down counter, so it serves both as clock source and as event
++// timer: the time is accumulated from the ticks consumed since the counter was
++// last loaded, and the counter is reloaded for every timeout.
++class A9TWDTimer : public HardwareTimer {
++public:
++	void SetTimeout(bigtime_t timeout);
++	bigtime_t Time();
++	void Clear();
++
++	static status_t Init(phys_addr_t regBase, uint32 interrupt,
++		uint32 frequency)
++	{
++		if (sInstance != NULL)
++			return B_OK;
++
++		A9TWDTimer* timer = new(std::nothrow) A9TWDTimer(regBase, interrupt,
++			frequency);
++		return timer != NULL ? B_OK : B_NO_MEMORY;
++	}
++
++private:
++	A9TWDTimer(phys_addr_t regBase, uint32 interrupt, uint32 frequency);
++
++	uint64 _TicksLocked();
++	void _LoadLocked(uint32 ticks);
++	uint64 _ToTicks(bigtime_t time) const;
++	bigtime_t _ToTime(uint64 ticks) const;
++
++	static int32 _HandleInterrupt(void* data);
++
++	area_id fRegArea;
++	volatile uint32* fRegs;
++	int32 fInterrupt;
++	uint32 fFrequency;
++
++	spinlock fLock;
++	uint64 fBaseTicks;		// ticks elapsed until the last load
++	uint32 fLoaded;			// value the counter was last loaded with
++	bool fEventArmed;
++	uint64 fEventTicks;		// when the armed event is due
++};
++
++
++#endif /* ARCH_ARM_TIMER_A9_TWD_H */
+diff --git a/src/system/kernel/arch/arm/arch_timer_generic.cpp b/src/system/kernel/arch/arm/arch_timer_generic.cpp
+index 1e66bed935..3220894ff2 100644
+--- a/src/system/kernel/arch/arm/arch_timer_generic.cpp
++++ b/src/system/kernel/arch/arm/arch_timer_generic.cpp
+@@ -91,6 +91,16 @@ ARMGenericTimer::ARMGenericTimer()
+ }
+ 
+ 
++status_t
++ARMGenericTimer::PerCpuInit()
++{
++	// the timer and its interrupt (a PPI) are banked per CPU
++	Clear();
++	InterruptController::Get()->EnableInterrupt(TIMER_IRQ);
++	return B_OK;
++}
++
++
+ bool
+ ARMGenericTimer::IsAvailable()
+ {
+diff --git a/src/system/kernel/arch/arm/arch_timer_generic.h b/src/system/kernel/arch/arm/arch_timer_generic.h
+index 26cb71b114..670067d4a3 100644
+--- a/src/system/kernel/arch/arm/arch_timer_generic.h
++++ b/src/system/kernel/arch/arm/arch_timer_generic.h
+@@ -15,6 +15,7 @@ public:
+ 	void SetTimeout(bigtime_t timeout);
+ 	void Clear();
+ 	bigtime_t Time();
++	status_t PerCpuInit();
+ 
+ 	static status_t Init() {
+ 		ARMGenericTimer *timer = new(std::nothrow) ARMGenericTimer();
+diff --git a/src/system/kernel/arch/arm/soc.h b/src/system/kernel/arch/arm/soc.h
+index b89294d7d7..fa5bfdd8f8 100644
+--- a/src/system/kernel/arch/arm/soc.h
++++ b/src/system/kernel/arch/arm/soc.h
+@@ -34,6 +34,11 @@ public:
+ 		return B_OK;
+ 	}
+ 
++	// Routes an interrupt to a CPU, returns the CPU it now goes to.
++	virtual int32 AssignToCpu(int32 irq, int32 cpu) {
++		return 0;
++	}
++
+ 	static InterruptController* Get() {
+ 		return sInstance;
+ 	}
+@@ -59,6 +64,11 @@ public:
+ 	virtual bigtime_t Time() = 0;
+ 	virtual void Clear() = 0;
+ 
++	// called on each CPU but the boot one, whose timer the constructor sets up
++	virtual status_t PerCpuInit() {
++		return B_OK;
++	}
++
+ 	static HardwareTimer* Get() {
+ 		return sInstance;
+ 	}
+diff --git a/src/system/kernel/arch/arm/soc_tegra.cpp b/src/system/kernel/arch/arm/soc_tegra.cpp
+new file mode 100644
+index 0000000000..1d073293ea
+--- /dev/null
++++ b/src/system/kernel/arch/arm/soc_tegra.cpp
+@@ -0,0 +1,227 @@
++/*
++ * Copyright 2026, Haiku, Inc. All rights reserved.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include "soc_tegra.h"
++
++#include <KernelExport.h>
++#include <cpu.h>
++#include <timer.h>
++#include <vm/vm.h>
++
++
++// Register offsets, in bytes, from the timer block base
++// (see drivers/clocksource/timer-tegra.c in Linux)
++#define TMR1_BASE			0x00
++#define TMR2_BASE			0x08
++#define TIMERUS_CNTR_1US	0x10
++
++#define TMR_PTV				0x0
++#define TMR_PTV_EN			(1U << 31)
++#define TMR_PTV_PER			(1U << 30)
++#define TMR_PTV_MAX			0x1fffffff
++#define TMR_PCR				0x4
++#define TMR_PCR_INTR_CLR	(1U << 30)
++
++// The binding lists one interrupt per timer, TMR1 first and TMR2 next
++#define TMR2_INTERRUPT_OFFSET	1
++
++// Well below the TIMERUS wrap time of 2^32 µs (about 71 minutes)
++#define WRAP_TICK_PERIOD	TMR_PTV_MAX
++
++// Cortex-A9 private timer, offsets in bytes
++#define TWD_LOAD				0x00
++#define TWD_CONTROL				0x08
++#define TWD_CONTROL_ENABLE		(1U << 0)
++#define TWD_CONTROL_IRQ_ENABLE	(1U << 2)
++#define TWD_INTERRUPT_STATUS	0x0c
++
++
++static inline uint32
++read_reg(volatile uint32* regs, uint32 offset)
++{
++	return regs[offset / sizeof(uint32)];
++}
++
++
++static inline void
++write_reg(volatile uint32* regs, uint32 offset, uint32 value)
++{
++	regs[offset / sizeof(uint32)] = value;
++}
++
++
++TegraTimer::TegraTimer(phys_addr_t regBase, uint32 interrupt,
++	phys_addr_t twdBase, uint32 twdInterrupt, uint32 twdFrequency)
++	:
++	fEventInterrupt(interrupt),
++	fWrapInterrupt(interrupt + TMR2_INTERRUPT_OFFSET),
++	fLock(B_SPINLOCK_INITIALIZER),
++	fHighTime(0),
++	fTWDArea(-1),
++	fTWD(NULL),
++	fTWDInterrupt(twdInterrupt),
++	fTWDFrequency(twdFrequency)
++{
++	fRegArea = vm_map_physical_memory(B_SYSTEM_TEAM, "timer-tegra",
++		(void**)&fRegs, B_ANY_KERNEL_ADDRESS, B_PAGE_SIZE,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, regBase, false);
++	if (fRegArea < 0)
++		panic("Cannot map Tegra timer registers!");
++
++	// TIMERUS is already running at 1 MHz, set up by the boot firmware
++	fLastCount = read_reg(fRegs, TIMERUS_CNTR_1US);
++
++	dprintf("Tegra: timer @ %#" B_PRIxPHYSADDR ", IRQs %" B_PRId32 "/%" B_PRId32
++		"\n", regBase, fEventInterrupt, fWrapInterrupt);
++
++	if (twdBase != 0 && twdFrequency != 0) {
++		fTWDArea = vm_map_physical_memory(B_SYSTEM_TEAM, "timer-a9-twd",
++			(void**)&fTWD, B_ANY_KERNEL_ADDRESS, B_PAGE_SIZE,
++			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++			ROUNDDOWN(twdBase, B_PAGE_SIZE), false);
++		if (fTWDArea < 0)
++			fTWD = NULL;
++		else
++			fTWD += (twdBase % B_PAGE_SIZE) / sizeof(uint32);
++	}
++
++	Clear();
++	if (fTWD != NULL) {
++		dprintf("Tegra: events from the private timers, IRQ %" B_PRId32 ", %"
++			B_PRIu32 " Hz\n", fTWDInterrupt, fTWDFrequency);
++		install_io_interrupt_handler(fTWDInterrupt,
++			&TegraTimer::_HandleTWDInterrupt, this, 0);
++	} else {
++		install_io_interrupt_handler(fEventInterrupt,
++			&TegraTimer::_HandleEventInterrupt, this, 0);
++	}
++
++	write_reg(fRegs, TMR2_BASE + TMR_PCR, TMR_PCR_INTR_CLR);
++	install_io_interrupt_handler(fWrapInterrupt,
++		&TegraTimer::_HandleWrapInterrupt, this, 0);
++	write_reg(fRegs, TMR2_BASE + TMR_PTV,
++		TMR_PTV_EN | TMR_PTV_PER | WRAP_TICK_PERIOD);
++}
++
++
++void
++TegraTimer::SetTimeout(bigtime_t timeout)
++{
++	if (fTWD != NULL) {
++		// one-shot on this CPU's private timer
++		uint64 ticks = (uint64)timeout * fTWDFrequency / 1000000;
++		if (ticks < 1)
++			ticks = 1;
++		if (ticks > 0xffffffff)
++			ticks = 0xffffffff;
++		write_reg(fTWD, TWD_CONTROL, 0);
++		write_reg(fTWD, TWD_INTERRUPT_STATUS, 1);
++		write_reg(fTWD, TWD_LOAD, (uint32)ticks);
++		write_reg(fTWD, TWD_CONTROL,
++			TWD_CONTROL_ENABLE | TWD_CONTROL_IRQ_ENABLE);
++		return;
++	}
++
++	// The counter fires when it reaches zero after PTV + 1 ticks
++	if (timeout < 1)
++		timeout = 1;
++	if (timeout > TMR_PTV_MAX + 1)
++		timeout = TMR_PTV_MAX + 1;
++
++	write_reg(fRegs, TMR1_BASE + TMR_PTV, TMR_PTV_EN | (uint32)(timeout - 1));
++}
++
++
++bigtime_t
++TegraTimer::Time()
++{
++	cpu_status state = disable_interrupts();
++	// Spin without handling inter-CPU interrupts, as acquire_spinlock() does:
++	// callers may hold locks their handlers need (add_timer() holds the timer
++	// lock that a change of the real time clock takes on every CPU), and the
++	// lock is only ever held for one register read.
++	while (!try_acquire_spinlock(&fLock))
++		arch_cpu_pause();
++
++	bigtime_t time = _TimeLocked();
++
++	release_spinlock(&fLock);
++	restore_interrupts(state);
++
++	return time;
++}
++
++
++void
++TegraTimer::Clear()
++{
++	if (fTWD != NULL) {
++		write_reg(fTWD, TWD_CONTROL, 0);
++		write_reg(fTWD, TWD_INTERRUPT_STATUS, 1);
++		return;
++	}
++
++	write_reg(fRegs, TMR1_BASE + TMR_PTV, 0);
++	write_reg(fRegs, TMR1_BASE + TMR_PCR, TMR_PCR_INTR_CLR);
++}
++
++
++/*!	The private timer and its interrupt (a PPI) are banked per CPU. */
++status_t
++TegraTimer::PerCpuInit()
++{
++	if (fTWD == NULL)
++		return B_OK;
++
++	Clear();
++	InterruptController::Get()->EnableInterrupt(fTWDInterrupt);
++	return B_OK;
++}
++
++
++bigtime_t
++TegraTimer::_TimeLocked()
++{
++	uint32 count = read_reg(fRegs, TIMERUS_CNTR_1US);
++	if (count < fLastCount)
++		fHighTime += 1LL << 32;
++	fLastCount = count;
++
++	return fHighTime + count;
++}
++
++
++int32
++TegraTimer::_HandleEventInterrupt(void* data)
++{
++	TegraTimer* timer = (TegraTimer*)data;
++
++	timer->Clear();
++	return timer_interrupt();
++}
++
++
++int32
++TegraTimer::_HandleTWDInterrupt(void* data)
++{
++	TegraTimer* timer = (TegraTimer*)data;
++
++	write_reg(timer->fTWD, TWD_INTERRUPT_STATUS, 1);
++	return timer_interrupt();
++}
++
++
++int32
++TegraTimer::_HandleWrapInterrupt(void* data)
++{
++	TegraTimer* timer = (TegraTimer*)data;
++
++	write_reg(timer->fRegs, TMR2_BASE + TMR_PCR, TMR_PCR_INTR_CLR);
++
++	// Only sampling the counter matters here, see _TimeLocked()
++	timer->Time();
++	return B_HANDLED_INTERRUPT;
++}
+diff --git a/src/system/kernel/arch/arm/soc_tegra.h b/src/system/kernel/arch/arm/soc_tegra.h
+new file mode 100644
+index 0000000000..98aa612fda
+--- /dev/null
++++ b/src/system/kernel/arch/arm/soc_tegra.h
+@@ -0,0 +1,67 @@
++/*
++ * Copyright 2026, Haiku, Inc. All rights reserved.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef ARCH_ARM_SOC_TEGRA_H
++#define ARCH_ARM_SOC_TEGRA_H
++
++
++#include "soc.h"
++
++#include <new>
++
++#include <lock.h>
++
++
++// Timer block of NVIDIA Tegra 2 ("nvidia,tegra20-timer"): a free running
++// 1 MHz counter (TIMERUS) used as clock source and the one-shot TMR1 used
++// for timer events. TMR2 ticks periodically so that the 32-bit TIMERUS
++// counter is sampled before it wraps.
++// With several CPUs the events come from the private timer (TWD) of each
++// CPU instead, as TMR1 and its interrupt are shared.
++class TegraTimer : public HardwareTimer {
++public:
++	void SetTimeout(bigtime_t timeout);
++	bigtime_t Time();
++	void Clear();
++	status_t PerCpuInit();
++
++	static status_t Init(phys_addr_t regBase, uint32 interrupt,
++		phys_addr_t twdBase = 0, uint32 twdInterrupt = 0,
++		uint32 twdFrequency = 0)
++	{
++		if (sInstance != NULL)
++			return B_OK;
++
++		TegraTimer* timer = new(std::nothrow) TegraTimer(regBase, interrupt,
++			twdBase, twdInterrupt, twdFrequency);
++		return timer != NULL ? B_OK : B_NO_MEMORY;
++	}
++
++private:
++	TegraTimer(phys_addr_t regBase, uint32 interrupt, phys_addr_t twdBase,
++		uint32 twdInterrupt, uint32 twdFrequency);
++
++	bigtime_t _TimeLocked();
++
++	static int32 _HandleEventInterrupt(void* data);
++	static int32 _HandleWrapInterrupt(void* data);
++	static int32 _HandleTWDInterrupt(void* data);
++
++	area_id fRegArea;
++	volatile uint32* fRegs;
++	int32 fEventInterrupt;
++	int32 fWrapInterrupt;
++
++	spinlock fLock;
++	uint32 fLastCount;
++	bigtime_t fHighTime;
++
++	area_id fTWDArea;
++	volatile uint32* fTWD;		// banked: each CPU sees its own timer
++	int32 fTWDInterrupt;
++	uint32 fTWDFrequency;
++};
++
++
++#endif /* ARCH_ARM_SOC_TEGRA_H */
+-- 
+2.39.5
+

@@ -1,0 +1,111 @@
+From 85143ce4eeafbffc2d9204a9e91114c012315fea Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Przemys=C5=82aw=20Buczkowski?= <prem@prem.moe>
+Date: Thu, 17 Sep 2026 19:14:00 +0900
+Subject: [PATCH 15/63] freebsd_network: enable on arm64
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+e1000, rtl8139, vmx were tested to work in QEMU.
+pcnet gets stuck in configuring, dec21xxx gets no link.
+
+Change-Id: I3a603d8fd98c5e77e86e7427577abf01d6ad3362
+Reviewed-on: https://review.haiku-os.org/c/haiku/+/11774
+Reviewed-by: Jérôme Duval <jerome.duval@gmail.com>
+Tested-by: Commit checker robot <no-reply+buildbot@haiku-os.org>
+(cherry picked from commit 1d73eca40ba9bc28fa5c94918a197bc3e6662b76)
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ build/jam/images/definitions/minimum                     | 4 ++--
+ build/jam/images/definitions/regular                     | 4 ++--
+ src/libs/compat/freebsd_network/compat/machine/bus.h     | 4 ++--
+ src/libs/compat/freebsd_network/compat/machine/cpufunc.h | 4 ++--
+ 4 files changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
+index 19feef5a38..01fc18c38e 100644
+--- a/build/jam/images/definitions/minimum
++++ b/build/jam/images/definitions/minimum
+@@ -309,7 +309,7 @@ SYSTEM_ADD_ONS_DRIVERS_GRAPHICS = [ FFilterByBuildFeatures
+ SYSTEM_ADD_ONS_DRIVERS_MIDI = ;
+ 
+ SYSTEM_ADD_ONS_DRIVERS_NET = [ FFilterByBuildFeatures
+-	x86,x86_64,riscv64 @{
++	x86,x86_64,riscv64,arm64 @{
+ 		3com
+ 		asix88xxx
+ 		atheros813x
+@@ -336,7 +336,7 @@ SYSTEM_ADD_ONS_DRIVERS_NET = [ FFilterByBuildFeatures
+ 		via_rhine
+ 		vmxnet
+ 		vt612x
+-	}@ # x86,x86_64,riscv64
++	}@ # x86,x86_64,riscv64,arm64
+ 
+ 	etherpci
+ 	usb_davicom
+diff --git a/build/jam/images/definitions/regular b/build/jam/images/definitions/regular
+index ad4bbf368d..c65e96f9d9 100644
+--- a/build/jam/images/definitions/regular
++++ b/build/jam/images/definitions/regular
+@@ -315,7 +315,7 @@ SYSTEM_ADD_ONS_DRIVERS_MIDI +=
+ 
+ SYSTEM_ADD_ONS_DRIVERS_NET += [ FFilterByBuildFeatures
+ 	# WLAN drivers
+-	x86,x86_64,riscv64 @{
++	x86,x86_64,riscv64,arm64 @{
+ 		aironetwifi
+ 		atheroswifi
+ 		broadcom43xx
+@@ -331,7 +331,7 @@ SYSTEM_ADD_ONS_DRIVERS_NET += [ FFilterByBuildFeatures
+ 		realtekwifi
+ 		realtekwifi8187
+ 		zydwifi1211
+-	}@ # x86,x86_64,riscv64
++	}@ # x86,x86_64,riscv64,arm64
+ ] ;
+ 
+ SYSTEM_ADD_ONS_DRIVERS_POWER += [ FFilterByBuildFeatures
+diff --git a/src/libs/compat/freebsd_network/compat/machine/bus.h b/src/libs/compat/freebsd_network/compat/machine/bus.h
+index b51501810a..b4189ef063 100644
+--- a/src/libs/compat/freebsd_network/compat/machine/bus.h
++++ b/src/libs/compat/freebsd_network/compat/machine/bus.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2018-2022, Haiku, Inc. All rights reserved.
++ * Copyright 2018-2026, Haiku, Inc. All rights reserved.
+  * Distributed under the terms of the MIT license.
+  */
+ #ifndef _FBSD_COMPAT_MACHINE_BUS_H_
+@@ -10,7 +10,7 @@
+ 
+ #if defined(__i386__) || defined(__amd64__)
+ #  include <machine/x86/bus.h>
+-#elif (defined(__riscv) && __riscv_xlen == 64)
++#elif (defined(__riscv) && __riscv_xlen == 64) || defined(__aarch64__)
+ #  include <machine/generic/bus.h>
+ #else
+ #  error Need a bus.h for this arch!
+diff --git a/src/libs/compat/freebsd_network/compat/machine/cpufunc.h b/src/libs/compat/freebsd_network/compat/machine/cpufunc.h
+index 49d6abc80a..665007232c 100644
+--- a/src/libs/compat/freebsd_network/compat/machine/cpufunc.h
++++ b/src/libs/compat/freebsd_network/compat/machine/cpufunc.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2018-2022, Haiku, Inc. All rights reserved.
++ * Copyright 2018-2026, Haiku, Inc. All rights reserved.
+  * Distributed under the terms of the MIT license.
+  */
+ #ifndef _FBSD_COMPAT_MACHINE_CPUFUNC_H_
+@@ -11,7 +11,7 @@
+ #  include <machine/x86/cpufunc.h>
+ #elif defined(__x86_64__)
+ #  include <machine/x86_64/cpufunc.h>
+-#elif (defined(__riscv) && __riscv_xlen == 64)
++#elif (defined(__riscv) && __riscv_xlen == 64) || defined(__aarch64__)
+ #  include <machine/generic/cpufunc.h>
+ #else
+ #  error Need a cpufunc.h for this arch!
+-- 
+2.39.5
+

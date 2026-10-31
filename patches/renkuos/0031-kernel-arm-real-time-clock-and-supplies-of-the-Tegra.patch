@@ -1,0 +1,594 @@
+From 00997db5ae6f8ee1edf5a38d9774526dc791acba Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 27 Oct 2026 07:20:24 +0100
+Subject: [PATCH 31/63] kernel/arm: real time clock and supplies of the Tegra 2
+ and TPS6586x
+
+- keep the system time offset and read the Tegra real time clock
+- take the time from the battery backed clock of the TPS6586x power
+  management IC, behind the DVC I2C controller (clocked and reset before
+  use); only write it after a successful read
+- raise the core, CPU and RTC supplies to their nominal voltages on
+  request, within the limits the Tegra 2 sets
+- access to the other chips on the DVC bus, for the ADT7461 driver
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../kernel/arch/arm/arch_real_time_clock.cpp  | 531 +++++++++++++++++-
+ 1 file changed, 528 insertions(+), 3 deletions(-)
+
+diff --git a/src/system/kernel/arch/arm/arch_real_time_clock.cpp b/src/system/kernel/arch/arm/arch_real_time_clock.cpp
+index 58cbea9172..89a08a7f53 100644
+--- a/src/system/kernel/arch/arm/arch_real_time_clock.cpp
++++ b/src/system/kernel/arch/arm/arch_real_time_clock.cpp
+@@ -10,39 +10,564 @@
+ 
+ #include <arch/real_time_clock.h>
+ 
++#include <KernelExport.h>
++#include <driver_settings.h>
++#include <kernel.h>
++
++#include <boot/kernel_args.h>
+ #include <real_time_clock.h>
+ #include <real_time_data.h>
+ #include <smp.h>
++#include <util/AutoLock.h>
++
++#include <string.h>
++
++
++// NVIDIA Tegra real time clock: a seconds counter in the always on domain
++#define TEGRA_RTC_BUSY				0x04
++#define TEGRA_RTC_SECONDS			0x08
++#define TEGRA_RTC_SHADOW_SECONDS	0x0c
++#define TEGRA_RTC_MILLI_SECONDS		0x10
++
++static volatile uint32* sTegraRTC;
++static spinlock sTegraRTCLock = B_SPINLOCK_INITIALIZER;
++
++
++// The TPS6586x power management IC has the battery backed clock: it counts
++// 1/1024 seconds since 2009, while the Tegra clock starts again from 0 at
++// every power on. It is behind the Tegra 2 DVC I2C controller, used here in
++// packet mode and polled, as at boot there is nothing else to wait for.
++#define I2C_CNFG					0x000
++#define I2C_CNFG_PACKET_MODE		(1 << 10)
++#define I2C_CNFG_NEW_MASTER_FSM		(1 << 11)
++#define I2C_TX_FIFO					0x050
++#define I2C_RX_FIFO					0x054
++#define I2C_FIFO_CONTROL			0x05c
++#define I2C_FIFO_FLUSH				0x03	// RX and TX
++#define I2C_FIFO_STATUS				0x060
++#define I2C_FIFO_STATUS_RX(x)		((x) & 0xf)
++#define I2C_FIFO_STATUS_TX(x)		(((x) >> 4) & 0xf)
++#define I2C_INT_STATUS				0x068
++#define I2C_INT_ARBITRATION_LOST	(1 << 2)
++#define I2C_INT_NO_ACK				(1 << 3)
++#define I2C_INT_PACKET_COMPLETE		(1 << 7)
++
++#define I2C_PACKET_PROTOCOL_I2C		(1 << 4)
++#define I2C_PACKET_ID(id)			((id) << 16)
++#define I2C_HEADER_REPEAT_START		(1 << 16)
++#define I2C_HEADER_IE_ENABLE		(1 << 17)
++#define I2C_HEADER_READ				(1 << 19)
++
++#define DVC_CTRL_REG1				0x000
++#define DVC_CTRL_REG1_INTR_EN		(1 << 1)
++#define DVC_CTRL_REG3				0x008
++#define DVC_CTRL_REG3_SW_PROG		(1 << 26)
++#define DVC_STATUS					0x00c
++#define DVC_STATUS_I2C_DONE			(1 << 30)
++
++#define TPS6586X_ADDRESS			0x34
++#define TPS6586X_RTC_CTRL			0xc0
++#define TPS6586X_RTC_ENABLE			(1 << 5)
++#define TPS6586X_RTC_COUNT4			0xc6
++	// reading starts at the register before it
++#define TPS6586X_EPOCH				1230768000	// 2009-01-01 00:00:00 UTC
++
++// the supplies of the core, the CPU and the RTC domain: 725 mV and steps of
++// 25 mV in the low 5 bits of their V1 registers, applied by a go bit
++#define TPS6586X_VCC1				0x20
++#define TPS6586X_VCC2				0x21
++#define TPS6586X_SM1V1				0x23
++#define TPS6586X_SM0V1				0x26
++#define TPS6586X_LDO2BV1			0x2f
++#define TPS6586X_DVM_MIN_MV			725
++#define TPS6586X_DVM_STEP_MV		25
++
++// U-Boot runs the CPU at 1 GHz with the 1.0 V the TPS6586x starts with, while
++// the Tegra 2 tables of Linux want up to 1.1 V at that rate, and the core 1.225
++// V; the core must stay 120 mV above the CPU and within 170 mV of the RTC
++#define TEGRA_NOMINAL_CORE_MV		1225
++#define TEGRA_NOMINAL_CPU_MV		1100
++#define TEGRA_NOMINAL_RTC_MV		1225
++#define TEGRA_CORE_OVER_CPU_MV		120
++#define TEGRA_CORE_RTC_SPREAD_MV	170
++
++// its clock, as for the other I2C controllers: 8 times the bus clock, from
++// PLLP (216 MHz)
++#define TEGRA20_CAR_BASE			0x60006000
++#define TEGRA20_CLK_DVC_I2C			47
++#define TEGRA_CAR_RST_DEVICES(bank)	(0x04 + (bank) * 4)
++#define TEGRA_CAR_CLK_OUT_ENB(bank)	(0x10 + (bank) * 4)
++#define TEGRA_CAR_CLK_SOURCE_DVC	0x128
++#define DVC_BUS_KHZ					100
++
++static volatile uint8* sDVC;
++static bool sTPS6586xRead;	// only write it after a successful read
++static spinlock sDVCLock = B_SPINLOCK_INITIALIZER;
++
++
++static inline volatile uint32*
++dvc_i2c_register(uint32 offset)
++{
++	// the I2C registers of the DVC controller are moved past its own
++	return (volatile uint32*)(sDVC + offset
++		+ (offset < I2C_TX_FIFO ? 0x40 : 0x10));
++}
++
++
++/*!	Clocks and resets the controller, then sets it up to be programmed by
++	software, in packet mode, as Linux does.
++*/
++static void
++dvc_setup_controller()
++{
++	void* address;
++	area_id area = map_physical_memory("tegra car", TEGRA20_CAR_BASE,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++	if (area >= B_OK) {
++		volatile uint8* car = (volatile uint8*)address;
++		uint32 bank = TEGRA20_CLK_DVC_I2C / 32;
++		uint32 bit = 1U << (TEGRA20_CLK_DVC_I2C % 32);
++		volatile uint32* reset
++			= (volatile uint32*)(car + TEGRA_CAR_RST_DEVICES(bank));
++		volatile uint32* enable
++			= (volatile uint32*)(car + TEGRA_CAR_CLK_OUT_ENB(bank));
++		volatile uint32* source
++			= (volatile uint32*)(car + TEGRA_CAR_CLK_SOURCE_DVC);
++		uint32 divider = (216000 + 8 * DVC_BUS_KHZ - 1) / (8 * DVC_BUS_KHZ) - 1;
++		*enable |= bit;
++		*source = (*source & ~((3U << 30) | 0xffff)) | divider;
++		*reset |= bit;
++		spin(2);
++		*reset &= ~bit;
++		spin(2);
++		delete_area(area);
++	}
++
++	*(volatile uint32*)(sDVC + DVC_CTRL_REG3) |= DVC_CTRL_REG3_SW_PROG;
++	*(volatile uint32*)(sDVC + DVC_CTRL_REG1) |= DVC_CTRL_REG1_INTR_EN;
++	*dvc_i2c_register(I2C_CNFG) = I2C_CNFG_NEW_MASTER_FSM
++		| I2C_CNFG_PACKET_MODE | (2 << 12);
++}
++
++
++/*!	Polls until \a condition is true, at most about 20 ms. */
++template<typename Condition>
++static bool
++dvc_wait(Condition condition)
++{
++	for (int32 i = 0; i < 20000; i++) {
++		if (condition())
++			return true;
++		spin(1);
++	}
++	return false;
++}
++
++
++/*!	One I2C message: writes \a length bytes of \a data or reads them into
++	it. With \a repeatStart the bus is kept for the next message.
++*/
++static status_t
++dvc_i2c_transfer(uint8 address, uint8* data, uint32 length, bool read,
++	bool repeatStart)
++{
++	if (length == 0 || length > 32)
++		return B_BAD_VALUE;
++
++	*dvc_i2c_register(I2C_FIFO_CONTROL) |= I2C_FIFO_FLUSH;
++	if (!dvc_wait([] {
++			return (*dvc_i2c_register(I2C_FIFO_CONTROL) & I2C_FIFO_FLUSH)
++				== 0; })) {
++		dprintf("DVC I2C: FIFO flush timed out\n");
++		return B_TIMED_OUT;
++	}
++	*dvc_i2c_register(I2C_INT_STATUS) = 0xffffffff;
++
++	uint32 words[3 + 8];
++	uint32 count = 0;
++	words[count++] = I2C_PACKET_PROTOCOL_I2C | I2C_PACKET_ID(1);
++	words[count++] = length - 1;
++	words[count++] = (address << 1) | I2C_HEADER_IE_ENABLE
++		| (read ? I2C_HEADER_READ : 0)
++		| (repeatStart ? I2C_HEADER_REPEAT_START : 0);
++	if (!read) {
++		for (uint32 i = 0; i < length; i += 4) {
++			uint32 word = 0;
++			for (uint32 j = 0; j < 4 && i + j < length; j++)
++				word |= (uint32)data[i + j] << (j * 8);
++			words[count++] = word;
++		}
++	}
++
++	for (uint32 i = 0; i < count; i++) {
++		if (!dvc_wait([] {
++				return I2C_FIFO_STATUS_TX(*dvc_i2c_register(I2C_FIFO_STATUS))
++					> 0; })) {
++			dprintf("DVC I2C: TX FIFO full, status %#" B_PRIx32 "\n",
++				*dvc_i2c_register(I2C_FIFO_STATUS));
++			return B_TIMED_OUT;
++		}
++		*dvc_i2c_register(I2C_TX_FIFO) = words[i];
++	}
++
++	if (read) {
++		for (uint32 i = 0; i < length; i += 4) {
++			if (!dvc_wait([] {
++					return I2C_FIFO_STATUS_RX(
++						*dvc_i2c_register(I2C_FIFO_STATUS)) > 0; })) {
++				dprintf("DVC I2C: no data, interrupt status %#"
++					B_PRIx32 "\n", *dvc_i2c_register(I2C_INT_STATUS));
++				return B_TIMED_OUT;
++			}
++			uint32 word = *dvc_i2c_register(I2C_RX_FIFO);
++			for (uint32 j = 0; j < 4 && i + j < length; j++)
++				data[i + j] = word >> (j * 8);
++		}
++	}
++
++	uint32 status = 0;
++	bool done = dvc_wait([&status] {
++		status = *dvc_i2c_register(I2C_INT_STATUS);
++		return (status & (I2C_INT_PACKET_COMPLETE | I2C_INT_NO_ACK
++			| I2C_INT_ARBITRATION_LOST)) != 0; });
++	*dvc_i2c_register(I2C_INT_STATUS) = status;
++	*(volatile uint32*)(sDVC + DVC_STATUS) = DVC_STATUS_I2C_DONE;
++
++	if (!done) {
++		dprintf("DVC I2C: transfer not done, interrupt status %#"
++			B_PRIx32 "\n", status);
++		return B_TIMED_OUT;
++	}
++	if ((status & (I2C_INT_NO_ACK | I2C_INT_ARBITRATION_LOST)) != 0)
++		return B_IO_ERROR;
++	return B_OK;
++}
++
++
++static status_t
++tps6586x_read(uint8 reg, uint8* data, uint32 length)
++{
++	status_t status = dvc_i2c_transfer(TPS6586X_ADDRESS, &reg, 1, false, true);
++	if (status == B_OK)
++		status = dvc_i2c_transfer(TPS6586X_ADDRESS, data, length, true, false);
++	return status;
++}
++
++
++static status_t
++tps6586x_write(uint8 reg, const uint8* data, uint32 length)
++{
++	uint8 buffer[8];
++	if (length + 1 > sizeof(buffer))
++		return B_BAD_VALUE;
++	buffer[0] = reg;
++	memcpy(buffer + 1, data, length);
++	return dvc_i2c_transfer(TPS6586X_ADDRESS, buffer, length + 1, false,
++		false);
++}
++
++
++/*!	For the drivers of the other chips on the DVC bus, like the ADT7461
++	temperature sensor of the AC100: reads \a length bytes from register
++	\a reg of the chip at \a address.
++*/
++extern "C" status_t
++arm_dvc_i2c_read(uint8 address, uint8 reg, uint8* data, uint32 length)
++{
++	if (sDVC == NULL)
++		return B_NO_INIT;
++
++	InterruptsSpinLocker locker(sDVCLock);
++	status_t status = dvc_i2c_transfer(address, &reg, 1, false, true);
++	if (status == B_OK)
++		status = dvc_i2c_transfer(address, data, length, true, false);
++	return status;
++}
++
++
++/*!	Writes \a length bytes to register \a reg of the chip at \a address on the
++	DVC bus.
++*/
++extern "C" status_t
++arm_dvc_i2c_write(uint8 address, uint8 reg, const uint8* data, uint32 length)
++{
++	if (sDVC == NULL)
++		return B_NO_INIT;
++
++	uint8 buffer[8];
++	if (length + 1 > sizeof(buffer))
++		return B_BAD_VALUE;
++	buffer[0] = reg;
++	memcpy(buffer + 1, data, length);
++
++	InterruptsSpinLocker locker(sDVCLock);
++	return dvc_i2c_transfer(address, buffer, length + 1, false, false);
++}
++
++
++/*!	Returns the seconds since 1970 of the TPS6586x clock, or 0 if it is not
++	available or not running.
++*/
++static uint64
++tps6586x_get_time()
++{
++	InterruptsSpinLocker locker(sDVCLock);
++	uint8 control;
++	uint8 count[6];
++	status_t status = tps6586x_read(TPS6586X_RTC_CTRL, &control, 1);
++	if (status == B_OK)
++		status = tps6586x_read(TPS6586X_RTC_COUNT4 - 1, count, sizeof(count));
++	locker.Unlock();
++
++	if (status != B_OK) {
++		dprintf("TPS6586x clock: read failed: %s\n", strerror(status));
++		return 0;
++	}
++
++	uint64 ticks = 0;
++	for (uint32 i = 1; i < sizeof(count); i++)
++		ticks = (ticks << 8) | count[i];
++	dprintf("TPS6586x clock: control %#x, %" B_PRIu64 " seconds since "
++		"2009\n", control, ticks >> 10);
++	sTPS6586xRead = true;
++	if ((control & TPS6586X_RTC_ENABLE) == 0)
++		return 0;
++	return (ticks >> 10) + TPS6586X_EPOCH;
++}
++
++
++static void
++tps6586x_set_time(uint64 seconds)
++{
++	if (seconds < TPS6586X_EPOCH)
++		return;
++
++	uint64 ticks = (seconds - TPS6586X_EPOCH) << 10;
++	uint8 count[5];
++	for (int32 i = 0; i < 5; i++)
++		count[i] = ticks >> ((4 - i) * 8);
++
++	// the counter may only be written while it is stopped
++	InterruptsSpinLocker locker(sDVCLock);
++	uint8 control;
++	status_t status = tps6586x_read(TPS6586X_RTC_CTRL, &control, 1);
++	if (status == B_OK) {
++		control &= ~TPS6586X_RTC_ENABLE;
++		status = tps6586x_write(TPS6586X_RTC_CTRL, &control, 1);
++	}
++	if (status == B_OK)
++		status = tps6586x_write(TPS6586X_RTC_COUNT4, count, sizeof(count));
++	control |= TPS6586X_RTC_ENABLE;
++	if (tps6586x_write(TPS6586X_RTC_CTRL, &control, 1) != B_OK)
++		status = B_IO_ERROR;
++	locker.Unlock();
++
++	if (status != B_OK)
++		dprintf("TPS6586x clock: write failed: %s\n", strerror(status));
++}
++
++
++static void
++tegra_rtc_set_time(uint64 seconds)
++{
++	if (sTegraRTC == NULL)
++		return;
++
++	// the registers may only be written while the clock is not busy posting
++	// its new value, which takes up to about 500 us
++	InterruptsSpinLocker locker(sTegraRTCLock);
++	for (int32 i = 0; i < 500 && (sTegraRTC[TEGRA_RTC_BUSY / 4] & 1) != 0; i++)
++		spin(1);
++	sTegraRTC[TEGRA_RTC_SECONDS / 4] = (uint32)seconds;
++}
++
++
++struct tps6586x_supply {
++	const char*	name;
++	uint8		voltageRegister;
++	uint8		controlRegister;
++	uint8		goBit;
++	uint8		v2Bit;
++	uint32		nominal;
++};
++
++// in the order they are raised, the core first
++static const tps6586x_supply kTPS6586xSupplies[] = {
++	{ "core", TPS6586X_SM0V1, TPS6586X_VCC1, 1 << 2, 1 << 3,
++		TEGRA_NOMINAL_CORE_MV },
++	{ "rtc", TPS6586X_LDO2BV1, TPS6586X_VCC2, 1 << 6, 1 << 7,
++		TEGRA_NOMINAL_RTC_MV },
++	{ "cpu", TPS6586X_SM1V1, TPS6586X_VCC1, 1 << 0, 1 << 1,
++		TEGRA_NOMINAL_CPU_MV },
++};
++
++
++/*!	Raises the core, RTC and CPU supplies to their nominal voltages, 25 mV at
++	a time, if they are below; it never lowers them.
++*/
++static void
++tps6586x_set_nominal_voltages()
++{
++	const int32 count = B_COUNT_OF(kTPS6586xSupplies);
++	uint8 values[count];
++	uint32 millivolts[count];
++
++	InterruptsSpinLocker locker(sDVCLock);
++	for (int32 i = 0; i < count; i++) {
++		const tps6586x_supply& supply = kTPS6586xSupplies[i];
++		uint8 control;
++		status_t status = tps6586x_read(supply.controlRegister, &control, 1);
++		if (status == B_OK)
++			status = tps6586x_read(supply.voltageRegister, &values[i], 1);
++		if (status != B_OK || (control & supply.v2Bit) != 0) {
++			locker.Unlock();
++			dprintf("TPS6586x voltages: %s not readable from V1\n",
++				supply.name);
++			return;
++		}
++		millivolts[i] = TPS6586X_DVM_MIN_MV
++			+ (values[i] & 0x1f) * TPS6586X_DVM_STEP_MV;
++	}
++
++	for (int32 i = 0; i < count; i++) {
++		const tps6586x_supply& supply = kTPS6586xSupplies[i];
++		while (millivolts[i] < supply.nominal) {
++			millivolts[i] += TPS6586X_DVM_STEP_MV;
++			// core, rtc, cpu
++			if (millivolts[0] < millivolts[2] + TEGRA_CORE_OVER_CPU_MV
++				|| millivolts[0] > millivolts[1] + TEGRA_CORE_RTC_SPREAD_MV
++				|| millivolts[1] > millivolts[0] + TEGRA_CORE_RTC_SPREAD_MV) {
++				locker.Unlock();
++				dprintf("TPS6586x voltages: %s %" B_PRIu32 " mV would "
++					"break the limits\n", supply.name, millivolts[i]);
++				return;
++			}
++
++			uint8 value = (values[i] & ~0x1f) | ((millivolts[i]
++				- TPS6586X_DVM_MIN_MV) / TPS6586X_DVM_STEP_MV);
++			uint8 go = supply.goBit;
++			status_t status = tps6586x_write(supply.voltageRegister, &value,
++				1);
++			if (status == B_OK)
++				status = tps6586x_write(supply.controlRegister, &go, 1);
++			if (status != B_OK) {
++				locker.Unlock();
++				dprintf("TPS6586x voltages: %s: %s\n", supply.name,
++					strerror(status));
++				return;
++			}
++			values[i] = value;
++
++			// even the slowest slew rate takes well under that for 25 mV
++			spin(1000);
++		}
++	}
++	locker.Unlock();
++
++	dprintf("TPS6586x voltages: core %" B_PRIu32 ", rtc %" B_PRIu32
++		", cpu %" B_PRIu32 " mV\n", millivolts[0], millivolts[1],
++		millivolts[2]);
++}
+ 
+ 
+ status_t
+ arch_rtc_init(kernel_args *args, struct real_time_data *data)
+ {
+-	return B_NOT_SUPPORTED;
++	data->arch_data.data[0].system_time_offset = 0;
++	data->arch_data.data[1].system_time_offset = 0;
++	data->arch_data.system_time_conversion_factor = 1000000000LL;
++	data->arch_data.version = 0;
++
++	if (args->arch_args.rtc.start != 0) {
++		void* address;
++		area_id area = map_physical_memory("tegra rtc",
++			args->arch_args.rtc.start & ~(phys_addr_t)(B_PAGE_SIZE - 1),
++			B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++		if (area >= B_OK) {
++			sTegraRTC = (volatile uint32*)((addr_t)address
++				+ (args->arch_args.rtc.start & (B_PAGE_SIZE - 1)));
++		}
++	}
++
++	// "tps6586x_clock false" in the kernel settings leaves the power
++	// management IC alone; "tegra_nominal_voltages true" raises the supplies
++	void* settings = load_driver_settings("kernel");
++	bool usePMIC = get_driver_boolean_parameter(settings, "tps6586x_clock",
++		true, true);
++	bool nominalVoltages = get_driver_boolean_parameter(settings,
++		"tegra_nominal_voltages", false, true);
++	unload_driver_settings(settings);
++
++	if (sTegraRTC != NULL && args->arch_args.pmicI2C.start != 0 && usePMIC) {
++		void* address;
++		area_id area = map_physical_memory("tegra dvc i2c",
++			args->arch_args.pmicI2C.start & ~(phys_addr_t)(B_PAGE_SIZE - 1),
++			B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++		if (area >= B_OK) {
++			sDVC = (volatile uint8*)address
++				+ (args->arch_args.pmicI2C.start & (B_PAGE_SIZE - 1));
++
++			dvc_setup_controller();
++
++			// the Tegra clock follows the battery backed one
++			uint64 seconds = tps6586x_get_time();
++			if (seconds != 0)
++				tegra_rtc_set_time(seconds);
++
++			if (nominalVoltages && sTPS6586xRead)
++				tps6586x_set_nominal_voltages();
++		}
++	}
++
++	return B_OK;
+ }
+ 
+ 
+ uint64
+ arch_rtc_get_hw_time(void)
+ {
+-	return 0;
++	if (sTegraRTC == NULL)
++		return 0;
++
++	// reading the milliseconds latches the seconds into the shadow register
++	InterruptsSpinLocker locker(sTegraRTCLock);
++	(void)sTegraRTC[TEGRA_RTC_MILLI_SECONDS / 4];
++	return sTegraRTC[TEGRA_RTC_SHADOW_SECONDS / 4];
+ }
+ 
+ 
+ void
+ arch_rtc_set_hw_time(uint64 seconds)
+ {
++	tegra_rtc_set_time(seconds);
++
++	// The power management IC keeps its registers with the machine off:
++	// never write it unless reading it worked, nor while booting (the
++	// kernel sets the clock to what it just read).
++	if (sDVC != NULL && sTPS6586xRead && !gKernelStartup)
++		tps6586x_set_time(seconds);
+ }
+ 
+ 
++/*!	Userland reads the offset without a lock: it reads the copy the version
++	points to, and again if the version changed meanwhile.
++*/
+ void
+ arch_rtc_set_system_time_offset(struct real_time_data *data, bigtime_t offset)
+ {
++	int32 version = data->arch_data.version + 1;
++	data->arch_data.data[version % 2].system_time_offset = offset;
++	memory_write_barrier();
++	data->arch_data.version = version;
+ }
+ 
+ 
+ bigtime_t
+ arch_rtc_get_system_time_offset(struct real_time_data *data)
+ {
+-	return 0;
++	return data->arch_data.data[data->arch_data.version % 2]
++		.system_time_offset;
+ }
+-- 
+2.39.5
+

@@ -1,0 +1,38 @@
+From 1785434e22af95ef021071bb44660cc2cfca2d05 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 27 Oct 2026 22:26:25 +0100
+Subject: [PATCH 57/63] media: align the meta_format buffers without alignas
+
+alignas is C++11 and the x86_gcc2 build failed on it. Use the GCC
+attribute, as the request buffers of this change already do.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/kits/media/MediaFormats.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/kits/media/MediaFormats.cpp b/src/kits/media/MediaFormats.cpp
+index c9f3d5659f..48f52236c0 100644
+--- a/src/kits/media/MediaFormats.cpp
++++ b/src/kits/media/MediaFormats.cpp
+@@ -396,7 +396,7 @@ update_media_formats()
+ 		ssize_t size;
+ 		if (reply.FindData("formats", MEDIA_META_FORMAT_TYPE, index,
+ 				&newItem, &size) == B_OK && size == sizeof(meta_format)) {
+-			alignas(meta_format) char buffer[sizeof(meta_format)];
++			char buffer[sizeof(meta_format)] __attribute__((aligned(8)));
+ 			memcpy(buffer, newItem, sizeof(meta_format));
+ 			*item = *(const meta_format*)buffer;
+ 		}
+@@ -409,7 +409,7 @@ update_media_formats()
+ 		ssize_t size;
+ 		if (reply.FindData("formats", MEDIA_META_FORMAT_TYPE, index,
+ 				&newItem, &size) == B_OK && size == sizeof(meta_format)) {
+-			alignas(meta_format) char buffer[sizeof(meta_format)];
++			char buffer[sizeof(meta_format)] __attribute__((aligned(8)));
+ 			memcpy(buffer, newItem, sizeof(meta_format));
+ 			sFormats.AddItem(new meta_format(*(const meta_format*)buffer));
+ 		}
+-- 
+2.39.5
+

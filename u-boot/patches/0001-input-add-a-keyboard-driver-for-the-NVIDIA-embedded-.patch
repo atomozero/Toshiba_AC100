@@ -1,0 +1,631 @@
+From 027330f33cc1f76da5e443c07fd4dc8a535c0fed Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 31 Oct 2026 00:07:46 +0100
+Subject: [PATCH 1/2] input: add a keyboard driver for the NVIDIA embedded
+ controller
+
+The Toshiba AC100 (paz00) has its keyboard behind the NVIDIA embedded
+controller ("nvidia,nvec"), the I2C bus master, which talks to a Tegra
+I2C controller in slave mode. Poll that controller when the console looks
+for input, as tegra-kbc does, and hand the PS/2 set 1 scan codes to the
+input layer.
+
+The EC keeps the state of its PS/2 port while the machine is off, and a
+touchpad left streaming blocks the keyboard events, so the port is reset
+before the keyboard is enabled.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ drivers/input/Kconfig               |   8 +
+ drivers/input/Makefile              |   1 +
+ drivers/input/nvec-keyboard.c       | 541 ++++++++++++++++++++++++++++
+ include/configs/tegra-common-post.h |   8 +-
+ 4 files changed, 557 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/input/nvec-keyboard.c
+
+diff --git a/drivers/input/Kconfig b/drivers/input/Kconfig
+index df8fbf15..744b17a5 100644
+--- a/drivers/input/Kconfig
++++ b/drivers/input/Kconfig
+@@ -104,6 +104,14 @@ config TEGRA_KEYBOARD
+ 	  A matrix keyboard connected directly to the internal keyboard
+ 	  controller on Tegra SoCs.
+ 
++config NVEC_KEYBOARD
++	bool "NVIDIA embedded controller (NVEC) keyboard support"
++	depends on ARCH_TEGRA && DM_KEYBOARD && DM_GPIO
++	help
++	  The keyboard behind the NVIDIA embedded controller ("nvidia,nvec"),
++	  which talks to a Tegra I2C controller in slave mode, as found in
++	  the Toshiba AC100 (paz00).
++
+ config TWL4030_INPUT
+ 	bool "Enable TWL4030 Input controller"
+ 	help
+diff --git a/drivers/input/Makefile b/drivers/input/Makefile
+index 1303fcdb..32fd9a41 100644
+--- a/drivers/input/Makefile
++++ b/drivers/input/Makefile
+@@ -14,5 +14,6 @@ ifndef CONFIG_XPL_BUILD
+ obj-$(CONFIG_APPLE_SPI_KEYB) += apple_spi_kbd.o
+ obj-$(CONFIG_I8042_KEYB) += i8042.o
+ obj-$(CONFIG_TEGRA_KEYBOARD) += input.o tegra-kbc.o
++obj-$(CONFIG_NVEC_KEYBOARD) += input.o nvec-keyboard.o
+ obj-$(CONFIG_TWL4030_INPUT) += twl4030.o
+ endif
+diff --git a/drivers/input/nvec-keyboard.c b/drivers/input/nvec-keyboard.c
+new file mode 100644
+index 00000000..56345e9e
+--- /dev/null
++++ b/drivers/input/nvec-keyboard.c
+@@ -0,0 +1,541 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Keyboard of the NVIDIA embedded controller ("nvidia,nvec"), as found in
++ * the Toshiba AC100 (paz00)
++ *
++ * Copyright 2026, Andrea Bernardi
++ *
++ * The EC is the I2C bus master and talks to a Tegra I2C controller in slave
++ * mode. When we have something to say, we pull a GPIO line low to ask it to
++ * read from us. Messages are a type byte, a length byte and the payload;
++ * events have bit 7 of the type set and may also have a fixed size of 2 or 3
++ * bytes. The keyboard sends PS/2 scan code set 1.
++ *
++ * There are no interrupts here: the controller is polled when the console
++ * looks for input. The EC holds the bus while a byte waits for us, so a
++ * message is not lost when it is answered late, only slowed down.
++ *
++ * Protocol and hardware sequence after Linux' drivers/staging/nvec.
++ */
++
++#include <dm.h>
++#include <input.h>
++#include <keyboard.h>
++#include <log.h>
++#include <stdio_dev.h>
++#include <time.h>
++#include <asm/gpio.h>
++#include <asm/io.h>
++#include <asm/arch/clock.h>
++#include <asm/arch/pinmux.h>
++#include <linux/delay.h>
++#include <linux/input.h>
++
++/* slave part of the Tegra I2C controller */
++#define I2C_CNFG			0x00
++#define I2C_CNFG_PACKET_MODE_EN		BIT(10)
++#define I2C_CNFG_NEW_MASTER_SFM		BIT(11)
++#define I2C_CNFG_DEBOUNCE_CNT_SHIFT	12
++#define I2C_SL_CNFG			0x20
++#define I2C_SL_NEWSL			BIT(2)
++#define I2C_SL_RCVD			0x24
++#define I2C_SL_STATUS			0x28
++#define I2C_SL_ADDR1			0x2c
++#define I2C_SL_ADDR2			0x30
++#define I2C_SL_DELAY_COUNT		0x3c
++
++/* slave status */
++#define I2C_SL_IRQ			BIT(3)
++#define END_TRANS			BIT(4)
++#define RCVD				BIT(2)
++#define RNW				BIT(1)
++
++/* message types */
++#define NVEC_SLEEP			4
++#define NVEC_KBD			5
++#define NVEC_PS2			6
++#define NVEC_CNTL			7
++#define NVEC_KB_EVT			0x80
++
++/* event sizes, bits 5-6 of the type byte */
++#define NVEC_2BYTES			0
++#define NVEC_3BYTES			1
++#define NVEC_VAR_SIZE			2
++
++/* commands */
++#define GLOBAL_EVENTS			0	/* NVEC_SLEEP */
++#define KBD_SET_LEDS			0xed	/* NVEC_KBD */
++#define KBD_ENABLE			0xf4
++#define PS2_SEND_COMMAND		1	/* NVEC_PS2 */
++
++#define NVEC_MSG_SIZE			34
++#define NVEC_TX_COUNT			4
++#define NVEC_BUS_HZ			80000
++
++/* how long to wait for the rest of a message that has started */
++#define NVEC_BYTE_TIMEOUT_US		5000
++/* a transfer that does not move for this long is given up */
++#define NVEC_STALL_MS			2000
++
++#define KEY_REPEAT_DELAY_MS		300
++#define KEY_REPEAT_RATE_MS		40
++
++struct nvec_msg {
++	u8 data[NVEC_MSG_SIZE];
++	unsigned int size;
++	unsigned int pos;
++};
++
++struct nvec_kbd_priv {
++	void __iomem *regs;
++	struct gpio_desc request;
++	u8 slave_addr;
++	struct input_config *input;
++
++	int state;
++	struct nvec_msg rx;
++	bool rx_valid;
++	struct nvec_msg tx[NVEC_TX_COUNT];
++	unsigned int tx_head;
++	unsigned int tx_tail;
++	struct nvec_msg tx_noop;
++	struct nvec_msg *tx_current;
++	unsigned int answers;	/* replies received, events excluded */
++	ulong last_activity;	/* ms */
++
++	bool extended;
++};
++
++static inline u32 nvec_read(struct nvec_kbd_priv *priv, u32 offset)
++{
++	return readl(priv->regs + offset);
++}
++
++/* a write needs to be read back to make sure it reached the controller */
++static inline void nvec_write(struct nvec_kbd_priv *priv, u32 offset, u32 val)
++{
++	writel(val, priv->regs + offset);
++	readl(priv->regs + offset);
++}
++
++/* asserted (low) asks the EC to read from us */
++static void nvec_set_request(struct nvec_kbd_priv *priv, bool asserted)
++{
++	dm_gpio_set_value(&priv->request, !asserted);
++}
++
++static void nvec_setup_slave(struct nvec_kbd_priv *priv)
++{
++	nvec_write(priv, I2C_CNFG, I2C_CNFG_NEW_MASTER_SFM
++		   | I2C_CNFG_PACKET_MODE_EN
++		   | (2 << I2C_CNFG_DEBOUNCE_CNT_SHIFT));
++	nvec_write(priv, I2C_SL_CNFG, I2C_SL_NEWSL);
++	nvec_write(priv, I2C_SL_DELAY_COUNT, 0x1e);
++	nvec_write(priv, I2C_SL_ADDR1, priv->slave_addr >> 1);
++	nvec_write(priv, I2C_SL_ADDR2, 0);
++}
++
++/* clocks the controller from scratch, so that the EC finds an idle bus */
++static void nvec_restart(struct nvec_kbd_priv *priv)
++{
++	/*
++	 * 8 times the bus clock. The I2C divider is an integer one, while
++	 * clock_start_periph_pll() works it out as a 7.1 divider: ask for
++	 * twice the rate, as tegra_i2c does.
++	 */
++	clock_start_periph_pll(PERIPH_ID_I2C3, CLOCK_ID_PERIPH,
++			       2 * 8 * NVEC_BUS_HZ);
++	nvec_setup_slave(priv);
++	priv->state = 0;
++	priv->rx_valid = false;
++	priv->last_activity = get_timer(0);
++}
++
++static bool nvec_is_event(const struct nvec_msg *msg)
++{
++	return msg->data[0] & 0x80;
++}
++
++static unsigned int nvec_msg_size(const struct nvec_msg *msg)
++{
++	unsigned int event_size = (msg->data[0] >> 5) & 3;
++
++	if (!nvec_is_event(msg) || event_size == NVEC_VAR_SIZE)
++		return msg->pos >= 2 ? msg->data[1] + 2 : 0;
++	if (event_size == NVEC_2BYTES)
++		return 2;
++	if (event_size == NVEC_3BYTES)
++		return 3;
++	return 0;
++}
++
++/* set 1 scan codes with an 0xe0 prefix, as Linux key codes */
++static const struct {
++	u8 scan_code;
++	u8 key_code;
++} nvec_extended_keys[] = {
++	{ 0x1c, KEY_KPENTER },
++	{ 0x1d, KEY_RIGHTCTRL },
++	{ 0x35, KEY_KPSLASH },
++	{ 0x38, KEY_RIGHTALT },
++	{ 0x47, KEY_HOME },
++	{ 0x48, KEY_UP },
++	{ 0x49, KEY_PAGEUP },
++	{ 0x4b, KEY_LEFT },
++	{ 0x4d, KEY_RIGHT },
++	{ 0x4f, KEY_END },
++	{ 0x50, KEY_DOWN },
++	{ 0x51, KEY_PAGEDOWN },
++	{ 0x52, KEY_INSERT },
++	{ 0x53, KEY_DELETE },
++	{ 0x5b, KEY_LEFTMETA },
++	{ 0x5c, KEY_RIGHTMETA },
++	{ 0x5d, KEY_COMPOSE },
++};
++
++static void nvec_scan_code(struct nvec_kbd_priv *priv, u8 code)
++{
++	bool release = code & 0x80;
++	bool extended = priv->extended;
++	int key_code = 0;
++	int i;
++
++	if (code == 0xe0) {
++		priv->extended = true;
++		return;
++	}
++	priv->extended = false;
++	code &= 0x7f;
++
++	if (!extended) {
++		/* Linux key codes are the set 1 scan codes up to F12 */
++		if (code >= KEY_ESC && code <= KEY_F12)
++			key_code = code;
++	} else {
++		for (i = 0; i < ARRAY_SIZE(nvec_extended_keys); i++) {
++			if (nvec_extended_keys[i].scan_code == code) {
++				key_code = nvec_extended_keys[i].key_code;
++				break;
++			}
++		}
++	}
++
++	if (key_code)
++		input_add_keycode(priv->input, key_code, release);
++	else
++		debug("nvec: unknown key %s%#x\n", extended ? "e0 " : "", code);
++}
++
++static void nvec_rx_completed(struct nvec_kbd_priv *priv)
++{
++	struct nvec_msg *msg = &priv->rx;
++	unsigned int event_size;
++	unsigned int i;
++
++	priv->state = 0;
++	priv->rx_valid = false;
++
++	if (msg->pos != nvec_msg_size(msg)) {
++		debug("nvec: incomplete message %#x: %u of %u bytes\n",
++		      msg->data[0], msg->pos, nvec_msg_size(msg));
++		return;
++	}
++	msg->size = msg->pos;
++
++	if (!nvec_is_event(msg)) {
++		priv->answers++;
++		return;
++	}
++	if ((msg->data[0] & 0x8f) != NVEC_KB_EVT)
++		return;
++
++	/* the power button comes with a variable size (e0 5e e0 de) */
++	event_size = (msg->data[0] >> 5) & 3;
++	if (event_size == NVEC_VAR_SIZE)
++		return;
++	for (i = 1; i < (event_size == NVEC_3BYTES ? 3 : 2); i++)
++		nvec_scan_code(priv, msg->data[i]);
++}
++
++/* picks the message the EC is about to read */
++static void nvec_start_tx(struct nvec_kbd_priv *priv)
++{
++	static const u8 noop[] = { 2, NVEC_CNTL, 2 };
++
++	if (priv->tx_head == priv->tx_tail) {
++		memcpy(priv->tx_noop.data, noop, sizeof(noop));
++		priv->tx_noop.size = sizeof(noop);
++		priv->tx_current = &priv->tx_noop;
++	} else {
++		priv->tx_current = &priv->tx[priv->tx_head % NVEC_TX_COUNT];
++	}
++	priv->tx_current->pos = 0;
++}
++
++/* one step of the slave state machine, for a pending status */
++static void nvec_handle(struct nvec_kbd_priv *priv, u32 status)
++{
++	u32 received = 0;
++	u8 to_send = 0xff;
++
++	/* the EC did not ask to read, so it sent us something */
++	if (!(status & RNW)) {
++		received = nvec_read(priv, I2C_SL_RCVD);
++		if (status & RCVD)
++			nvec_write(priv, I2C_SL_RCVD, 0);
++	}
++
++	if (status == (I2C_SL_IRQ | RCVD))
++		priv->state = 0;
++
++	switch (priv->state) {
++	case 0:
++		/* the start of a transfer, checked below */
++		break;
++
++	case 1:
++		/* command byte */
++		if (status != I2C_SL_IRQ) {
++			priv->state = 0;
++		} else {
++			priv->rx.data[0] = received;
++			priv->rx.pos = 1;
++			priv->rx_valid = true;
++			priv->state = 2;
++		}
++		break;
++
++	case 2:
++		/* first byte after the command */
++		if (status == (I2C_SL_IRQ | RNW | RCVD)) {
++			udelay(33);
++			priv->rx_valid = false;
++			if (priv->rx.data[0] != 0x01) {
++				priv->state = 0;
++				break;
++			}
++			/* the EC reads our message */
++			priv->state = 3;
++			nvec_start_tx(priv);
++			to_send = priv->tx_current->data[0];
++			priv->tx_current->pos = 1;
++		} else if (status == I2C_SL_IRQ) {
++			priv->rx.data[1] = received;
++			priv->rx.pos = 2;
++			priv->state = 4;
++		} else {
++			priv->state = 0;
++		}
++		break;
++
++	case 3:
++		/* the EC reads a message from us */
++		if (status & END_TRANS) {
++			if (priv->tx_current->pos != priv->tx_current->size) {
++				/* stopped early: send it again */
++				priv->tx_current->pos = 0;
++				nvec_set_request(priv, true);
++			} else {
++				if (priv->tx_current != &priv->tx_noop)
++					priv->tx_head++;
++				priv->state = 0;
++			}
++		} else if (!(status & RNW) || (status & RCVD)) {
++			priv->state = 0;
++		} else if (priv->tx_current->pos < priv->tx_current->size) {
++			to_send = priv->tx_current->data[priv->tx_current->pos++];
++		} else {
++			priv->state = 0;
++		}
++		break;
++
++	case 4:
++		/* the EC sends us a message */
++		if ((status & (END_TRANS | RNW)) == END_TRANS)
++			nvec_rx_completed(priv);
++		else if (status & (RNW | RCVD))
++			priv->state = 0;
++		else if (priv->rx.pos < NVEC_MSG_SIZE)
++			priv->rx.data[priv->rx.pos++] = received;
++		break;
++
++	default:
++		priv->state = 0;
++		break;
++	}
++
++	/* a new transfer to us begins with our address */
++	if ((status & (RCVD | RNW)) == RCVD)
++		priv->state = 1;
++
++	/* send a byte if one is asked for, but not at the end of the transfer */
++	if ((status & (RNW | END_TRANS)) == RNW)
++		nvec_write(priv, I2C_SL_RCVD, to_send);
++
++	/* the first byte is out, the request has been seen */
++	if (status == (I2C_SL_IRQ | RNW | RCVD))
++		nvec_set_request(priv, false);
++}
++
++/*
++ * Handles what the EC has for us. Returns when the bus is idle, or when a
++ * started message did not go on for a while.
++ */
++static void nvec_poll(struct nvec_kbd_priv *priv)
++{
++	ulong start = timer_get_us();
++
++	for (;;) {
++		u32 status = nvec_read(priv, I2C_SL_STATUS);
++
++		if (status & I2C_SL_IRQ) {
++			nvec_handle(priv, status);
++			priv->last_activity = get_timer(0);
++			start = timer_get_us();
++			continue;
++		}
++
++		if (priv->state == 0)
++			break;
++		/* do not keep the controller busy with status reads */
++		udelay(10);
++		if (timer_get_us() - start > NVEC_BYTE_TIMEOUT_US) {
++			/* the EC stopped in the middle of a transfer */
++			if (get_timer(priv->last_activity) > NVEC_STALL_MS)
++				nvec_restart(priv);
++			break;
++		}
++	}
++}
++
++/* sends a message (it starts with its type) and waits for the answer */
++static int nvec_send(struct nvec_kbd_priv *priv, const u8 *data,
++		     unsigned int size)
++{
++	struct nvec_msg *msg;
++	unsigned int answers;
++	ulong start;
++
++	if (size + 1 > NVEC_MSG_SIZE
++	    || priv->tx_tail - priv->tx_head >= NVEC_TX_COUNT)
++		return -EINVAL;
++
++	msg = &priv->tx[priv->tx_tail % NVEC_TX_COUNT];
++	msg->data[0] = size;
++	memcpy(msg->data + 1, data, size);
++	msg->size = size + 1;
++	msg->pos = 0;
++	priv->tx_tail++;
++
++	answers = priv->answers;
++	start = get_timer(0);
++	nvec_set_request(priv, true);
++	while (get_timer(start) < 700) {
++		nvec_poll(priv);
++		if (priv->tx_head == priv->tx_tail && priv->answers != answers)
++			return 0;
++		udelay(10);
++	}
++
++	debug("nvec: no answer to message %#x\n", data[0]);
++	nvec_set_request(priv, false);
++	priv->tx_head = priv->tx_tail;
++	return -ETIMEDOUT;
++}
++
++static int nvec_kbd_check(struct input_config *input)
++{
++	struct nvec_kbd_priv *priv = dev_get_priv(input->dev);
++
++	nvec_poll(priv);
++	return 1;
++}
++
++static int nvec_kbd_start(struct udevice *dev)
++{
++	struct nvec_kbd_priv *priv = dev_get_priv(dev);
++	static const u8 global_events[] = { NVEC_SLEEP, GLOBAL_EVENTS, 1 };
++	/*
++	 * The EC keeps the state of its PS/2 port while the machine is off:
++	 * a touchpad left streaming by the last system blocks the keyboard
++	 * events until the port is reset (Andrey Danin's U-Boot driver and
++	 * Haiku's start with this, too). The touchpad answers fa aa 00.
++	 */
++	static const u8 ps2_reset[] = { NVEC_PS2, PS2_SEND_COMMAND, 0xff, 3 };
++	static const u8 kbd_leds[] = { NVEC_KBD, KBD_SET_LEDS, 0 };
++	static const u8 kbd_enable[] = { NVEC_KBD, KBD_ENABLE };
++	static const struct {
++		const u8 *data;
++		unsigned int size;
++	} msgs[] = {
++		{ global_events, sizeof(global_events) },
++		{ ps2_reset, sizeof(ps2_reset) },
++		{ kbd_leds, sizeof(kbd_leds) },
++		{ kbd_enable, sizeof(kbd_enable) },
++	};
++	int ret, i;
++
++	/* function 0 of the "dtf" pin group is I2C3 */
++	pinmux_set_func(PMUX_PINGRP_DTF, PMUX_FUNC_I2C3);
++	pinmux_tristate_disable(PMUX_PINGRP_DTF);
++	nvec_set_request(priv, false);
++	nvec_restart(priv);
++
++	for (i = 0; i < ARRAY_SIZE(msgs); i++) {
++		ret = nvec_send(priv, msgs[i].data, msgs[i].size);
++		if (ret)
++			log_warning("nvec: no answer to request %02x %02x: %d\n",
++				    msgs[i].data[0], msgs[i].data[1], ret);
++	}
++
++	return 0;
++}
++
++static int nvec_kbd_probe(struct udevice *dev)
++{
++	struct nvec_kbd_priv *priv = dev_get_priv(dev);
++	struct keyboard_priv *uc_priv = dev_get_uclass_priv(dev);
++	struct stdio_dev *sdev = &uc_priv->sdev;
++	struct input_config *input = &uc_priv->input;
++	int ret;
++
++	priv->regs = dev_read_addr_ptr(dev);
++	if (!priv->regs)
++		return -EINVAL;
++	priv->slave_addr = dev_read_u32_default(dev, "slave-addr", 0x8a);
++
++	ret = gpio_request_by_name(dev, "request-gpios", 0, &priv->request,
++				   GPIOD_IS_OUT | GPIOD_IS_OUT_ACTIVE);
++	if (ret) {
++		debug("%s: no request GPIO: %d\n", __func__, ret);
++		return ret;
++	}
++
++	input_set_delays(input, KEY_REPEAT_DELAY_MS, KEY_REPEAT_RATE_MS);
++	input_add_tables(input, false);
++
++	priv->input = input;
++	input->dev = dev;
++	input->read_keys = nvec_kbd_check;
++	strcpy(sdev->name, "nvec-kbd");
++
++	return input_stdio_register(sdev);
++}
++
++static const struct keyboard_ops nvec_kbd_ops = {
++	.start	= nvec_kbd_start,
++};
++
++static const struct udevice_id nvec_kbd_ids[] = {
++	{ .compatible = "nvidia,nvec" },
++	{ }
++};
++
++U_BOOT_DRIVER(nvec_kbd) = {
++	.name	= "nvec_kbd",
++	.id	= UCLASS_KEYBOARD,
++	.of_match = nvec_kbd_ids,
++	.probe	= nvec_kbd_probe,
++	.ops	= &nvec_kbd_ops,
++	.priv_auto	= sizeof(struct nvec_kbd_priv),
++};
+diff --git a/include/configs/tegra-common-post.h b/include/configs/tegra-common-post.h
+index a9c0cea4..99aef864 100644
+--- a/include/configs/tegra-common-post.h
++++ b/include/configs/tegra-common-post.h
+@@ -15,6 +15,12 @@
+ #define STDIN_KBD_KBC ""
+ #endif
+ 
++#ifdef CONFIG_NVEC_KEYBOARD
++#define STDIN_KBD_NVEC ",nvec-kbd"
++#else
++#define STDIN_KBD_NVEC ""
++#endif
++
+ #ifdef CONFIG_USB_KEYBOARD
+ #define STDIN_KBD_USB ",usbkbd"
+ #else
+@@ -40,7 +46,7 @@
+ #endif
+ 
+ #define TEGRA_DEVICE_SETTINGS \
+-	"stdin=serial" STDIN_KBD_KBC STDIN_KBD_USB STDOUT_CROS_EC STDIN_BTN_KBD "\0" \
++	"stdin=serial" STDIN_KBD_KBC STDIN_KBD_NVEC STDIN_KBD_USB STDOUT_CROS_EC STDIN_BTN_KBD "\0" \
+ 	"stdout=serial" STDOUT_VIDEO "\0" \
+ 	"stderr=serial" STDOUT_VIDEO "\0" \
+ 	""
+-- 
+2.39.5
+

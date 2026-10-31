@@ -1,0 +1,178 @@
+From 5ae0dde883ab492ef4dd83d6c34fae80286b784f Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 20 Oct 2026 18:10:21 +0200
+Subject: [PATCH 12/63] Cortex: copy media structures out of messages before
+ using them
+
+BMessage::FindData() returns the data in place, where it does not have to be
+aligned; reading a media_node or media_source from there raised SIGBUS on ARM
+(TransportView, when updating the time source).
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/apps/cortex/InfoView/InfoWindowManager.cpp  |  6 ++++--
+ .../MediaRoutingView/MediaRoutingView.cpp       | 14 ++++++++------
+ src/apps/cortex/NodeManager/NodeGroup.cpp       |  2 +-
+ src/apps/cortex/NodeManager/NodeManager.cpp     | 17 ++++++++++++++---
+ src/apps/cortex/TransportView/TransportView.cpp |  4 ++--
+ 5 files changed, 29 insertions(+), 14 deletions(-)
+
+diff --git a/src/apps/cortex/InfoView/InfoWindowManager.cpp b/src/apps/cortex/InfoView/InfoWindowManager.cpp
+index 126ec6f879..4e83692dad 100644
+--- a/src/apps/cortex/InfoView/InfoWindowManager.cpp
++++ b/src/apps/cortex/InfoView/InfoWindowManager.cpp
+@@ -611,11 +611,13 @@ void InfoWindowManager::MessageReceived(
+ 			if (message->FindData("source", B_RAW_TYPE, &data, &dataSize) != B_OK) {
+ 				return;
+ 			}
+-			const media_source source = *reinterpret_cast<const media_source *>(data);
++			media_source source;
++			memcpy((void*)&source, data, sizeof(source));
+ 			if (message->FindData("destination", B_RAW_TYPE, &data, &dataSize) != B_OK) {
+ 				return;
+ 			}
+-			const media_destination destination = *reinterpret_cast<const media_destination *>(data);
++			media_destination destination;
++			memcpy((void*)&destination, data, sizeof(destination));
+ 			BWindow *window;
+ 			if (_findWindowFor(source, destination, &window)) {
+ 				window->Lock();
+diff --git a/src/apps/cortex/MediaRoutingView/MediaRoutingView.cpp b/src/apps/cortex/MediaRoutingView/MediaRoutingView.cpp
+index 0e8c803560..50545bf855 100644
+--- a/src/apps/cortex/MediaRoutingView/MediaRoutingView.cpp
++++ b/src/apps/cortex/MediaRoutingView/MediaRoutingView.cpp
+@@ -483,7 +483,7 @@ void MediaRoutingView::MessageReceived(
+ 					ssize_t dataSize;
+ 					if (message->FindData("output", B_RAW_TYPE, n, &data, &dataSize) == B_OK)
+ 					{
+-						output = *reinterpret_cast<const media_output *>(data);
++						memcpy((void*)&output, data, sizeof(output));
+ 						Connection connection;
+ 						if (manager->findConnection(output.node.node, output.source, &connection) == B_OK)
+ 						{
+@@ -524,15 +524,17 @@ void MediaRoutingView::MessageReceived(
+ 			if(message->FindInt32("__connection_id", (int32*)&connectionID) < B_OK)
+ 				break;
+ 
+-			media_source* source;
++			const void* sourceData;
+ 			ssize_t dataSize;
+-			if(message->FindData("be:source", B_RAW_TYPE, (const void**)&source, &dataSize) < B_OK)
++			if(message->FindData("be:source", B_RAW_TYPE, &sourceData, &dataSize) < B_OK)
+ 				break;
++			media_source source;
++			memcpy((void*)&source, sourceData, sizeof(source));
+ 
+ 			MediaWire* wire;
+ 			if(_findWireFor(connectionID, &wire) == B_OK) {
+ 				// copy new connection data
+-				manager->findConnection(nodeID, *source, &wire->connection);
++				manager->findConnection(nodeID, source, &wire->connection);
+ 			}
+ 			break;
+ 		}
+@@ -674,7 +676,7 @@ void MediaRoutingView::MessageReceived(
+ 					ssize_t dataSize;
+ 					if (message->FindData("input", B_RAW_TYPE, i, &data, &dataSize) == B_OK)
+ 					{
+-						input = *reinterpret_cast<const media_input *>(data);
++						memcpy((void*)&input, data, sizeof(input));
+ 						InfoWindowManager *manager = InfoWindowManager::Instance();
+ 						if (manager && manager->Lock()) {
+ 							manager->openWindowFor(input);
+@@ -692,7 +694,7 @@ void MediaRoutingView::MessageReceived(
+ 					ssize_t dataSize;
+ 					if (message->FindData("output", B_RAW_TYPE, i, &data, &dataSize) == B_OK)
+ 					{
+-						output = *reinterpret_cast<const media_output *>(data);
++						memcpy((void*)&output, data, sizeof(output));
+ 						InfoWindowManager *manager = InfoWindowManager::Instance();
+ 						if (manager && manager->Lock()) {
+ 							manager->openWindowFor(output);
+diff --git a/src/apps/cortex/NodeManager/NodeGroup.cpp b/src/apps/cortex/NodeManager/NodeGroup.cpp
+index af4e613ccb..1679c12783 100644
+--- a/src/apps/cortex/NodeManager/NodeGroup.cpp
++++ b/src/apps/cortex/NodeManager/NodeGroup.cpp
+@@ -730,7 +730,7 @@ void NodeGroup::MessageReceived(
+ 						"  no timeSourceNode!\n"));
+ 					break;
+ 				}
+-				timeSource = *(media_node*)data;
++				memcpy((void*)&timeSource, data, sizeof(timeSource));
+ 
+ 				setTimeSource(timeSource);
+ 			}
+diff --git a/src/apps/cortex/NodeManager/NodeManager.cpp b/src/apps/cortex/NodeManager/NodeManager.cpp
+index e418c18b58..7358da4b7c 100644
+--- a/src/apps/cortex/NodeManager/NodeManager.cpp
++++ b/src/apps/cortex/NodeManager/NodeManager.cpp
+@@ -2235,7 +2235,7 @@ inline void NodeManager::_handleConnectionMade(
+ 				"* NodeManager::_handleConnectionMade(): not enough data for output.\n"));
+ 			break;
+ 		}
+-		output = *(media_output*)data;
++		memcpy((void*)&output, data, sizeof(output));
+ 
+ 		// fetch input
+ 		err = message->FindData("input", B_RAW_TYPE, n, &data, &dataSize);
+@@ -2251,7 +2251,7 @@ inline void NodeManager::_handleConnectionMade(
+ 				"* NodeManager::_handleConnectionMade(): not enough data for input.\n"));
+ 			break;
+ 		}
+-		input = *(media_input*)data;
++		memcpy((void*)&input, data, sizeof(input));
+ 
+ 		// look for existing Connection instance
+ 		Connection found;
+@@ -2311,7 +2311,7 @@ inline void NodeManager::_handleConnectionBroken(
+ 				"* NodeManager::_handleConnectionBroken(): not enough data for source.\n"));
+ 			continue;
+ 		}
+-		source = *(media_source*)data;
++		memcpy((void*)&source, data, sizeof(source));
+ 
+ 		// look up the connection +++++ SLOW +++++
+ 		Connection con;
+@@ -2379,6 +2379,17 @@ NodeManager::_handleFormatChanged(BMessage *message)
+ 		return;
+ 	}
+ 
++	// the data in the message does not have to be aligned
++	media_source sourceCopy;
++	memcpy((void*)&sourceCopy, source, sizeof(sourceCopy));
++	source = &sourceCopy;
++	media_destination destinationCopy;
++	memcpy((void*)&destinationCopy, destination, sizeof(destinationCopy));
++	destination = &destinationCopy;
++	media_format formatCopy;
++	memcpy((void*)&formatCopy, format, sizeof(formatCopy));
++	format = &formatCopy;
++
+ 	// find matching connection
+ 	for(con_map::const_iterator it = m_conSourceMap.begin();
+ 		it != m_conSourceMap.end(); ++it) {
+diff --git a/src/apps/cortex/TransportView/TransportView.cpp b/src/apps/cortex/TransportView/TransportView.cpp
+index d9bd17fb4f..9edae69c26 100644
+--- a/src/apps/cortex/TransportView/TransportView.cpp
++++ b/src/apps/cortex/TransportView/TransportView.cpp
+@@ -1042,7 +1042,7 @@ void TransportView::_updateTimeSource() {
+ 		if(err < B_OK)
+ 			continue;
+ 
+-		itemNode = *((media_node*)data);
++		memcpy((void*)&itemNode, data, sizeof(itemNode));
+ 		if(itemNode != tsNode)
+ 			continue;
+ 
+@@ -1164,7 +1164,7 @@ void TransportView::_timeSourceDeleted(
+ 		if(err < B_OK)
+ 			continue;
+ 
+-		itemNode = *((media_node*)data);
++		memcpy((void*)&itemNode, data, sizeof(itemNode));
+ 		if(itemNode.node != id)
+ 			continue;
+ 
+-- 
+2.39.5
+

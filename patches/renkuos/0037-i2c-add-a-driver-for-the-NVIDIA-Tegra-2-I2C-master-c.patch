@@ -1,0 +1,575 @@
+From 96c2f1a911b272db8200970deaeda0d558d4bbf6 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 27 Oct 2026 07:20:26 +0100
+Subject: [PATCH 37/63] i2c: add a driver for the NVIDIA Tegra 2 I2C master
+ controllers
+
+Finds the device tree children of the bus.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/add-ons/kernel/busses/i2c/Jamfile         |   1 +
+ src/add-ons/kernel/busses/i2c/tegra/Jamfile   |  10 +
+ .../kernel/busses/i2c/tegra/tegra_i2c.cpp     | 524 ++++++++++++++++++
+ 3 files changed, 535 insertions(+)
+ create mode 100644 src/add-ons/kernel/busses/i2c/tegra/Jamfile
+ create mode 100644 src/add-ons/kernel/busses/i2c/tegra/tegra_i2c.cpp
+
+diff --git a/src/add-ons/kernel/busses/i2c/Jamfile b/src/add-ons/kernel/busses/i2c/Jamfile
+index 17b385a68e..7641c18a44 100644
+--- a/src/add-ons/kernel/busses/i2c/Jamfile
++++ b/src/add-ons/kernel/busses/i2c/Jamfile
+@@ -2,3 +2,4 @@ SubDir HAIKU_TOP src add-ons kernel busses i2c ;
+ 
+ SubInclude HAIKU_TOP src add-ons kernel busses i2c ocores ;
+ SubInclude HAIKU_TOP src add-ons kernel busses i2c pch ;
++SubInclude HAIKU_TOP src add-ons kernel busses i2c tegra ;
+diff --git a/src/add-ons/kernel/busses/i2c/tegra/Jamfile b/src/add-ons/kernel/busses/i2c/tegra/Jamfile
+new file mode 100644
+index 0000000000..c8e67ce169
+--- /dev/null
++++ b/src/add-ons/kernel/busses/i2c/tegra/Jamfile
+@@ -0,0 +1,10 @@
++SubDir HAIKU_TOP src add-ons kernel busses i2c tegra ;
++
++SubDirC++Flags -fno-rtti ;
++
++UsePrivateHeaders i2c ;
++UsePrivateKernelHeaders ;
++
++KernelAddon tegra_i2c :
++	tegra_i2c.cpp
++;
+diff --git a/src/add-ons/kernel/busses/i2c/tegra/tegra_i2c.cpp b/src/add-ons/kernel/busses/i2c/tegra/tegra_i2c.cpp
+new file mode 100644
+index 0000000000..717e15c187
+--- /dev/null
++++ b/src/add-ons/kernel/busses/i2c/tegra/tegra_i2c.cpp
+@@ -0,0 +1,524 @@
++/*
++ * Copyright 2026, Haiku, Inc.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++/*!	I2C master controllers of NVIDIA Tegra 2 (nvidia,tegra20-i2c), driven in
++	packet mode and polled.
++
++	The DVC controller (nvidia,tegra20-i2c-dvc) is left out: the kernel reads
++	the clock of the power management IC behind it. The third controller is
++	the slave interface of the embedded controller, see busses/i2c/nvec.
++*/
++
++
++#include <new>
++#include <stdlib.h>
++#include <string.h>
++
++#include <ByteOrder.h>
++#include <KernelExport.h>
++#include <bus/FDT.h>
++#include <device_manager.h>
++#include <i2c.h>
++#include <lock.h>
++
++
++#define TEGRA_I2C_DRIVER_MODULE_NAME	"busses/i2c/tegra_i2c/driver_v1"
++
++#define TRACE_ALWAYS(x...)	dprintf("tegra_i2c: " x)
++
++// controller registers
++#define I2C_CNFG					0x000
++#define I2C_CNFG_PACKET_MODE		(1 << 10)
++#define I2C_CNFG_NEW_MASTER_FSM		(1 << 11)
++#define I2C_CNFG_DEBOUNCE_SHIFT		12
++#define I2C_TX_FIFO					0x050
++#define I2C_RX_FIFO					0x054
++#define I2C_FIFO_CONTROL			0x05c
++#define I2C_FIFO_FLUSH				0x03	// RX and TX
++#define I2C_FIFO_STATUS				0x060
++#define I2C_FIFO_STATUS_RX(x)		((x) & 0xf)
++#define I2C_FIFO_STATUS_TX(x)		(((x) >> 4) & 0xf)
++#define I2C_INT_MASK				0x064
++#define I2C_INT_STATUS				0x068
++#define I2C_INT_ARBITRATION_LOST	(1 << 2)
++#define I2C_INT_NO_ACK				(1 << 3)
++#define I2C_INT_PACKET_COMPLETE		(1 << 7)
++
++// packet headers
++#define I2C_PACKET_PROTOCOL_I2C		(1 << 4)
++#define I2C_PACKET_ID(id)			((id) << 16)
++#define I2C_HEADER_REPEAT_START		(1 << 16)
++#define I2C_HEADER_IE_ENABLE		(1 << 17)
++#define I2C_HEADER_READ				(1 << 19)
++
++// clock and reset controller
++#define TEGRA20_CAR_BASE			0x60006000
++#define TEGRA_CAR_RST_DEVICES(bank)	(0x04 + (bank) * 4)
++#define TEGRA_CAR_CLK_OUT_ENB(bank)	(0x10 + (bank) * 4)
++#define TEGRA20_PLLP_KHZ			216000
++
++static const struct {
++	uint32	clock;			// Tegra 2 clock number, as in the device tree
++	uint32	sourceRegister;	// in the clock and reset controller
++} kClocks[] = {
++	{ 12, 0x124 },		// I2C1
++	{ 54, 0x198 },		// I2C2
++};
++
++
++static device_manager_info* gDeviceManager;
++static i2c_for_controller_interface* gI2c;
++
++
++struct tegra_i2c {
++	device_node*		node;
++	i2c_bus				bus;
++	mutex				lock;
++	area_id				registersArea;
++	volatile uint8*		registers;
++	uint32				clock;
++	uint32				busKHz;
++	uint32				transfers;
++	uint32				errors;
++};
++
++
++static inline uint32
++read_reg(tegra_i2c* controller, uint32 offset)
++{
++	return *(volatile uint32*)(controller->registers + offset);
++}
++
++
++static inline void
++write_reg(tegra_i2c* controller, uint32 offset, uint32 value)
++{
++	*(volatile uint32*)(controller->registers + offset) = value;
++}
++
++
++/*!	Polls until \a condition holds, at most about \a timeout microseconds. */
++template<typename Condition>
++static bool
++poll(Condition condition, int32 timeout = 50000)
++{
++	for (int32 i = 0; i < timeout; i += 5) {
++		if (condition())
++			return true;
++		spin(5);
++	}
++	return condition();
++}
++
++
++/*!	Clocks the controller at 8 times the bus clock from PLLP, resets it and
++	puts it in packet mode. Also used to recover from a failed transfer.
++*/
++static status_t
++setup_controller(tegra_i2c* controller)
++{
++	uint32 sourceRegister = 0;
++	for (uint32 i = 0; i < B_COUNT_OF(kClocks); i++) {
++		if (kClocks[i].clock == controller->clock)
++			sourceRegister = kClocks[i].sourceRegister;
++	}
++	if (sourceRegister == 0)
++		return B_NOT_SUPPORTED;
++
++	void* address;
++	area_id area = map_physical_memory("tegra car", TEGRA20_CAR_BASE,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++	if (area < B_OK)
++		return area;
++
++	volatile uint8* car = (volatile uint8*)address;
++	uint32 bank = controller->clock / 32;
++	uint32 bit = 1U << (controller->clock % 32);
++	volatile uint32* reset = (volatile uint32*)(car
++		+ TEGRA_CAR_RST_DEVICES(bank));
++	volatile uint32* enable = (volatile uint32*)(car
++		+ TEGRA_CAR_CLK_OUT_ENB(bank));
++	volatile uint32* source = (volatile uint32*)(car + sourceRegister);
++
++	// source 0 is PLLP; the divider is integer, minus 1
++	uint32 divider = (TEGRA20_PLLP_KHZ + 8 * controller->busKHz - 1)
++		/ (8 * controller->busKHz) - 1;
++	*enable |= bit;
++	*source = (*source & ~((3U << 30) | 0xffff)) | divider;
++	*reset |= bit;
++	spin(2);
++	*reset &= ~bit;
++	delete_area(area);
++	spin(2);
++
++	write_reg(controller, I2C_CNFG, I2C_CNFG_NEW_MASTER_FSM
++		| I2C_CNFG_PACKET_MODE | (2 << I2C_CNFG_DEBOUNCE_SHIFT));
++	write_reg(controller, I2C_INT_MASK, 0);
++	write_reg(controller, I2C_FIFO_CONTROL, I2C_FIFO_FLUSH);
++	if (!poll([controller] {
++			return (read_reg(controller, I2C_FIFO_CONTROL) & I2C_FIFO_FLUSH)
++				== 0; })) {
++		return B_TIMED_OUT;
++	}
++	write_reg(controller, I2C_INT_STATUS, 0xffffffff);
++	return B_OK;
++}
++
++
++/*!	One message: writes \a length bytes from \a data, or reads them into it.
++	With \a repeatStart the bus is kept for the next message.
++*/
++static status_t
++transfer(tegra_i2c* controller, i2c_addr address, uint8* data, size_t length,
++	bool read, bool repeatStart)
++{
++	if (length == 0 || length > 4096 || address > 0x7f)
++		return B_BAD_VALUE;
++
++	write_reg(controller, I2C_INT_STATUS, 0xffffffff);
++
++	uint32 header[3] = {
++		I2C_PACKET_PROTOCOL_I2C | I2C_PACKET_ID(1),
++		(uint32)length - 1,
++		((uint32)address << 1) | I2C_HEADER_IE_ENABLE
++			| (read ? I2C_HEADER_READ : 0)
++			| (repeatStart ? I2C_HEADER_REPEAT_START : 0)
++	};
++	size_t words = 3 + (read ? 0 : (length + 3) / 4);
++	size_t received = 0;
++	for (size_t i = 0; i < words; i++) {
++		uint32 word;
++		if (i < 3)
++			word = header[i];
++		else {
++			size_t offset = (i - 3) * 4;
++			word = 0;
++			for (size_t j = 0; j < 4 && offset + j < length; j++)
++				word |= (uint32)data[offset + j] << (j * 8);
++		}
++		if (!poll([controller] {
++				return I2C_FIFO_STATUS_TX(read_reg(controller, I2C_FIFO_STATUS))
++					> 0
++					|| (read_reg(controller, I2C_INT_STATUS)
++						& (I2C_INT_NO_ACK | I2C_INT_ARBITRATION_LOST)) != 0; })
++			|| I2C_FIFO_STATUS_TX(read_reg(controller, I2C_FIFO_STATUS)) == 0) {
++			break;
++		}
++		write_reg(controller, I2C_TX_FIFO, word);
++	}
++
++	while (read && received < length) {
++		if (!poll([controller] {
++				return I2C_FIFO_STATUS_RX(read_reg(controller, I2C_FIFO_STATUS))
++					> 0
++					|| (read_reg(controller, I2C_INT_STATUS)
++						& (I2C_INT_NO_ACK | I2C_INT_ARBITRATION_LOST)) != 0; })
++			|| I2C_FIFO_STATUS_RX(read_reg(controller, I2C_FIFO_STATUS)) == 0) {
++			break;
++		}
++		uint32 word = read_reg(controller, I2C_RX_FIFO);
++		for (size_t j = 0; j < 4 && received < length; j++)
++			data[received++] = word >> (j * 8);
++	}
++
++	uint32 status = 0;
++	bool done = poll([controller, &status] {
++		status = read_reg(controller, I2C_INT_STATUS);
++		return (status & (I2C_INT_PACKET_COMPLETE | I2C_INT_NO_ACK
++			| I2C_INT_ARBITRATION_LOST)) != 0; });
++	write_reg(controller, I2C_INT_STATUS, status);
++
++	if (done && (status & (I2C_INT_NO_ACK | I2C_INT_ARBITRATION_LOST)) == 0
++		&& (!read || received == length)) {
++		return B_OK;
++	}
++
++	// the controller has to be reset to get out of a failed transfer
++	controller->errors++;
++	setup_controller(controller);
++	if (!done)
++		return B_TIMED_OUT;
++	if ((status & I2C_INT_NO_ACK) != 0)
++		return B_DEV_NOT_READY;
++	return B_IO_ERROR;
++}
++
++
++//	#pragma mark - controller interface
++
++
++static status_t
++tegra_i2c_exec_command(i2c_bus_cookie cookie, i2c_op op,
++	i2c_addr slaveAddress, const void* cmdBuffer, size_t cmdLength,
++	void* dataBuffer, size_t dataLength)
++{
++	tegra_i2c* controller = (tegra_i2c*)cookie;
++	controller->transfers++;
++
++	if (IS_WRITE_OP(op)) {
++		// the command and the data go out in one message
++		size_t length = cmdLength + dataLength;
++		if (length == 0) {
++			// a quick write: probe the address with a one byte read
++			uint8 dummy;
++			return transfer(controller, slaveAddress, &dummy, 1, true, false);
++		}
++		uint8* buffer = new(std::nothrow) uint8[length];
++		if (buffer == NULL)
++			return B_NO_MEMORY;
++		if (cmdLength > 0)
++			memcpy(buffer, cmdBuffer, cmdLength);
++		if (dataLength > 0)
++			memcpy(buffer + cmdLength, dataBuffer, dataLength);
++		status_t status = transfer(controller, slaveAddress, buffer, length,
++			false, false);
++		delete[] buffer;
++		return status;
++	}
++
++	if (cmdLength > 0) {
++		uint8 command[32];
++		if (cmdLength > sizeof(command))
++			return B_BAD_VALUE;
++		memcpy(command, cmdBuffer, cmdLength);
++		status_t status = transfer(controller, slaveAddress, command,
++			cmdLength, false, dataLength > 0);
++		if (status != B_OK || dataLength == 0)
++			return status;
++	}
++
++	if (dataLength == 0) {
++		uint8 dummy;
++		return transfer(controller, slaveAddress, &dummy, 1, true, false);
++	}
++	return transfer(controller, slaveAddress, (uint8*)dataBuffer, dataLength,
++		true, false);
++}
++
++
++/*!	Registers the devices the device tree puts on this bus (like the audio
++	codec of the AC100), so that their drivers can find them. Their address is
++	in their node name, "name@address".
++*/
++static status_t
++tegra_i2c_scan_bus(i2c_bus_cookie cookie)
++{
++	tegra_i2c* controller = (tegra_i2c*)cookie;
++	device_node* fdtNode = gDeviceManager->get_parent_node(controller->node);
++	if (fdtNode == NULL)
++		return B_ERROR;
++
++	// only the device tree nodes, not this driver's own node
++	const device_attr fdtChildren[] = {
++		{ B_DEVICE_BUS, B_STRING_TYPE, { .string = "fdt" }},
++		{}
++	};
++	device_node* child = NULL;
++	while (gDeviceManager->get_next_child_node(fdtNode, fdtChildren, &child)
++			== B_OK) {
++		const char* name;
++		const char* compatible;
++		if (gDeviceManager->get_attr_string(child, "fdt/name", &name, false)
++				!= B_OK
++			|| gDeviceManager->get_attr_string(child, "fdt/compatible",
++				&compatible, false) != B_OK) {
++			continue;
++		}
++		const char* at = strchr(name, '@');
++		if (at == NULL)
++			continue;
++		i2c_addr address = (i2c_addr)strtoul(at + 1, NULL, 16);
++
++		char* hid = strdup(compatible);
++		char* cid[] = { hid, NULL };
++		status_t status = hid != NULL
++			? gI2c->register_device(controller->bus, address, hid, cid, NULL)
++			: B_NO_MEMORY;
++		TRACE_ALWAYS("device %s (%s) at %#x: %s\n", name, compatible,
++			address, strerror(status));
++		free(hid);
++	}
++
++	gDeviceManager->put_node(fdtNode);
++	return B_OK;
++}
++
++
++static void
++tegra_i2c_set_bus(i2c_bus_cookie cookie, i2c_bus bus)
++{
++	((tegra_i2c*)cookie)->bus = bus;
++}
++
++
++static status_t
++tegra_i2c_acquire_bus(i2c_bus_cookie cookie)
++{
++	return mutex_lock(&((tegra_i2c*)cookie)->lock);
++}
++
++
++static void
++tegra_i2c_release_bus(i2c_bus_cookie cookie)
++{
++	mutex_unlock(&((tegra_i2c*)cookie)->lock);
++}
++
++
++//	#pragma mark - driver
++
++
++static float
++tegra_i2c_supports_device(device_node* parent)
++{
++	const char* bus;
++	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
++			!= B_OK || strcmp(bus, "fdt") != 0) {
++		return 0.0f;
++	}
++
++	const char* compatible;
++	if (gDeviceManager->get_attr_string(parent, "fdt/compatible", &compatible,
++			false) != B_OK || strcmp(compatible, "nvidia,tegra20-i2c") != 0) {
++		return 0.0f;
++	}
++
++	return 1.0f;
++}
++
++
++static status_t
++tegra_i2c_register_device(device_node* parent)
++{
++	device_attr attrs[] = {
++		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
++			{ .string = "NVIDIA Tegra I2C Controller" }},
++		{ B_DEVICE_FIXED_CHILD, B_STRING_TYPE,
++			{ .string = I2C_FOR_CONTROLLER_MODULE_NAME }},
++		{}
++	};
++
++	return gDeviceManager->register_node(parent, TEGRA_I2C_DRIVER_MODULE_NAME,
++		attrs, NULL, NULL);
++}
++
++
++static status_t
++tegra_i2c_init_driver(device_node* node, void** _cookie)
++{
++	device_node* parent = gDeviceManager->get_parent_node(node);
++	fdt_device_module_info* fdt;
++	fdt_device* fdtDevice;
++	status_t status = gDeviceManager->get_driver(parent,
++		(driver_module_info**)&fdt, (void**)&fdtDevice);
++	gDeviceManager->put_node(parent);
++	if (status != B_OK)
++		return status;
++
++	uint64 registers, size;
++	if (!fdt->get_reg(fdtDevice, 0, &registers, &size))
++		return B_ERROR;
++
++	// clocks = <&car id ...>: the first is the controller's
++	int length;
++	const uint32* clocks = (const uint32*)fdt->get_prop(fdtDevice, "clocks",
++		&length);
++	if (clocks == NULL || length < 8)
++		return B_ERROR;
++	const uint32* frequency = (const uint32*)fdt->get_prop(fdtDevice,
++		"clock-frequency", &length);
++
++	tegra_i2c* controller = new(std::nothrow) tegra_i2c;
++	if (controller == NULL)
++		return B_NO_MEMORY;
++	memset((void*)controller, 0, sizeof(*controller));
++	controller->node = node;
++	controller->clock = B_BENDIAN_TO_HOST_INT32(clocks[1]);
++	controller->busKHz = frequency != NULL && length >= 4
++		? B_BENDIAN_TO_HOST_INT32(*frequency) / 1000 : 100;
++	if (controller->busKHz == 0 || controller->busKHz > 400)
++		controller->busKHz = 100;
++	mutex_init(&controller->lock, "tegra i2c");
++
++	void* address;
++	controller->registersArea = map_physical_memory("tegra i2c",
++		registers & ~(phys_addr_t)(B_PAGE_SIZE - 1), B_PAGE_SIZE,
++		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++		&address);
++	if (controller->registersArea < B_OK) {
++		status = controller->registersArea;
++		goto err;
++	}
++	controller->registers = (volatile uint8*)address
++		+ (registers & (B_PAGE_SIZE - 1));
++
++	status = setup_controller(controller);
++	TRACE_ALWAYS("controller %#" B_PRIx64 ", clock %" B_PRIu32 ", %" B_PRIu32
++		" kHz: %s\n", registers, controller->clock, controller->busKHz,
++		strerror(status));
++	if (status != B_OK)
++		goto err;
++
++	*_cookie = controller;
++	return B_OK;
++
++err:
++	delete_area(controller->registersArea);
++	mutex_destroy(&controller->lock);
++	delete controller;
++	return status;
++}
++
++
++static void
++tegra_i2c_uninit_driver(void* cookie)
++{
++	tegra_i2c* controller = (tegra_i2c*)cookie;
++	delete_area(controller->registersArea);
++	mutex_destroy(&controller->lock);
++	delete controller;
++}
++
++
++static i2c_sim_interface sTegraI2cDriver = {
++	{
++		{
++			TEGRA_I2C_DRIVER_MODULE_NAME,
++			0,
++			NULL
++		},
++
++		tegra_i2c_supports_device,
++		tegra_i2c_register_device,
++		tegra_i2c_init_driver,
++		tegra_i2c_uninit_driver,
++		NULL,	// register_child_devices
++		NULL,	// rescan
++		NULL,	// device_removed
++	},
++
++	tegra_i2c_set_bus,
++	tegra_i2c_exec_command,
++	tegra_i2c_scan_bus,
++	tegra_i2c_acquire_bus,
++	tegra_i2c_release_bus,
++	NULL,	// install_interrupt_handler
++	NULL,	// uninstall_interrupt_handler
++};
++
++
++module_dependency module_dependencies[] = {
++	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&gDeviceManager },
++	{ I2C_FOR_CONTROLLER_MODULE_NAME, (module_info**)&gI2c },
++	{}
++};
++
++
++module_info* modules[] = {
++	(module_info*)&sTegraI2cDriver,
++	NULL
++};
+-- 
+2.39.5
+

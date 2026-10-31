@@ -1,0 +1,4615 @@
+From e4af4075651883509b49efc9eaa23b220764e2ed Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 27 Oct 2026 07:20:28 +0100
+Subject: [PATCH 42/63] tegra_dc: a display driver and accelerant for the
+ NVIDIA Tegra 2
+
+32 bit modes, brightness and display power, a hardware cursor on window
+C, a video overlay on window B, and the HDMI output: mirroring of the
+panel or a video on the whole HDMI screen, EDID with retries, HDMI or
+DVI mode, audio from S/PDIF.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../private/graphics/tegra_dc/tegra_dc_info.h |  146 ++
+ src/add-ons/accelerants/Jamfile               |    1 +
+ src/add-ons/accelerants/tegra_dc/Jamfile      |   16 +
+ .../accelerants/tegra_dc/accelerant.cpp       |  171 ++
+ src/add-ons/accelerants/tegra_dc/accelerant.h |   32 +
+ .../accelerants/tegra_dc/accelerant_protos.h  |   73 +
+ src/add-ons/accelerants/tegra_dc/cursor.cpp   |   55 +
+ src/add-ons/accelerants/tegra_dc/hooks.cpp    |  111 +
+ src/add-ons/accelerants/tegra_dc/mode.cpp     |  160 ++
+ src/add-ons/accelerants/tegra_dc/overlay.cpp  |  279 +++
+ src/add-ons/accelerants/tegra_dc/power.cpp    |   81 +
+ src/add-ons/kernel/drivers/graphics/Jamfile   |    1 +
+ .../kernel/drivers/graphics/tegra_dc/Jamfile  |   13 +
+ .../kernel/drivers/graphics/tegra_dc/hdmi.cpp | 1783 +++++++++++++++++
+ .../kernel/drivers/graphics/tegra_dc/hdmi.h   |   71 +
+ .../drivers/graphics/tegra_dc/tegra_dc.cpp    | 1468 ++++++++++++++
+ 16 files changed, 4461 insertions(+)
+ create mode 100644 headers/private/graphics/tegra_dc/tegra_dc_info.h
+ create mode 100644 src/add-ons/accelerants/tegra_dc/Jamfile
+ create mode 100644 src/add-ons/accelerants/tegra_dc/accelerant.cpp
+ create mode 100644 src/add-ons/accelerants/tegra_dc/accelerant.h
+ create mode 100644 src/add-ons/accelerants/tegra_dc/accelerant_protos.h
+ create mode 100644 src/add-ons/accelerants/tegra_dc/cursor.cpp
+ create mode 100644 src/add-ons/accelerants/tegra_dc/hooks.cpp
+ create mode 100644 src/add-ons/accelerants/tegra_dc/mode.cpp
+ create mode 100644 src/add-ons/accelerants/tegra_dc/overlay.cpp
+ create mode 100644 src/add-ons/accelerants/tegra_dc/power.cpp
+ create mode 100644 src/add-ons/kernel/drivers/graphics/tegra_dc/Jamfile
+ create mode 100644 src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
+ create mode 100644 src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.h
+ create mode 100644 src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
+
+diff --git a/headers/private/graphics/tegra_dc/tegra_dc_info.h b/headers/private/graphics/tegra_dc/tegra_dc_info.h
+new file mode 100644
+index 0000000000..e46891df2d
+--- /dev/null
++++ b/headers/private/graphics/tegra_dc/tegra_dc_info.h
+@@ -0,0 +1,146 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef TEGRA_DC_INFO_H
++#define TEGRA_DC_INFO_H
++
++
++#include <Accelerant.h>
++#include <Drivers.h>
++#include <edid.h>
++
++
++#define TEGRA_DC_ACCELERANT_NAME	"tegra_dc.accelerant"
++#define TEGRA_DC_DEVICE_NAME		"graphics/tegra_dc"
++
++
++/*!	Shared between the kernel driver and the accelerant (cloned read-write
++	by it). The kernel driver owns the hardware: the accelerant only reads
++	this and asks for changes through the ioctls below.
++*/
++struct tegra_dc_shared_info {
++	area_id			mode_list_area;		// created by the primary accelerant
++	uint32			mode_count;
++
++	display_mode	current_mode;
++	uint32			bytes_per_row;
++
++	display_timing	timing;				// as the firmware set the panel up
++	uint32			frame_buffer_size;	// bytes mapped for scanout
++
++	sem_id			vblank_sem;
++	uint32			vblank_count;		// vertical blank interrupts so far
++
++	bool			has_backlight;		// the backlight PWM runs
++	uint32			dpms_mode;			// B_DPMS_*
++
++	edid1_info		edid_info;
++	bool			has_edid;
++};
++
++
++enum {
++	TEGRA_DC_GET_PRIVATE_DATA = B_DEVICE_OP_CODES_END + 1,
++		// area_id of the shared info
++	TEGRA_DC_GET_DEVICE_NAME,
++		// char[B_PATH_NAME_LENGTH]
++	TEGRA_DC_CLONE_FRAME_BUFFER,
++		// area_info of a clone of the scanout memory in the caller
++	TEGRA_DC_SET_DISPLAY_MODE,
++		// display_mode
++	TEGRA_DC_GET_BRIGHTNESS,
++		// uint32, backlight duty cycle 0 - 256
++	TEGRA_DC_SET_BRIGHTNESS,
++		// uint32, backlight duty cycle 1 - 256
++	TEGRA_DC_SET_DPMS_MODE,
++		// uint32, B_DPMS_*
++	TEGRA_DC_SET_CURSOR_BITMAP,
++		// tegra_dc_cursor_bitmap
++	TEGRA_DC_MOVE_CURSOR,
++		// uint16[2], x and y of the hot spot
++	TEGRA_DC_SHOW_CURSOR,
++		// uint32, 0 hides
++	TEGRA_DC_ALLOCATE_OVERLAY_BUFFER,
++		// tegra_dc_overlay_buffer, size in, area and address out
++	TEGRA_DC_RELEASE_OVERLAY_BUFFER,
++		// area_id
++	TEGRA_DC_CONFIGURE_OVERLAY,
++		// tegra_dc_overlay_config
++	TEGRA_DC_GET_HDMI_STATUS,
++		// tegra_dc_hdmi_status
++	TEGRA_DC_RECONNECT_HDMI,
++		// nothing: the HDMI output reads its driver settings again
++	TEGRA_DC_SET_HDMI_VIDEO,
++		// tegra_dc_hdmi_video: a video on the whole HDMI screen, or not
++};
++
++
++struct tegra_dc_hdmi_video {
++	uint32			enable;
++	area_id			handle;			// an overlay buffer, as allocated
++	uint32			space;			// B_YCbCr422 or B_RGB32
++	uint32			bytes_per_row;
++	uint16			width;
++	uint16			height;
++};
++
++
++struct tegra_dc_hdmi_status {
++	bool			plugged;		// the hot plug line is up
++	bool			active;			// the output runs
++	bool			has_edid;
++	bool			hdmi_sink;		// rather than DVI
++	bool			dvi;			// sending DVI
++	bool			enabled;		// not turned off in the settings
++	bool			video;			// showing a video, not the panel
++	char			screen_name[16];
++	uint16			width;
++	uint16			height;
++	uint32			pixel_clock;	// kHz
++	uint16			h_total;
++	uint16			v_total;
++};
++
++
++struct tegra_dc_overlay_buffer {
++	uint32			size;			// in
++	area_id			handle;			// the driver's area, to release it
++	area_id			area;			// a cloneable clone in the caller
++	void*			address;		// of that clone
++	uint32			physical;
++};
++
++struct tegra_dc_overlay_config {
++	uint32			enable;
++	area_id			handle;			// of the buffer to show
++	uint32			space;			// B_YCbCr422 or B_RGB32
++	uint32			bytes_per_row;
++	uint16			source_x;		// part of the buffer shown
++	uint16			source_y;
++	uint16			source_width;
++	uint16			source_height;
++	uint16			x;				// where on screen, inside it
++	uint16			y;
++	uint16			width;
++	uint16			height;
++	uint32			filter;			// bit 0 horizontal, bit 1 vertical
++	bool			color_key;		// show where window A has the key
++	uint32			key_lower;		// 0x00RRGGBB
++	uint32			key_upper;
++};
++
++
++#define TEGRA_DC_CURSOR_SIZE		64
++
++struct tegra_dc_cursor_bitmap {
++	uint16			width;
++	uint16			height;
++	uint16			hot_x;
++	uint16			hot_y;
++	uint32			bytes_per_row;
++	const void*		bits;			// B_RGBA32, in the caller's address space
++};
++
++
++#endif	// TEGRA_DC_INFO_H
+diff --git a/src/add-ons/accelerants/Jamfile b/src/add-ons/accelerants/Jamfile
+index 9b6a99e650..a46e4e18d6 100644
+--- a/src/add-ons/accelerants/Jamfile
++++ b/src/add-ons/accelerants/Jamfile
+@@ -5,6 +5,7 @@ SubInclude HAIKU_TOP src add-ons accelerants ati ;
+ SubInclude HAIKU_TOP src add-ons accelerants common ;
+ SubInclude HAIKU_TOP src add-ons accelerants et6x00 ;
+ SubInclude HAIKU_TOP src add-ons accelerants framebuffer ;
++SubInclude HAIKU_TOP src add-ons accelerants tegra_dc ;
+ SubInclude HAIKU_TOP src add-ons accelerants intel_810 ;
+ SubInclude HAIKU_TOP src add-ons accelerants intel_extreme ;
+ SubInclude HAIKU_TOP src add-ons accelerants matrox ;
+diff --git a/src/add-ons/accelerants/tegra_dc/Jamfile b/src/add-ons/accelerants/tegra_dc/Jamfile
+new file mode 100644
+index 0000000000..3d28a06210
+--- /dev/null
++++ b/src/add-ons/accelerants/tegra_dc/Jamfile
+@@ -0,0 +1,16 @@
++SubDir HAIKU_TOP src add-ons accelerants tegra_dc ;
++
++UsePrivateHeaders graphics ;
++UsePrivateHeaders [ FDirName graphics tegra_dc ] ;
++UsePrivateHeaders [ FDirName graphics common ] ;
++UsePrivateHeaders shared ;
++
++Addon tegra_dc.accelerant :
++	accelerant.cpp
++	cursor.cpp
++	hooks.cpp
++	mode.cpp
++	overlay.cpp
++	power.cpp
++	: libaccelerantscommon.a
++;
+diff --git a/src/add-ons/accelerants/tegra_dc/accelerant.cpp b/src/add-ons/accelerants/tegra_dc/accelerant.cpp
+new file mode 100644
+index 0000000000..5ff33374a5
+--- /dev/null
++++ b/src/add-ons/accelerants/tegra_dc/accelerant.cpp
+@@ -0,0 +1,171 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++/*!	Accelerant for the display controller of the NVIDIA Tegra 2. The kernel
++	driver owns the hardware; the accelerant offers its modes to app_server
++	and gives it a clone of the scanout memory.
++*/
++
++
++#include "accelerant.h"
++#include "accelerant_protos.h"
++
++#include <errno.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <AutoDeleterOS.h>
++
++
++accelerant_info* gInfo;
++
++
++/*!	Common part of the primary accelerant and of its clones. */
++static status_t
++init_common(int device, bool isClone)
++{
++	gInfo = (accelerant_info*)calloc(1, sizeof(accelerant_info));
++	if (gInfo == NULL)
++		return B_NO_MEMORY;
++	MemoryDeleter infoDeleter(gInfo);
++
++	gInfo->is_clone = isClone;
++	gInfo->device = device;
++	gInfo->mode_list_area = -1;
++	gInfo->frame_buffer_area = -1;
++
++	area_id sharedArea;
++	if (ioctl(device, TEGRA_DC_GET_PRIVATE_DATA, &sharedArea,
++			sizeof(area_id)) != 0) {
++		return B_ERROR;
++	}
++
++	AreaDeleter sharedDeleter(clone_area("tegra_dc shared info",
++		(void**)&gInfo->shared_info, B_ANY_ADDRESS,
++		B_READ_AREA | B_WRITE_AREA, sharedArea));
++	status_t status = gInfo->shared_info_area = sharedDeleter.Get();
++	if (status < B_OK)
++		return status;
++
++	infoDeleter.Detach();
++	sharedDeleter.Detach();
++	return B_OK;
++}
++
++
++static void
++uninit_common()
++{
++	delete_area(gInfo->frame_buffer_area);
++	delete_area(gInfo->shared_info_area);
++
++	// only a clone opened the device itself
++	if (gInfo->is_clone)
++		close(gInfo->device);
++
++	free(gInfo);
++	gInfo = NULL;
++}
++
++
++//	#pragma mark - public accelerant functions
++
++
++status_t
++tegra_dc_init_accelerant(int device)
++{
++	status_t status = init_common(device, false);
++	if (status != B_OK)
++		return status;
++
++	status = create_mode_list();
++	if (status != B_OK) {
++		uninit_common();
++		return status;
++	}
++
++	area_info info;
++	if (ioctl(device, TEGRA_DC_CLONE_FRAME_BUFFER, &info, sizeof(info)) != 0) {
++		status = errno;
++		uninit_common();
++		return status;
++	}
++	gInfo->frame_buffer_area = info.area;
++	gInfo->frame_buffer = info.address;
++	return B_OK;
++}
++
++
++ssize_t
++tegra_dc_accelerant_clone_info_size(void)
++{
++	return B_PATH_NAME_LENGTH;
++}
++
++
++void
++tegra_dc_get_accelerant_clone_info(void* info)
++{
++	ioctl(gInfo->device, TEGRA_DC_GET_DEVICE_NAME, info, B_PATH_NAME_LENGTH);
++}
++
++
++status_t
++tegra_dc_clone_accelerant(void* info)
++{
++	char path[B_PATH_NAME_LENGTH];
++	strlcpy(path, "/dev/", sizeof(path));
++	strlcat(path, (const char*)info, sizeof(path));
++
++	int device = open(path, B_READ_WRITE);
++	if (device < 0)
++		return errno;
++
++	status_t status = init_common(device, true);
++	if (status != B_OK) {
++		close(device);
++		return status;
++	}
++
++	gInfo->mode_list_area = clone_area("tegra_dc cloned modes",
++		(void**)&gInfo->mode_list, B_ANY_ADDRESS, B_READ_AREA,
++		gInfo->shared_info->mode_list_area);
++	if (gInfo->mode_list_area < B_OK) {
++		status = gInfo->mode_list_area;
++		uninit_common();
++		return status;
++	}
++	return B_OK;
++}
++
++
++void
++tegra_dc_uninit_accelerant(void)
++{
++	delete_area(gInfo->mode_list_area);
++	uninit_common();
++}
++
++
++status_t
++tegra_dc_get_accelerant_device_info(accelerant_device_info* info)
++{
++	info->version = B_ACCELERANT_VERSION;
++	strlcpy(info->name, "NVIDIA Tegra 2", sizeof(info->name));
++	strlcpy(info->chipset, "Tegra20 DC", sizeof(info->chipset));
++	strlcpy(info->serial_no, "None", sizeof(info->serial_no));
++	info->memory = gInfo->shared_info->frame_buffer_size;
++	info->dac_speed = gInfo->shared_info->timing.pixel_clock / 1000;
++	return B_OK;
++}
++
++
++sem_id
++tegra_dc_accelerant_retrace_semaphore(void)
++{
++	return gInfo->shared_info->vblank_sem;
++}
+diff --git a/src/add-ons/accelerants/tegra_dc/accelerant.h b/src/add-ons/accelerants/tegra_dc/accelerant.h
+new file mode 100644
+index 0000000000..10ed145c13
+--- /dev/null
++++ b/src/add-ons/accelerants/tegra_dc/accelerant.h
+@@ -0,0 +1,32 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef TEGRA_DC_ACCELERANT_H
++#define TEGRA_DC_ACCELERANT_H
++
++
++#include "tegra_dc_info.h"
++
++
++struct accelerant_info {
++	int					device;
++	bool				is_clone;
++
++	area_id				shared_info_area;
++	tegra_dc_shared_info* shared_info;
++
++	area_id				mode_list_area;
++	display_mode*		mode_list;
++
++	area_id				frame_buffer_area;
++		// clone of the scanout memory
++	void*				frame_buffer;
++};
++
++extern accelerant_info* gInfo;
++
++status_t create_mode_list();
++
++
++#endif	// TEGRA_DC_ACCELERANT_H
+diff --git a/src/add-ons/accelerants/tegra_dc/accelerant_protos.h b/src/add-ons/accelerants/tegra_dc/accelerant_protos.h
+new file mode 100644
+index 0000000000..b3b86ab16a
+--- /dev/null
++++ b/src/add-ons/accelerants/tegra_dc/accelerant_protos.h
+@@ -0,0 +1,73 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef TEGRA_DC_ACCELERANT_PROTOS_H
++#define TEGRA_DC_ACCELERANT_PROTOS_H
++
++
++#include <Accelerant.h>
++#include <video_overlay.h>
++
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// general
++status_t tegra_dc_init_accelerant(int fd);
++ssize_t tegra_dc_accelerant_clone_info_size(void);
++void tegra_dc_get_accelerant_clone_info(void* data);
++status_t tegra_dc_clone_accelerant(void* data);
++void tegra_dc_uninit_accelerant(void);
++status_t tegra_dc_get_accelerant_device_info(accelerant_device_info* info);
++sem_id tegra_dc_accelerant_retrace_semaphore(void);
++
++// modes
++uint32 tegra_dc_accelerant_mode_count(void);
++status_t tegra_dc_get_mode_list(display_mode* modes);
++status_t tegra_dc_propose_display_mode(display_mode* target,
++	const display_mode* low, const display_mode* high);
++status_t tegra_dc_set_display_mode(display_mode* mode);
++status_t tegra_dc_get_display_mode(display_mode* currentMode);
++status_t tegra_dc_get_preferred_display_mode(display_mode* preferredMode);
++status_t tegra_dc_get_edid_info(void* info, size_t size, uint32* _version);
++status_t tegra_dc_get_frame_buffer_config(frame_buffer_config* config);
++status_t tegra_dc_get_pixel_clock_limits(display_mode* mode, uint32* _low,
++	uint32* _high);
++
++// cursor
++status_t tegra_dc_set_cursor_bitmap(uint16 width, uint16 height, uint16 hotX,
++	uint16 hotY, color_space colorSpace, uint16 bytesPerRow,
++	const uint8* bitmapData);
++void tegra_dc_move_cursor(uint16 x, uint16 y);
++void tegra_dc_show_cursor(bool isVisible);
++
++// brightness and display power
++status_t tegra_dc_set_brightness(float brightness);
++status_t tegra_dc_get_brightness(float* brightness);
++uint32 tegra_dc_dpms_capabilities(void);
++uint32 tegra_dc_dpms_mode(void);
++status_t tegra_dc_set_dpms_mode(uint32 mode);
++
++// overlay
++uint32 tegra_dc_overlay_count(const display_mode* mode);
++const uint32* tegra_dc_overlay_supported_spaces(const display_mode* mode);
++uint32 tegra_dc_overlay_supported_features(uint32 colorSpace);
++const overlay_buffer* tegra_dc_allocate_overlay_buffer(color_space space,
++	uint16 width, uint16 height);
++status_t tegra_dc_release_overlay_buffer(const overlay_buffer* buffer);
++status_t tegra_dc_get_overlay_constraints(const display_mode* mode,
++	const overlay_buffer* buffer, overlay_constraints* constraints);
++overlay_token tegra_dc_allocate_overlay(void);
++status_t tegra_dc_release_overlay(overlay_token overlayToken);
++status_t tegra_dc_configure_overlay(overlay_token overlayToken,
++	const overlay_buffer* buffer, const overlay_window* window,
++	const overlay_view* view);
++
++#ifdef __cplusplus
++}
++#endif
++
++
++#endif	// TEGRA_DC_ACCELERANT_PROTOS_H
+diff --git a/src/add-ons/accelerants/tegra_dc/cursor.cpp b/src/add-ons/accelerants/tegra_dc/cursor.cpp
+new file mode 100644
+index 0000000000..8f54e7b621
+--- /dev/null
++++ b/src/add-ons/accelerants/tegra_dc/cursor.cpp
+@@ -0,0 +1,55 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++/*!	Hardware cursor: a 64x64 image with alpha, on a window of its own. */
++
++
++#include "accelerant.h"
++#include "accelerant_protos.h"
++
++#include <errno.h>
++#include <unistd.h>
++
++
++status_t
++tegra_dc_set_cursor_bitmap(uint16 width, uint16 height, uint16 hotX,
++	uint16 hotY, color_space colorSpace, uint16 bytesPerRow,
++	const uint8* bitmapData)
++{
++	if (colorSpace != B_RGBA32 || width > TEGRA_DC_CURSOR_SIZE
++		|| height > TEGRA_DC_CURSOR_SIZE) {
++		return B_BAD_VALUE;
++	}
++
++	tegra_dc_cursor_bitmap cursor;
++	cursor.width = width;
++	cursor.height = height;
++	cursor.hot_x = hotX;
++	cursor.hot_y = hotY;
++	cursor.bytes_per_row = bytesPerRow;
++	cursor.bits = bitmapData;
++	if (ioctl(gInfo->device, TEGRA_DC_SET_CURSOR_BITMAP, &cursor,
++			sizeof(cursor)) != 0) {
++		return errno;
++	}
++	return B_OK;
++}
++
++
++void
++tegra_dc_move_cursor(uint16 x, uint16 y)
++{
++	uint16 position[2] = { x, y };
++	ioctl(gInfo->device, TEGRA_DC_MOVE_CURSOR, position, sizeof(position));
++}
++
++
++void
++tegra_dc_show_cursor(bool isVisible)
++{
++	uint32 show = isVisible ? 1 : 0;
++	ioctl(gInfo->device, TEGRA_DC_SHOW_CURSOR, &show, sizeof(show));
++}
+diff --git a/src/add-ons/accelerants/tegra_dc/hooks.cpp b/src/add-ons/accelerants/tegra_dc/hooks.cpp
+new file mode 100644
+index 0000000000..19ae7e2779
+--- /dev/null
++++ b/src/add-ons/accelerants/tegra_dc/hooks.cpp
+@@ -0,0 +1,111 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "accelerant_protos.h"
++
++#include <driver_settings.h>
++
++
++/*!	"hardware_cursor false" in the tegra_dc driver settings leaves the
++	cursor to app_server.
++*/
++static bool
++hardware_cursor_enabled()
++{
++	void* settings = load_driver_settings("tegra_dc");
++	bool enabled = get_driver_boolean_parameter(settings, "hardware_cursor",
++		true, true);
++	unload_driver_settings(settings);
++	return enabled;
++}
++
++
++extern "C" void*
++get_accelerant_hook(uint32 feature, void* data)
++{
++	switch (feature) {
++		// general
++		case B_INIT_ACCELERANT:
++			return (void*)tegra_dc_init_accelerant;
++		case B_UNINIT_ACCELERANT:
++			return (void*)tegra_dc_uninit_accelerant;
++		case B_CLONE_ACCELERANT:
++			return (void*)tegra_dc_clone_accelerant;
++		case B_ACCELERANT_CLONE_INFO_SIZE:
++			return (void*)tegra_dc_accelerant_clone_info_size;
++		case B_GET_ACCELERANT_CLONE_INFO:
++			return (void*)tegra_dc_get_accelerant_clone_info;
++		case B_GET_ACCELERANT_DEVICE_INFO:
++			return (void*)tegra_dc_get_accelerant_device_info;
++		case B_ACCELERANT_RETRACE_SEMAPHORE:
++			return (void*)tegra_dc_accelerant_retrace_semaphore;
++
++		// modes
++		case B_ACCELERANT_MODE_COUNT:
++			return (void*)tegra_dc_accelerant_mode_count;
++		case B_GET_MODE_LIST:
++			return (void*)tegra_dc_get_mode_list;
++		case B_PROPOSE_DISPLAY_MODE:
++			return (void*)tegra_dc_propose_display_mode;
++		case B_SET_DISPLAY_MODE:
++			return (void*)tegra_dc_set_display_mode;
++		case B_GET_DISPLAY_MODE:
++			return (void*)tegra_dc_get_display_mode;
++		case B_GET_PREFERRED_DISPLAY_MODE:
++			return (void*)tegra_dc_get_preferred_display_mode;
++		case B_GET_EDID_INFO:
++			return (void*)tegra_dc_get_edid_info;
++		case B_GET_FRAME_BUFFER_CONFIG:
++			return (void*)tegra_dc_get_frame_buffer_config;
++		case B_GET_PIXEL_CLOCK_LIMITS:
++			return (void*)tegra_dc_get_pixel_clock_limits;
++
++		// cursor
++		case B_SET_CURSOR_BITMAP:
++			return hardware_cursor_enabled()
++				? (void*)tegra_dc_set_cursor_bitmap : NULL;
++		case B_MOVE_CURSOR:
++			return hardware_cursor_enabled()
++				? (void*)tegra_dc_move_cursor : NULL;
++		case B_SHOW_CURSOR:
++			return hardware_cursor_enabled()
++				? (void*)tegra_dc_show_cursor : NULL;
++
++		// brightness and display power
++		case B_SET_BRIGHTNESS:
++			return (void*)tegra_dc_set_brightness;
++		case B_GET_BRIGHTNESS:
++			return (void*)tegra_dc_get_brightness;
++		case B_DPMS_CAPABILITIES:
++			return (void*)tegra_dc_dpms_capabilities;
++		case B_DPMS_MODE:
++			return (void*)tegra_dc_dpms_mode;
++		case B_SET_DPMS_MODE:
++			return (void*)tegra_dc_set_dpms_mode;
++
++		// overlay
++		case B_OVERLAY_COUNT:
++			return (void*)tegra_dc_overlay_count;
++		case B_OVERLAY_SUPPORTED_SPACES:
++			return (void*)tegra_dc_overlay_supported_spaces;
++		case B_OVERLAY_SUPPORTED_FEATURES:
++			return (void*)tegra_dc_overlay_supported_features;
++		case B_ALLOCATE_OVERLAY_BUFFER:
++			return (void*)tegra_dc_allocate_overlay_buffer;
++		case B_RELEASE_OVERLAY_BUFFER:
++			return (void*)tegra_dc_release_overlay_buffer;
++		case B_GET_OVERLAY_CONSTRAINTS:
++			return (void*)tegra_dc_get_overlay_constraints;
++		case B_ALLOCATE_OVERLAY:
++			return (void*)tegra_dc_allocate_overlay;
++		case B_RELEASE_OVERLAY:
++			return (void*)tegra_dc_release_overlay;
++		case B_CONFIGURE_OVERLAY:
++			return (void*)tegra_dc_configure_overlay;
++	}
++
++	return NULL;
++}
+diff --git a/src/add-ons/accelerants/tegra_dc/mode.cpp b/src/add-ons/accelerants/tegra_dc/mode.cpp
+new file mode 100644
+index 0000000000..d1ad99607f
+--- /dev/null
++++ b/src/add-ons/accelerants/tegra_dc/mode.cpp
+@@ -0,0 +1,160 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++/*!	Modes: the panel as the firmware set it up, at 32 or 16 bits per pixel. */
++
++
++#include "accelerant.h"
++#include "accelerant_protos.h"
++
++#include <errno.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <create_display_modes.h>
++#include <video_overlay.h>
++
++
++static bool
++is_mode_supported(display_mode* mode)
++{
++	const display_timing& timing = gInfo->shared_info->timing;
++	return mode != NULL
++		&& mode->timing.h_display == timing.h_display
++		&& mode->timing.v_display == timing.v_display
++		&& mode->virtual_width == timing.h_display
++		&& mode->virtual_height == timing.v_display
++		&& (mode->space == B_RGB32 || mode->space == B_RGB16);
++}
++
++
++static void
++panel_mode(display_mode& mode, color_space space)
++{
++	memset(&mode, 0, sizeof(display_mode));
++	mode.timing = gInfo->shared_info->timing;
++	mode.space = space;
++	mode.virtual_width = mode.timing.h_display;
++	mode.virtual_height = mode.timing.v_display;
++	mode.flags = B_8_BIT_DAC | B_PARALLEL_ACCESS | B_HARDWARE_CURSOR
++		| B_SUPPORTS_OVERLAYS;
++	if (gInfo->shared_info->has_backlight)
++		mode.flags |= B_DPMS;
++}
++
++
++status_t
++create_mode_list()
++{
++	const color_space spaces[] = { B_RGB32, B_RGB16 };
++	display_mode mode;
++	panel_mode(mode, B_RGB32);
++
++	gInfo->mode_list_area = create_display_modes("tegra_dc modes", NULL,
++		&mode, 1, spaces, B_COUNT_OF(spaces), is_mode_supported,
++		&gInfo->mode_list, &gInfo->shared_info->mode_count);
++	if (gInfo->mode_list_area < 0)
++		return gInfo->mode_list_area;
++
++	gInfo->shared_info->mode_list_area = gInfo->mode_list_area;
++	return B_OK;
++}
++
++
++//	#pragma mark -
++
++
++uint32
++tegra_dc_accelerant_mode_count(void)
++{
++	return gInfo->shared_info->mode_count;
++}
++
++
++status_t
++tegra_dc_get_mode_list(display_mode* modes)
++{
++	memcpy(modes, gInfo->mode_list,
++		gInfo->shared_info->mode_count * sizeof(display_mode));
++	return B_OK;
++}
++
++
++status_t
++tegra_dc_propose_display_mode(display_mode* target, const display_mode* low,
++	const display_mode* high)
++{
++	// The panel has one timing: keep the color space, take everything else
++	color_space space = (color_space)target->space;
++	if (space != B_RGB16)
++		space = B_RGB32;
++	panel_mode(*target, space);
++	return B_OK;
++}
++
++
++status_t
++tegra_dc_set_display_mode(display_mode* mode)
++{
++	if (!is_mode_supported(mode))
++		return B_BAD_VALUE;
++	if (ioctl(gInfo->device, TEGRA_DC_SET_DISPLAY_MODE, mode,
++			sizeof(display_mode)) != 0) {
++		return errno;
++	}
++	return B_OK;
++}
++
++
++status_t
++tegra_dc_get_display_mode(display_mode* currentMode)
++{
++	*currentMode = gInfo->shared_info->current_mode;
++	return B_OK;
++}
++
++
++status_t
++tegra_dc_get_preferred_display_mode(display_mode* preferredMode)
++{
++	panel_mode(*preferredMode, B_RGB32);
++	return B_OK;
++}
++
++
++status_t
++tegra_dc_get_edid_info(void* info, size_t size, uint32* _version)
++{
++	if (!gInfo->shared_info->has_edid)
++		return B_ERROR;
++	if (size < sizeof(edid1_info))
++		return B_BUFFER_OVERFLOW;
++
++	memcpy(info, &gInfo->shared_info->edid_info, sizeof(edid1_info));
++	*_version = EDID_VERSION_1;
++	return B_OK;
++}
++
++
++status_t
++tegra_dc_get_frame_buffer_config(frame_buffer_config* config)
++{
++	config->frame_buffer = gInfo->frame_buffer;
++	config->frame_buffer_dma = NULL;
++	config->bytes_per_row = gInfo->shared_info->bytes_per_row;
++	return B_OK;
++}
++
++
++status_t
++tegra_dc_get_pixel_clock_limits(display_mode* mode, uint32* _low,
++	uint32* _high)
++{
++	// Only the panel's own pixel clock
++	*_low = *_high = gInfo->shared_info->timing.pixel_clock;
++	return B_OK;
++}
+diff --git a/src/add-ons/accelerants/tegra_dc/overlay.cpp b/src/add-ons/accelerants/tegra_dc/overlay.cpp
+new file mode 100644
+index 0000000000..d6747c3d08
+--- /dev/null
++++ b/src/add-ons/accelerants/tegra_dc/overlay.cpp
+@@ -0,0 +1,279 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++/*!	Video overlay: window B of the display controller scales a YCbCr 4:2:2
++	or RGB32 frame, converts it to RGB, and shows it under the desktop where
++	that has the key color. The frames are physically contiguous buffers the
++	kernel driver allocates.
++*/
++
++
++#include "accelerant.h"
++#include "accelerant_protos.h"
++
++#include <errno.h>
++#include <new>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++
++struct tegra_dc_overlay {
++	overlay_buffer		buffer;		// first, app_server sees only this
++	area_id				handle;
++	area_id				area;
++};
++
++
++static const uint32 kSupportedSpaces[] = { B_YCbCr422, B_RGB32, 0 };
++
++static int32 sOverlayToken;
++static bool sOverlayAllocated;
++
++
++static uint32
++bytes_per_pixel(uint32 space)
++{
++	return space == B_YCbCr422 ? 2 : 4;
++}
++
++
++/*!	The key compares window A pixels before their expansion to 24 bits; red
++	is the low byte.
++*/
++static void
++key_range(const overlay_window& window, uint32& lower, uint32& upper)
++{
++	const overlay_key_color* keys[] = { &window.red, &window.green,
++		&window.blue };
++	uint32 shifts[] = { 0, 0, 0 };
++	if (gInfo->shared_info->current_mode.space == B_RGB16) {
++		shifts[0] = 3;
++		shifts[1] = 2;
++		shifts[2] = 3;
++	}
++
++	lower = upper = 0;
++	for (int32 i = 0; i < 3; i++) {
++		uint32 low = (keys[i]->value & keys[i]->mask) << shifts[i];
++		uint32 high = ((keys[i]->value | ~keys[i]->mask) << shifts[i]) & 0xff;
++		lower |= (low & 0xff) << (8 * i);
++		upper |= high << (8 * i);
++	}
++}
++
++
++static status_t
++hide_overlay()
++{
++	tegra_dc_overlay_config config = {};
++	if (ioctl(gInfo->device, TEGRA_DC_CONFIGURE_OVERLAY, &config,
++			sizeof(config)) != 0) {
++		return errno;
++	}
++	return B_OK;
++}
++
++
++//	#pragma mark -
++
++
++uint32
++tegra_dc_overlay_count(const display_mode* mode)
++{
++	return 1;
++}
++
++
++const uint32*
++tegra_dc_overlay_supported_spaces(const display_mode* mode)
++{
++	return kSupportedSpaces;
++}
++
++
++uint32
++tegra_dc_overlay_supported_features(uint32 colorSpace)
++{
++	return B_OVERLAY_COLOR_KEY | B_OVERLAY_HORIZONTAL_FILTERING
++		| B_OVERLAY_VERTICAL_FILTERING;
++}
++
++
++const overlay_buffer*
++tegra_dc_allocate_overlay_buffer(color_space colorSpace, uint16 width,
++	uint16 height)
++{
++	if (colorSpace != B_YCbCr422 && colorSpace != B_RGB32)
++		return NULL;
++	if (width == 0 || height == 0 || width > 2048 || height > 2048)
++		return NULL;
++
++	tegra_dc_overlay* overlay = new(std::nothrow) tegra_dc_overlay;
++	if (overlay == NULL)
++		return NULL;
++
++	uint32 bytesPerRow = (width * bytes_per_pixel(colorSpace) + 63) & ~63u;
++	tegra_dc_overlay_buffer request = {};
++	request.size = bytesPerRow * height;
++	if (ioctl(gInfo->device, TEGRA_DC_ALLOCATE_OVERLAY_BUFFER, &request,
++			sizeof(request)) != 0) {
++		delete overlay;
++		return NULL;
++	}
++
++	overlay->handle = request.handle;
++	overlay->area = request.area;
++	overlay->buffer.space = colorSpace;
++	overlay->buffer.width = width;
++	overlay->buffer.height = height;
++	overlay->buffer.bytes_per_row = bytesPerRow;
++	overlay->buffer.buffer = request.address;
++	overlay->buffer.buffer_dma = (void*)(addr_t)request.physical;
++	return &overlay->buffer;
++}
++
++
++status_t
++tegra_dc_release_overlay_buffer(const overlay_buffer* buffer)
++{
++	if (buffer == NULL)
++		return B_BAD_VALUE;
++
++	tegra_dc_overlay* overlay = (tegra_dc_overlay*)buffer;
++	delete_area(overlay->area);
++	ioctl(gInfo->device, TEGRA_DC_RELEASE_OVERLAY_BUFFER, &overlay->handle,
++		sizeof(overlay->handle));
++	delete overlay;
++	return B_OK;
++}
++
++
++status_t
++tegra_dc_get_overlay_constraints(const display_mode* mode,
++	const overlay_buffer* buffer, overlay_constraints* constraints)
++{
++	if (buffer == NULL || constraints == NULL)
++		return B_BAD_VALUE;
++
++	memset(constraints, 0, sizeof(overlay_constraints));
++
++	// 4:2:2 frames start on a pixel pair
++	uint16 alignment = buffer->space == B_YCbCr422 ? 1 : 0;
++	constraints->view.h_alignment = alignment;
++	constraints->view.width_alignment = alignment;
++	constraints->view.width.min = 2;
++	constraints->view.width.max = buffer->width;
++	constraints->view.height.min = 2;
++	constraints->view.height.max = buffer->height;
++
++	constraints->window.width.min = 2;
++	constraints->window.width.max = 4096;
++	constraints->window.height.min = 2;
++	constraints->window.height.max = 4096;
++
++	// The DDA steps at most 8 (2 bytes per pixel) or 4 (4 bytes) source
++	// pixels horizontally and 15 lines vertically
++	constraints->h_scale.min = buffer->space == B_YCbCr422 ? 1.0f / 8 : 1.0f / 4;
++	constraints->h_scale.max = 16.0f;
++	constraints->v_scale.min = 1.0f / 15;
++	constraints->v_scale.max = 16.0f;
++	return B_OK;
++}
++
++
++overlay_token
++tegra_dc_allocate_overlay(void)
++{
++	if (sOverlayAllocated)
++		return NULL;
++	sOverlayAllocated = true;
++	return (overlay_token)&sOverlayToken;
++}
++
++
++status_t
++tegra_dc_release_overlay(overlay_token overlayToken)
++{
++	if (overlayToken != (overlay_token)&sOverlayToken || !sOverlayAllocated)
++		return B_BAD_VALUE;
++
++	hide_overlay();
++	sOverlayAllocated = false;
++	return B_OK;
++}
++
++
++status_t
++tegra_dc_configure_overlay(overlay_token overlayToken,
++	const overlay_buffer* buffer, const overlay_window* window,
++	const overlay_view* view)
++{
++	if (overlayToken != (overlay_token)&sOverlayToken)
++		return B_BAD_VALUE;
++	if (buffer == NULL || window == NULL || view == NULL)
++		return hide_overlay();
++
++	const tegra_dc_overlay* overlay = (const tegra_dc_overlay*)buffer;
++	if (window->width == 0 || window->height == 0 || view->width == 0
++		|| view->height == 0) {
++		return hide_overlay();
++	}
++
++	// Clip the window to the screen, and the view with it
++	const display_timing& timing = gInfo->shared_info->current_mode.timing;
++	int32 left = max_c(window->h_start, 0);
++	int32 top = max_c(window->v_start, 0);
++	int32 right = min_c(window->h_start + window->width,
++		(int32)timing.h_display);
++	int32 bottom = min_c(window->v_start + window->height,
++		(int32)timing.v_display);
++	if (left >= right || top >= bottom)
++		return hide_overlay();
++
++	float hScale = (float)view->width / window->width;
++	float vScale = (float)view->height / window->height;
++	int32 sourceLeft = view->h_start
++		+ (int32)((left - window->h_start) * hScale + 0.5f);
++	int32 sourceTop = view->v_start
++		+ (int32)((top - window->v_start) * vScale + 0.5f);
++	int32 sourceRight = view->h_start
++		+ (int32)((right - window->h_start) * hScale + 0.5f);
++	int32 sourceBottom = view->v_start
++		+ (int32)((bottom - window->v_start) * vScale + 0.5f);
++	sourceRight = min_c(sourceRight, (int32)buffer->width);
++	sourceBottom = min_c(sourceBottom, (int32)buffer->height);
++	if (sourceLeft >= sourceRight || sourceTop >= sourceBottom)
++		return hide_overlay();
++
++	tegra_dc_overlay_config config = {};
++	config.enable = 1;
++	config.handle = overlay->handle;
++	config.space = buffer->space;
++	config.bytes_per_row = buffer->bytes_per_row;
++	config.source_x = sourceLeft;
++	config.source_y = sourceTop;
++	config.source_width = sourceRight - sourceLeft;
++	config.source_height = sourceBottom - sourceTop;
++	config.x = left;
++	config.y = top;
++	config.width = right - left;
++	config.height = bottom - top;
++	if ((window->flags & B_OVERLAY_HORIZONTAL_FILTERING) != 0)
++		config.filter |= 1;
++	if ((window->flags & B_OVERLAY_VERTICAL_FILTERING) != 0)
++		config.filter |= 2;
++	if ((window->flags & B_OVERLAY_COLOR_KEY) != 0) {
++		config.color_key = true;
++		key_range(*window, config.key_lower, config.key_upper);
++	}
++
++	if (ioctl(gInfo->device, TEGRA_DC_CONFIGURE_OVERLAY, &config,
++			sizeof(config)) != 0) {
++		return errno;
++	}
++	return B_OK;
++}
+diff --git a/src/add-ons/accelerants/tegra_dc/power.cpp b/src/add-ons/accelerants/tegra_dc/power.cpp
+new file mode 100644
+index 0000000000..282cde3523
+--- /dev/null
++++ b/src/add-ons/accelerants/tegra_dc/power.cpp
+@@ -0,0 +1,81 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++/*!	Brightness and display power: the panel backlight, through the kernel
++	driver.
++*/
++
++
++#include "accelerant.h"
++#include "accelerant_protos.h"
++
++#include <errno.h>
++#include <unistd.h>
++
++
++status_t
++tegra_dc_set_brightness(float brightness)
++{
++	if (!gInfo->shared_info->has_backlight)
++		return B_NOT_SUPPORTED;
++
++	// 1 - 256: never fully off, that is what DPMS is for
++	if (brightness < 0)
++		brightness = 0;
++	if (brightness > 1)
++		brightness = 1;
++	uint32 duty = (uint32)(brightness * 255 + 0.5f) + 1;
++	if (ioctl(gInfo->device, TEGRA_DC_SET_BRIGHTNESS, &duty, sizeof(duty))
++			!= 0) {
++		return errno;
++	}
++	return B_OK;
++}
++
++
++status_t
++tegra_dc_get_brightness(float* brightness)
++{
++	if (!gInfo->shared_info->has_backlight)
++		return B_NOT_SUPPORTED;
++
++	uint32 duty;
++	if (ioctl(gInfo->device, TEGRA_DC_GET_BRIGHTNESS, &duty, sizeof(duty))
++			!= 0) {
++		return errno;
++	}
++	*brightness = duty <= 1 ? 0 : (duty - 1) / 255.0f;
++	return B_OK;
++}
++
++
++uint32
++tegra_dc_dpms_capabilities(void)
++{
++	if (!gInfo->shared_info->has_backlight)
++		return B_DPMS_ON;
++	return B_DPMS_ON | B_DPMS_STAND_BY | B_DPMS_SUSPEND | B_DPMS_OFF;
++}
++
++
++uint32
++tegra_dc_dpms_mode(void)
++{
++	return gInfo->shared_info->dpms_mode;
++}
++
++
++status_t
++tegra_dc_set_dpms_mode(uint32 mode)
++{
++	if (!gInfo->shared_info->has_backlight)
++		return mode == B_DPMS_ON ? B_OK : B_NOT_SUPPORTED;
++	if (ioctl(gInfo->device, TEGRA_DC_SET_DPMS_MODE, &mode, sizeof(mode))
++			!= 0) {
++		return errno;
++	}
++	return B_OK;
++}
+diff --git a/src/add-ons/kernel/drivers/graphics/Jamfile b/src/add-ons/kernel/drivers/graphics/Jamfile
+index cfaa4e4878..08fc69f278 100644
+--- a/src/add-ons/kernel/drivers/graphics/Jamfile
++++ b/src/add-ons/kernel/drivers/graphics/Jamfile
+@@ -14,6 +14,7 @@ SubInclude HAIKU_TOP src add-ons kernel drivers graphics radeon ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics radeon_hd ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics s3 ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics skeleton ;
++SubInclude HAIKU_TOP src add-ons kernel drivers graphics tegra_dc ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics vesa ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics via ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics virtio ;
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/Jamfile b/src/add-ons/kernel/drivers/graphics/tegra_dc/Jamfile
+new file mode 100644
+index 0000000000..ff28148c1a
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/Jamfile
+@@ -0,0 +1,13 @@
++SubDir HAIKU_TOP src add-ons kernel drivers graphics tegra_dc ;
++
++UsePrivateHeaders [ FDirName graphics common ] ;
++UsePrivateHeaders [ FDirName graphics tegra_dc ] ;
++UsePrivateKernelHeaders ;
++UseLibraryHeaders [ FDirName libfdt ] ;
++
++KernelAddon tegra_dc :
++	hdmi.cpp
++	tegra_dc.cpp
++	:
++	kernel_fdt.a
++	;
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
+new file mode 100644
+index 0000000000..d55c94176a
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.cpp
+@@ -0,0 +1,1783 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++/*!	HDMI output of the Tegra 2: while a screen is plugged in, display
++	controller B scans out the panel's frame buffer, scaled to the screen's
++	mode, and the HDMI block sends it out as TMDS.
++
++	The register descriptions of the HDMI block are not in the public
++	Technical Reference Manual; the register layout and the power up
++	sequence follow the Linux tegra-drm driver, used as documentation only.
++	On the Toshiba AC100 the HDMI block is powered by LDO7 (AVDD_HDMI,
++	3.3 V) and LDO8 (AVDD_HDMI_PLL, 1.8 V) of the TPS6586x, the hot plug
++	detect line is GPIO N7 and the DDC bus is I2C2.
++*/
++
++
++#include "hdmi.h"
++#include "tegra_dc_info.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <KernelExport.h>
++#include <OS.h>
++#include <driver_settings.h>
++#include <lock.h>
++#include <util/AutoLock.h>
++
++
++#define ERROR(x...) dprintf("tegra_dc: hdmi: " x)
++
++
++extern "C" status_t arm_dvc_i2c_read(uint8 address, uint8 reg, uint8* data,
++	uint32 length);
++extern "C" status_t arm_dvc_i2c_write(uint8 address, uint8 reg,
++	const uint8* data, uint32 length);
++
++
++// TPS6586x power management IC
++#define TPS6586X_ADDRESS			0x34
++#define TPS6586X_SUPPLYENC			0x12
++#define TPS6586X_SUPPLYEND			0x13
++#define TPS6586X_LDO7				(1 << 5)	// AVDD_HDMI
++#define TPS6586X_LDO8				(1 << 6)	// AVDD_HDMI_PLL
++
++// Clock and reset controller
++#define TEGRA20_CAR_BASE			0x60006000
++#define CAR_RST_DEVICES_L			0x004
++#define CAR_RST_DEVICES_H			0x008
++#define CAR_CLK_OUT_ENB_L			0x010
++#define CAR_CLK_OUT_ENB_H			0x014
++#define CAR_PLLD_BASE				0x0d0
++#define CAR_PLLD_MISC				0x0dc
++#define CAR_CLK_SOURCE_DISP2		0x13c
++#define CAR_CLK_SOURCE_HDMI			0x18c
++#define CAR_CLK_SOURCE_I2C2			0x198
++#define CAR_DISP2_BIT				(1u << 26)	// in the L registers
++#define CAR_HDMI_BIT				(1u << 19)	// in the H registers
++#define CAR_I2C2_BIT				(1u << 22)	// in the H registers
++#define CAR_SOURCE_PLL_D_OUT0		(1u << 30)
++#define CAR_SOURCE_PLL_P			(0u << 30)
++
++#define PLLD_BYPASS					(1u << 31)
++#define PLLD_ENABLE					(1u << 30)
++#define PLLD_LOCK					(1u << 27)
++#define PLLD_DIVN(n)				((uint32)(n) << 8)
++#define PLLD_DIVM(m)				((uint32)(m) << 0)
++#define PLLD_MISC_LOCK_ENABLE		(1u << 22)
++#define PLLD_MISC_CPCON(x)			((uint32)(x) << 8)
++#define PLLD_MISC_LFCON(x)			((uint32)(x) << 4)
++#define OSC_KHZ						12000
++
++// GPIO port N is in bank 3; the masked registers are 0x800 further
++#define TEGRA20_GPIO_BASE			0x6000d000
++#define GPIO_BANK3_PORT1			(0x180 + 0x04)
++#define GPIO_CNF					0x000
++#define GPIO_OE						0x010
++#define GPIO_IN						0x030
++#define GPIO_MASKED					0x800
++#define HOT_PLUG_BIT				7
++
++// I2C2, the DDC bus
++#define TEGRA20_I2C2_BASE			0x7000c400
++#define I2C_CNFG					0x000
++#define I2C_CNFG_PACKET_MODE		(1u << 10)
++#define I2C_CNFG_NEW_MASTER_FSM		(1u << 11)
++#define I2C_CNFG_DEBOUNCE(x)		((uint32)(x) << 12)
++#define I2C_SL_CNFG					0x020
++#define I2C_SL_CNFG_NACK			(1u << 1)
++#define I2C_SL_CNFG_NEWSL			(1u << 2)
++#define I2C_SL_ADDR1				0x02c
++#define I2C_SL_ADDR2				0x030
++#define I2C_TX_FIFO					0x050
++#define I2C_RX_FIFO					0x054
++#define I2C_FIFO_CONTROL			0x05c
++#define I2C_FIFO_FLUSH				0x03
++#define I2C_FIFO_STATUS				0x060
++#define I2C_FIFO_STATUS_RX(x)		((x) & 0xf)
++#define I2C_FIFO_STATUS_TX(x)		(((x) >> 4) & 0xf)
++#define I2C_INT_STATUS				0x068
++#define I2C_INT_ARBITRATION_LOST	(1u << 2)
++#define I2C_INT_NO_ACK				(1u << 3)
++#define I2C_INT_PACKET_COMPLETE		(1u << 7)
++#define I2C_PACKET_PROTOCOL_I2C		(1u << 4)
++#define I2C_PACKET_ID(id)			((uint32)(id) << 16)
++#define I2C_HEADER_REPEAT_START		(1u << 16)
++#define I2C_HEADER_IE_ENABLE		(1u << 17)
++#define I2C_HEADER_READ				(1u << 19)
++#define DDC_BUS_KHZ					100
++#define DDC_EDID_ADDRESS			0x50
++
++// Display controller B (word offsets)
++#define TEGRA20_DC_B_BASE			0x54240000
++#define TEGRA20_DC_SIZE				0x10000
++#define DC_CMD_DISPLAY_COMMAND		0x032
++#define DISPLAY_CTRL_C_DISPLAY		(1u << 5)
++#define DC_CMD_DISPLAY_POWER_CONTROL	0x036
++#define DISPLAY_POWER_ALL			0x00050155	// PW0-PW4, PM0, PM1
++#define DC_CMD_INT_MASK				0x038
++#define DC_CMD_INT_ENABLE			0x039
++#define DC_CMD_STATE_CONTROL		0x041
++#define STATE_GENERAL_ACT_REQ		(1u << 0)
++#define STATE_WIN_A_ACT_REQ			(1u << 1)
++#define STATE_WIN_B_ACT_REQ			(1u << 2)
++#define STATE_WIN_C_ACT_REQ			(1u << 3)
++#define STATE_WIN_B_UPDATE			(1u << 10)
++#define STATE_GENERAL_UPDATE		(1u << 8)
++#define STATE_WIN_A_UPDATE			(1u << 9)
++#define STATE_WIN_C_UPDATE			(1u << 11)
++#define DC_CMD_DISPLAY_WINDOW_HEADER	0x042
++#define WINDOW_A_SELECT				(1u << 4)
++#define WINDOW_B_SELECT				(1u << 5)
++#define WINDOW_C_SELECT				(1u << 6)
++#define DC_DISP_SIGNAL_OPTIONS0		0x400
++#define H_PULSE2_ENABLE				(1u << 12)
++#define DC_DISP_WIN_OPTIONS			0x402
++#define HDMI_ENABLE					(1u << 30)
++#define DC_DISP_MEM_HIGH_PRIORITY	0x403
++#define DC_DISP_MEM_HIGH_PRIORITY_TIMER	0x404
++#define DC_DISP_TIMING_OPTIONS		0x405
++#define DC_DISP_REF_TO_SYNC			0x406
++#define DC_DISP_SYNC_WIDTH			0x407
++#define DC_DISP_BACK_PORCH			0x408
++#define DC_DISP_ACTIVE				0x409
++#define DC_DISP_FRONT_PORCH			0x40a
++#define DC_DISP_H_PULSE2_CONTROL	0x415
++#define PULSE_QUAL_VACTIVE			(2u << 6)
++#define PULSE_LAST_END_A			(1u << 8)
++#define DC_DISP_H_PULSE2_POSITION_A	0x416
++#define DC_DISP_CLOCK_CONTROL		0x42e
++#define DC_DISP_INTERFACE_CONTROL	0x42f
++#define DC_DISP_COLOR_CONTROL		0x430
++#define BASE_COLOR_SIZE_888			8
++#define DC_DISP_BORDER_COLOR		0x435
++
++#define WIN_OPTIONS					0x700
++#define WIN_OPTIONS_COLOR_EXPAND	(1u << 6)
++#define WIN_OPTIONS_ENABLE			(1u << 30)
++#define WIN_BYTE_SWAP				0x701
++#define WIN_COLOR_DEPTH				0x703
++#define WIN_POSITION				0x704
++#define WIN_SIZE					0x705
++#define WIN_PRESCALED_SIZE			0x706
++#define WIN_H_INITIAL_DDA			0x707
++#define WIN_V_INITIAL_DDA			0x708
++#define WIN_DDA_INCREMENT			0x709
++#define WIN_LINE_STRIDE				0x70a
++#define WIN_BUF_STRIDE				0x70b
++#define WIN_BUFFER_ADDR_MODE		0x70d
++#define WIN_OPTIONS_H_FILTER		(1u << 8)
++#define WIN_OPTIONS_V_FILTER		(1u << 10)
++#define WIN_OPTIONS_CSC				(1u << 18)
++#define WINC_H_FILTER_P00			0x601
++#define WINC_CSC_YOF				0x611
++#define WINC_V_FILTER_P00			0x619
++#define DC_DISP_COLOR_KEY0_LOWER	0x436
++#define DC_DISP_COLOR_KEY0_UPPER	0x437
++#define BLEND_CKEY0					1u
++#define MAX_V_DDA					0xf000
++#define WIN_BLEND_NOKEY				0x70f
++#define WIN_BLEND_1WIN				0x710
++#define WIN_BLEND_2WIN_X			0x711
++#define WIN_BLEND_2WIN_Y			0x712
++#define WIN_BLEND_3WIN				0x713
++#define WINBUF_START_ADDR			0x800
++#define WINBUF_ADDR_H_OFFSET		0x806
++#define WINBUF_ADDR_V_OFFSET		0x808
++#define BLEND_FIX_255				0x00ffff00
++#define BLEND_ALPHA_255				0x00ffff04
++#define BLEND_DEPENDENT				0x00000008
++#define COLOR_DEPTH_B5G6R5			6
++#define COLOR_DEPTH_B8G8R8A8		12
++#define CURSOR_BYTES_PER_ROW		256
++
++// HDMI block (word offsets)
++#define TEGRA20_HDMI_BASE			0x54280000
++#define HDMI_SIZE					0x1000
++#define HDMI_SOR_STATE0				0x01
++#define SOR_STATE_UPDATE			(1u << 0)
++#define HDMI_SOR_STATE1				0x02
++#define SOR_STATE_HEAD_OPMODE_AWAKE	(2u << 0)
++#define SOR_STATE_ORMODE_NORMAL		(1u << 2)
++#define SOR_STATE_ATTACHED			(1u << 3)
++#define HDMI_SOR_STATE2				0x03
++#define SOR_STATE_OWNER_HEAD0		(1u << 0)
++#define SOR_STATE_SUBOWNER_BOTH		(3u << 4)
++#define SOR_STATE_CRCMODE_COMPLETE	(1u << 6)
++#define SOR_STATE_PROTOCOL_TMDS_A	(1u << 8)
++#define SOR_STATE_HSYNC_NEGATIVE	(1u << 12)
++#define SOR_STATE_VSYNC_NEGATIVE	(1u << 13)
++#define HDMI_AUDIO_INFOFRAME_CTRL	0x1e
++#define HDMI_AUDIO_INFOFRAME_HEADER	0x20
++#define HDMI_AVI_INFOFRAME_CTRL		0x23
++#define INFOFRAME_CTRL_ENABLE		(1u << 0)
++#define HDMI_AVI_INFOFRAME_HEADER	0x25
++#define HDMI_GENERIC_CTRL			0x2a
++#define GENERIC_CTRL_AUDIO			(1u << 16)
++#define HDMI_ACR_CTRL				0x35
++#define HDMI_ACR_SUBPACK_LOW(i)		(0x36 + 2 * (i))	// 32, 44.1, 88.2,
++#define HDMI_ACR_SUBPACK_HIGH(i)	(0x37 + 2 * (i))	// 176.4, 48, 96, 192 kHz
++#define ACR_SUBPACK_CTS(x)			(((uint32)(x) & 0xffffff) << 8)
++#define ACR_SUBPACK_N(x)			((uint32)(x) & 0xffffff)
++#define ACR_ENABLE					(1u << 31)
++#define HDMI_SPARE					0x4f
++#define SPARE_HW_CTS				(1u << 0)
++#define SPARE_FORCE_SW_CTS			(1u << 1)
++#define SPARE_CTS_RESET_VAL(x)		(((uint32)(x) & 0x7) << 16)
++#define HDMI_AUDIO_FS(x)			(0x82 + (x))
++#define AUDIO_FS_LOW(x)				((uint32)(x) & 0xfff)
++#define AUDIO_FS_HIGH(x)			(((uint32)(x) & 0xfff) << 16)
++#define HDMI_AUDIO_CNTRL0			0x8b
++#define AUDIO_CNTRL0_ERROR_TOLERANCE(x)	((uint32)(x) & 0xff)
++#define AUDIO_CNTRL0_SOURCE_SPDIF	(1u << 20)
++#define AUDIO_CNTRL0_FRAMES_PER_BLOCK(x)	(((uint32)(x) & 0xff) << 24)
++#define HDMI_AUDIO_N				0x8c
++#define AUDIO_N_VALUE(x)			((uint32)(x) & 0xfffff)
++#define AUDIO_N_RESETF				(1u << 20)
++#define AUDIO_N_GENERATE_ALTERNATE	(1u << 24)
++#define HDMI_AUDIO_CLOCK			216000000	// Hz
++#define HDMI_CTRL					0x44
++#define HDMI_CTRL_REKEY(x)			((uint32)(x) & 0x7f)
++#define HDMI_CTRL_MAX_AC_PACKET(x)	(((uint32)(x) & 0x1f) << 16)
++#define HDMI_CTRL_ENABLE			(1u << 30)
++#define HDMI_REKEY					56
++#define HDMI_VSYNC_WINDOW			0x46
++#define VSYNC_WINDOW_END(x)			((uint32)(x) & 0x3ff)
++#define VSYNC_WINDOW_START(x)		(((uint32)(x) & 0x3ff) << 16)
++#define VSYNC_WINDOW_ENABLE			(1u << 31)
++#define HDMI_SOR_PWR				0x55
++#define SOR_PWR_NORMAL_STATE_PU		(1u << 0)
++#define SOR_PWR_SETTING_NEW			(1u << 31)	// trigger, then pending
++#define HDMI_SOR_PLL0				0x57
++#define SOR_PLL_PWR					(1u << 0)
++#define SOR_PLL_PDBG				(1u << 1)
++#define SOR_PLL_RESISTORSEL			(1u << 4)
++#define SOR_PLL_VCOCAP(x)			(((uint32)(x) & 0xf) << 8)
++#define SOR_PLL_BG_V17_S(x)			(((uint32)(x) & 0xf) << 12)
++#define SOR_PLL_ICHPMP(x)			(((uint32)(x) & 0xf) << 24)
++#define SOR_PLL_TX_REG_LOAD(x)		(((uint32)(x) & 0xf) << 28)
++#define HDMI_SOR_PLL1				0x58
++#define SOR_PLL_TMDS_TERM_ENABLE	(1u << 8)
++#define SOR_PLL_PE_EN				(1u << 28)
++#define HDMI_SOR_CSTM				0x5a
++#define SOR_CSTM_ROTCLK(x)			(((uint32)(x) & 0xf) << 24)
++#define SOR_CSTM_PLLDIV				(1u << 21)
++#define SOR_CSTM_LVDS_ENABLE		(1u << 16)
++#define SOR_CSTM_MODE_MASK			(3u << 12)
++#define SOR_CSTM_MODE_TMDS			(1u << 12)
++#define HDMI_SOR_SEQ_CTL			0x5f
++#define SOR_SEQ_PD_PC(x)			(((uint32)(x) & 0xf) << 8)
++#define SOR_SEQ_PD_PC_ALT(x)		(((uint32)(x) & 0xf) << 12)
++#define HDMI_SOR_SEQ_INST(x)		(0x60 + (x))
++#define SOR_SEQ_INST_WAIT_TIME(x)	((uint32)(x) & 0x3ff)
++#define SOR_SEQ_INST_WAIT_VSYNC		(2u << 12)
++#define SOR_SEQ_INST_HALT			(1u << 15)
++#define SOR_SEQ_INST_DRIVE_PWM_LOW	(1u << 23)
++#define HDMI_SOR_LANE_DRIVE_CURRENT	0x7e
++#define DRIVE_CURRENT_ALL(x)		((uint32)(x) * 0x01010101)
++#define DRIVE_CURRENT_7_125_MA		0x0f
++#define DRIVE_CURRENT_FUSE_OVERRIDE	(1u << 31)
++#define HDMI_SOR_REFCLK				0x95
++#define SOR_REFCLK_DIV_INT(x)		(((uint32)(x) & 0xff) << 8)
++#define SOR_REFCLK_DIV_FRAC(x)		(((uint32)(x) & 0x3) << 6)
++#define HDMI_INPUT_CONTROL			0x97
++#define HDMI_SOURCE_DISPLAY_B		(1u << 0)
++#define HDMI_VIDEO_RANGE_LIMITED	(1u << 1)
++#define HDMI_PE_CURRENT				0x99
++#define PE_CURRENT_ALL(x)			((uint32)(x) * 0x01010101)
++
++#define POLL_INTERVAL				500000
++#define EDID_SIZE					256
++
++
++struct hdmi_mode {
++	uint32	pixel_clock;	// kHz
++	uint16	h_display, h_sync_start, h_sync_end, h_total;
++	uint16	v_display, v_sync_start, v_sync_end, v_total;
++	bool	h_sync_positive;
++	bool	v_sync_positive;
++	uint8	vic;			// CEA video identification code, or 0
++};
++
++
++// 1280x720 at 60 Hz (CEA-861 VIC 4), for screens without a usable EDID mode
++static const hdmi_mode k720p = {
++	74250, 1280, 1390, 1430, 1650, 720, 725, 730, 750, true, true, 4
++};
++
++
++// TMDS output settings; the driver settings can change them for screens or
++// cables that need it (they are read again at each hot plug)
++struct tmds_settings {
++	bool	force_dvi;
++	uint32	pre_emphasis;	// PE_CURRENT units of 0.5 mA, 0 = off
++	uint32	drive_current;	// DRIVE_CURRENT code, 1.5 mA + n * 0.375 mA
++	uint32	vco_cap;
++
++	// experiments with the HDMI audio, also from the driver settings
++	bool	force_720p;		// "hdmi_mode 720p"
++	bool	preferred_mode;	// "hdmi_mode preferred"
++	bool	hardware_cts;	// "hdmi_hw_cts": the block measures CTS itself
++	bool	audio_auto;		// "hdmi_audio_auto": source chosen by the block
++							// (the default: S/PDIF forced sounded worse)
++};
++
++
++static struct {
++	mutex			lock;
++	thread_id		thread;
++	volatile bool	quit;
++
++	area_id			car_area;
++	volatile uint32* car;
++	area_id			gpio_area;
++	volatile uint32* gpio;
++	area_id			i2c_area;
++	volatile uint32* i2c;
++	area_id			dc_area;
++	volatile uint32* dc;
++	area_id			hdmi_area;
++	volatile uint32* hdmi;
++
++	// what display controller B scans out
++	uint32			physical;
++	uint16			width;
++	uint16			height;
++	uint32			color_depth;
++	uint32			bytes_per_row;
++
++	// where window A shows it on the screen
++	uint32			window_x;
++	uint32			window_y;
++	uint32			window_width;
++	uint32			window_height;
++
++	// the cursor, in panel coordinates
++	struct {
++		bool		visible;
++		uint32		physical;
++		int32		x;
++		int32		y;
++		uint32		width;
++		uint32		height;
++		uint32		skip_x;
++		uint32		skip_y;
++	}				cursor;
++
++	hdmi_overlay	overlay;
++	hdmi_video		video;
++	bool			output_enabled;	// "hdmi_output false" turns it off
++
++	bool			plugged;
++	bool			has_edid;
++	bool			hdmi_sink;
++	bool			sending_dvi;
++	char			screen_name[16];
++	bool			active;
++	hdmi_mode		mode;
++	tmds_settings	tmds;
++} sHdmi;
++
++
++static inline uint32
++read_car(uint32 offset)
++{
++	return sHdmi.car[offset / 4];
++}
++
++
++static inline void
++write_car(uint32 offset, uint32 value)
++{
++	sHdmi.car[offset / 4] = value;
++}
++
++
++static inline uint32
++read_dc(uint32 word)
++{
++	return sHdmi.dc[word];
++}
++
++
++static inline void
++write_dc(uint32 word, uint32 value)
++{
++	sHdmi.dc[word] = value;
++}
++
++
++static inline uint32
++read_hdmi(uint32 word)
++{
++	return sHdmi.hdmi[word];
++}
++
++
++static inline void
++write_hdmi(uint32 word, uint32 value)
++{
++	sHdmi.hdmi[word] = value;
++}
++
++
++static volatile uint32*
++map_registers(const char* name, phys_addr_t base, size_t size, area_id* _area)
++{
++	void* address;
++	*_area = map_physical_memory(name, base, size, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++	return *_area >= 0 ? (volatile uint32*)address : NULL;
++}
++
++
++/*!	Turns the clock of a block on and takes it out of reset, or puts it
++	back into reset and stops its clock.
++*/
++static void
++enable_block(uint32 enableRegister, uint32 resetRegister, uint32 bit,
++	bool enable)
++{
++	if (enable) {
++		write_car(resetRegister, read_car(resetRegister) | bit);
++		write_car(enableRegister, read_car(enableRegister) | bit);
++		snooze(1000);
++		write_car(resetRegister, read_car(resetRegister) & ~bit);
++		spin(10);
++	} else {
++		write_car(resetRegister, read_car(resetRegister) | bit);
++		write_car(enableRegister, read_car(enableRegister) & ~bit);
++	}
++}
++
++
++//	#pragma mark - power and hot plug
++
++
++static status_t
++set_hdmi_power(bool on)
++{
++	const uint8 supplies = TPS6586X_LDO7 | TPS6586X_LDO8;
++	const uint8 registers[] = { TPS6586X_SUPPLYENC, TPS6586X_SUPPLYEND };
++	for (size_t i = 0; i < B_COUNT_OF(registers); i++) {
++		uint8 value;
++		status_t status = arm_dvc_i2c_read(TPS6586X_ADDRESS, registers[i],
++			&value, 1);
++		if (status != B_OK)
++			return status;
++		uint8 newValue = on ? value | supplies : value & ~supplies;
++		if (newValue == value)
++			continue;
++		status = arm_dvc_i2c_write(TPS6586X_ADDRESS, registers[i], &newValue,
++			1);
++		if (status != B_OK)
++			return status;
++	}
++	if (on)
++		snooze(5000);
++	return B_OK;
++}
++
++
++static void
++setup_hot_plug_pin()
++{
++	// GPIO mode, input: the masked registers change only this pin
++	volatile uint32* port = sHdmi.gpio + GPIO_BANK3_PORT1 / 4;
++	port[(GPIO_MASKED + GPIO_OE) / 4] = 1u << (HOT_PLUG_BIT + 8);
++	port[(GPIO_MASKED + GPIO_CNF) / 4]
++		= (1u << (HOT_PLUG_BIT + 8)) | (1u << HOT_PLUG_BIT);
++}
++
++
++static bool
++screen_plugged()
++{
++	volatile uint32* port = sHdmi.gpio + GPIO_BANK3_PORT1 / 4;
++	return (port[GPIO_IN / 4] & (1u << HOT_PLUG_BIT)) != 0;
++}
++
++
++//	#pragma mark - DDC
++
++
++/*!	I2C2 is also set up by the tegra_i2c bus driver, with no devices on it;
++	it is reset here every time with the same settings (100 kHz): after a
++	hot plug the controller kept words in its transmit FIFO and never sent
++	them.
++*/
++static void
++setup_ddc()
++{
++	write_car(CAR_CLK_SOURCE_I2C2, CAR_SOURCE_PLL_P
++		| ((216000 + 8 * DDC_BUS_KHZ - 1) / (8 * DDC_BUS_KHZ) - 1));
++	enable_block(CAR_CLK_OUT_ENB_H, CAR_RST_DEVICES_H, CAR_I2C2_BIT, true);
++
++	volatile uint32* i2c = sHdmi.i2c;
++	i2c[I2C_CNFG / 4] = I2C_CNFG_NEW_MASTER_FSM | I2C_CNFG_PACKET_MODE
++		| I2C_CNFG_DEBOUNCE(2);
++	// not a slave
++	i2c[I2C_SL_CNFG / 4] |= I2C_SL_CNFG_NACK | I2C_SL_CNFG_NEWSL;
++	i2c[I2C_SL_ADDR1 / 4] = 0xfc;
++	i2c[I2C_SL_ADDR2 / 4] = 0;
++}
++
++
++template<typename Condition>
++static bool
++ddc_wait(Condition condition)
++{
++	for (int32 i = 0; i < 50000; i++) {
++		if (condition())
++			return true;
++		spin(1);
++	}
++	return false;
++}
++
++
++/*!	One I2C message on the DDC bus: writes \a length bytes of \a data or
++	reads them into it. With \a repeatStart the bus is kept for the next one.
++*/
++static status_t
++ddc_transfer(uint8 address, uint8* data, uint32 length, bool read,
++	bool repeatStart)
++{
++	volatile uint32* i2c = sHdmi.i2c;
++	if (length == 0 || length > 32)
++		return B_BAD_VALUE;
++
++	i2c[I2C_FIFO_CONTROL / 4] |= I2C_FIFO_FLUSH;
++	if (!ddc_wait([i2c] {
++			return (i2c[I2C_FIFO_CONTROL / 4] & I2C_FIFO_FLUSH) == 0; })) {
++		return B_TIMED_OUT;
++	}
++	i2c[I2C_INT_STATUS / 4] = 0xffffffff;
++
++	uint32 words[3 + 8];
++	uint32 count = 0;
++	words[count++] = I2C_PACKET_PROTOCOL_I2C | I2C_PACKET_ID(1);
++	words[count++] = length - 1;
++	words[count++] = (address << 1) | I2C_HEADER_IE_ENABLE
++		| (read ? I2C_HEADER_READ : 0)
++		| (repeatStart ? I2C_HEADER_REPEAT_START : 0);
++	if (!read) {
++		for (uint32 i = 0; i < length; i += 4) {
++			uint32 word = 0;
++			for (uint32 j = 0; j < 4 && i + j < length; j++)
++				word |= (uint32)data[i + j] << (j * 8);
++			words[count++] = word;
++		}
++	}
++
++	for (uint32 i = 0; i < count; i++) {
++		if (!ddc_wait([i2c] {
++				return I2C_FIFO_STATUS_TX(i2c[I2C_FIFO_STATUS / 4]) > 0; })) {
++			return B_TIMED_OUT;
++		}
++		i2c[I2C_TX_FIFO / 4] = words[i];
++	}
++
++	if (read) {
++		for (uint32 i = 0; i < length; i += 4) {
++			if (!ddc_wait([i2c] {
++					return I2C_FIFO_STATUS_RX(i2c[I2C_FIFO_STATUS / 4]) > 0
++						|| (i2c[I2C_INT_STATUS / 4] & I2C_INT_NO_ACK) != 0;
++					})
++				|| I2C_FIFO_STATUS_RX(i2c[I2C_FIFO_STATUS / 4]) == 0) {
++				return B_IO_ERROR;
++			}
++			uint32 word = i2c[I2C_RX_FIFO / 4];
++			for (uint32 j = 0; j < 4 && i + j < length; j++)
++				data[i + j] = word >> (j * 8);
++		}
++	}
++
++	uint32 status = 0;
++	bool done = ddc_wait([i2c, &status] {
++		status = i2c[I2C_INT_STATUS / 4];
++		return (status & (I2C_INT_PACKET_COMPLETE | I2C_INT_NO_ACK
++			| I2C_INT_ARBITRATION_LOST)) != 0; });
++	i2c[I2C_INT_STATUS / 4] = status;
++	if (!done)
++		return B_TIMED_OUT;
++	if ((status & (I2C_INT_NO_ACK | I2C_INT_ARBITRATION_LOST)) != 0)
++		return B_IO_ERROR;
++	return B_OK;
++}
++
++
++/*!	Reads the base EDID block and, if there is one, the first extension. */
++static status_t
++read_edid(uint8* edid, uint32* _size)
++{
++	uint32 size = 128;
++	for (uint32 offset = 0; offset < size; offset += 32) {
++		uint8 start = offset;
++		status_t status = ddc_transfer(DDC_EDID_ADDRESS, &start, 1, false,
++			true);
++		bool wrote = status == B_OK;
++		if (wrote) {
++			status = ddc_transfer(DDC_EDID_ADDRESS, edid + offset, 32, true,
++				false);
++		}
++		if (status != B_OK) {
++			ERROR("DDC %s at offset %" B_PRIu32 ": %s, interrupt status %#"
++				B_PRIx32 ", FIFO status %#" B_PRIx32 "\n",
++				wrote ? "read" : "write", offset, strerror(status),
++				sHdmi.i2c[I2C_INT_STATUS / 4], sHdmi.i2c[I2C_FIFO_STATUS / 4]);
++			return status;
++		}
++		if (offset == 96 && edid[126] > 0)
++			size = EDID_SIZE;
++	}
++
++	static const uint8 kHeader[] = { 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0 };
++	if (memcmp(edid, kHeader, sizeof(kHeader)) != 0)
++		return B_BAD_DATA;
++	*_size = size;
++	return B_OK;
++}
++
++
++//	#pragma mark - modes
++
++
++static uint8
++cea_vic(const hdmi_mode& mode)
++{
++	uint32 refresh = (mode.pixel_clock * 1000 + mode.h_total * mode.v_total / 2)
++		/ (mode.h_total * mode.v_total);
++	struct { uint16 width, height; uint32 refresh; uint8 vic; } kModes[] = {
++		{ 640, 480, 60, 1 }, { 720, 480, 60, 2 }, { 1280, 720, 60, 4 },
++		{ 1920, 1080, 60, 16 }, { 720, 576, 50, 17 }, { 1280, 720, 50, 19 },
++		{ 1920, 1080, 50, 31 },
++	};
++	for (size_t i = 0; i < B_COUNT_OF(kModes); i++) {
++		if (kModes[i].width == mode.h_display
++			&& kModes[i].height == mode.v_display
++			&& kModes[i].refresh == refresh) {
++			return kModes[i].vic;
++		}
++	}
++	return 0;
++}
++
++
++/*!	A detailed timing descriptor of an EDID, if it is one this hardware can
++	drive: progressive, separate sync, up to 1920x1200 and 148.5 MHz.
++*/
++static bool
++parse_detailed_timing(const uint8* d, hdmi_mode& mode)
++{
++	uint32 pixelClock = (d[0] | (d[1] << 8)) * 10;
++	if (pixelClock == 0)
++		return false;
++
++	uint32 hActive = d[2] | ((d[4] >> 4) << 8);
++	uint32 hBlank = d[3] | ((d[4] & 0xf) << 8);
++	uint32 vActive = d[5] | ((d[7] >> 4) << 8);
++	uint32 vBlank = d[6] | ((d[7] & 0xf) << 8);
++	uint32 hSyncOffset = d[8] | (((d[11] >> 6) & 3) << 8);
++	uint32 hSyncWidth = d[9] | (((d[11] >> 4) & 3) << 8);
++	uint32 vSyncOffset = (d[10] >> 4) | (((d[11] >> 2) & 3) << 4);
++	uint32 vSyncWidth = (d[10] & 0xf) | ((d[11] & 3) << 4);
++	uint8 flags = d[17];
++
++	dprintf("tegra_dc: hdmi: EDID mode %" B_PRIu32 "x%" B_PRIu32 "%s, %"
++		B_PRIu32 " kHz, totals %" B_PRIu32 "x%" B_PRIu32 "\n", hActive,
++		vActive, (flags & 0x80) != 0 ? " interlaced" : "", pixelClock,
++		hActive + hBlank, vActive + vBlank);
++	if ((flags & 0x80) != 0 || (flags & 0x18) != 0x18
++		|| pixelClock > 148500 || hActive > 1920 || vActive > 1200
++		|| hActive < 640 || vActive < 480) {
++		return false;
++	}
++
++	mode.pixel_clock = pixelClock;
++	mode.h_display = hActive;
++	mode.h_sync_start = hActive + hSyncOffset;
++	mode.h_sync_end = mode.h_sync_start + hSyncWidth;
++	mode.h_total = hActive + hBlank;
++	mode.v_display = vActive;
++	mode.v_sync_start = vActive + vSyncOffset;
++	mode.v_sync_end = mode.v_sync_start + vSyncWidth;
++	mode.v_total = vActive + vBlank;
++	mode.h_sync_positive = (flags & 0x02) != 0;
++	mode.v_sync_positive = (flags & 0x04) != 0;
++	mode.vic = cea_vic(mode);
++	return true;
++}
++
++
++// 1920x1080 at 60 Hz (CEA-861 VIC 16)
++static const hdmi_mode k1080p = {
++	148500, 1920, 2008, 2052, 2200, 1080, 1084, 1089, 1125, true, true, 16
++};
++
++
++/*!	The smallest mode the screen lists that still holds the panel's picture
++	(1024x600) without shrinking it, usually 1280x720: a larger one only
++	scales the same picture more, at a higher clock that is harder on the
++	link (the HDMI audio sounded metallic at 1080p, clean at 720p).
++	With \a preferred, the screen's preferred mode if this hardware can
++	drive it, or else the largest it can.
++	The candidates are the detailed timings and, as 720p and 1080p are often
++	only listed by their CEA codes, the CEA video codes.
++*/
++static bool
++choose_mode(const uint8* edid, uint32 size, bool preferred,
++	hdmi_mode& chosen)
++{
++	bool found = false;
++	auto holdsPanel = [](const hdmi_mode& mode) {
++		return mode.h_display >= sHdmi.width && mode.v_display >= sHdmi.height;
++	};
++	auto consider = [&](const hdmi_mode& mode) {
++		uint32 area = (uint32)mode.h_display * mode.v_display;
++		uint32 chosenArea = (uint32)chosen.h_display * chosen.v_display;
++		bool better;
++		if (!found)
++			better = true;
++		else if (preferred)
++			better = area > chosenArea;
++		else if (holdsPanel(mode) != holdsPanel(chosen))
++			better = holdsPanel(mode);
++		else
++			better = holdsPanel(mode) ? area < chosenArea : area > chosenArea;
++		if (better) {
++			chosen = mode;
++			found = true;
++		}
++	};
++
++	for (uint32 offset = 0x36; offset < 0x7e; offset += 18) {
++		hdmi_mode mode;
++		if (parse_detailed_timing(edid + offset, mode)) {
++			consider(mode);
++			if (offset == 0x36 && preferred)
++				return true;
++		}
++	}
++
++	if (size >= 256 && edid[128] == 0x02) {
++		const uint8* cea = edid + 128;
++		uint32 end = cea[2];
++		for (uint32 offset = end; offset + 18 <= 127 && end >= 4;
++				offset += 18) {
++			hdmi_mode mode;
++			if (parse_detailed_timing(cea + offset, mode))
++				consider(mode);
++		}
++		for (uint32 i = 4; i < end && i < 127;) {
++			uint32 tag = cea[i] >> 5;
++			uint32 length = cea[i] & 0x1f;
++			if (tag == 2) {
++				for (uint32 j = 1; j <= length && i + j < 127; j++) {
++					if ((cea[i + j] & 0x7f) == k1080p.vic)
++						consider(k1080p);
++					else if ((cea[i + j] & 0x7f) == k720p.vic)
++						consider(k720p);
++				}
++			}
++			i += 1 + length;
++		}
++	}
++	return found;
++}
++
++
++/*!	A screen is an HDMI sink, rather than a DVI one, if its CEA extension
++	has the HDMI vendor specific data block.
++*/
++static bool
++is_hdmi_sink(const uint8* edid, uint32 size)
++{
++	if (size < 256 || edid[128] != 0x02)
++		return false;
++	const uint8* cea = edid + 128;
++	uint32 end = cea[2];
++	for (uint32 i = 4; i < end && i < 127;) {
++		uint32 tag = cea[i] >> 5;
++		uint32 length = cea[i] & 0x1f;
++		if (tag == 3 && length >= 3 && cea[i + 1] == 0x03
++			&& cea[i + 2] == 0x0c && cea[i + 3] == 0x00) {
++			return true;
++		}
++		i += 1 + length;
++	}
++	return false;
++}
++
++
++//	#pragma mark - display controller B
++
++
++/*!	PLL_D runs at twice the pixel clock: display controller B and the HDMI
++	block take its output divided by two.
++*/
++static status_t
++set_pll_d(uint32 pixelClock)
++{
++	uint32 target = pixelClock * 2;
++	uint32 bestM = 0, bestN = 0, bestError = ~0u;
++	// comparison frequency 1 - 6 MHz
++	for (uint32 m = 2; m <= OSC_KHZ / 1000; m++) {
++		uint32 n = (target * m + OSC_KHZ / 2) / OSC_KHZ;
++		if (n < 1 || n > 1023)
++			continue;
++		uint32 rate = OSC_KHZ * n / m;
++		uint32 error = rate > target ? rate - target : target - rate;
++		if (error < bestError) {
++			bestError = error;
++			bestM = m;
++			bestN = n;
++		}
++	}
++	if (bestM == 0 || bestError * 200 > target)
++		return B_BAD_VALUE;
++
++	// Charge pump current by the feedback divider (TRM table 17)
++	uint32 cpcon = bestN < 150 ? 2 : bestN < 450 ? 4 : bestN < 800 ? 8 : 12;
++
++	write_car(CAR_PLLD_BASE, PLLD_BYPASS | PLLD_DIVN(bestN)
++		| PLLD_DIVM(bestM));
++	write_car(CAR_PLLD_MISC, PLLD_MISC_LOCK_ENABLE | PLLD_MISC_CPCON(cpcon)
++		| PLLD_MISC_LFCON(bestN >= 600 ? 1 : 0));
++	write_car(CAR_PLLD_BASE, read_car(CAR_PLLD_BASE) | PLLD_ENABLE);
++
++	bigtime_t timeout = system_time() + 10000;
++	while ((read_car(CAR_PLLD_BASE) & PLLD_LOCK) == 0) {
++		if (system_time() > timeout) {
++			ERROR("PLL_D does not lock (n %" B_PRIu32 ", m %" B_PRIu32 ")\n",
++				bestN, bestM);
++			write_car(CAR_PLLD_BASE, 0);
++			return B_TIMED_OUT;
++		}
++		spin(10);
++	}
++	write_car(CAR_PLLD_BASE, read_car(CAR_PLLD_BASE) & ~PLLD_BYPASS);
++
++	dprintf("tegra_dc: hdmi: PLL_D %" B_PRIu32 " kHz (n %" B_PRIu32 ", m %"
++		B_PRIu32 ")\n", OSC_KHZ * bestN / bestM, bestN, bestM);
++	return B_OK;
++}
++
++
++static uint32
++dda_increment(uint32 source, uint32 target)
++{
++	if (target <= 1 || source <= 1)
++		return 0x1000;
++	return ((source - 1) * 0x1000 + (target - 1) / 2) / (target - 1);
++}
++
++
++/*!	Window A of display controller B shows the panel's frame buffer, scaled
++	to fill the screen without changing its proportions.
++*/
++static void
++program_mirror_window()
++{
++	const hdmi_mode& mode = sHdmi.mode;
++	uint32 bytesPerPixel = sHdmi.color_depth == COLOR_DEPTH_B5G6R5 ? 2 : 4;
++
++	uint32 width = mode.h_display;
++	uint32 height = (uint32)sHdmi.height * width / sHdmi.width;
++	if (height > mode.v_display) {
++		height = mode.v_display;
++		width = (uint32)sHdmi.width * height / sHdmi.height;
++	}
++	uint32 x = (mode.h_display - width) / 2;
++	uint32 y = (mode.v_display - height) / 2;
++	sHdmi.window_x = x;
++	sHdmi.window_y = y;
++	sHdmi.window_width = width;
++	sHdmi.window_height = height;
++
++	write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_A_SELECT);
++	write_dc(WIN_COLOR_DEPTH, sHdmi.color_depth);
++	write_dc(WIN_BYTE_SWAP, 0);
++	write_dc(WIN_POSITION, (y << 16) | x);
++	write_dc(WIN_SIZE, (height << 16) | width);
++	write_dc(WIN_PRESCALED_SIZE, ((uint32)sHdmi.height << 16)
++		| (sHdmi.width * bytesPerPixel));
++	write_dc(WIN_H_INITIAL_DDA, 0);
++	write_dc(WIN_V_INITIAL_DDA, 0);
++	write_dc(WIN_DDA_INCREMENT, (dda_increment(sHdmi.height, height) << 16)
++		| dda_increment(sHdmi.width, width));
++	write_dc(WIN_LINE_STRIDE, sHdmi.bytes_per_row);
++	write_dc(WIN_BUF_STRIDE, 0);
++	write_dc(WIN_BUFFER_ADDR_MODE, 0);
++	write_dc(WIN_BLEND_NOKEY, BLEND_FIX_255);
++	write_dc(WIN_BLEND_1WIN, BLEND_FIX_255);
++	write_dc(WINBUF_START_ADDR, sHdmi.physical);
++	write_dc(WINBUF_ADDR_H_OFFSET, 0);
++	write_dc(WINBUF_ADDR_V_OFFSET, 0);
++	write_dc(WIN_OPTIONS, sHdmi.video.enabled ? 0 : WIN_OPTIONS_ENABLE
++		| (bytesPerPixel == 2 ? WIN_OPTIONS_COLOR_EXPAND : 0));
++
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_UPDATE | STATE_WIN_A_UPDATE);
++	read_dc(DC_CMD_STATE_CONTROL);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_ACT_REQ
++		| STATE_WIN_A_ACT_REQ);
++}
++
++
++/*!	Window C of display controller B shows the cursor image as window C of
++	controller A does on the panel, scaled as the frame buffer is.
++*/
++static void
++program_cursor_window()
++{
++	const auto& cursor = sHdmi.cursor;
++	write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_C_SELECT);
++	if (!cursor.visible || cursor.width == 0 || cursor.height == 0
++		|| sHdmi.video.enabled) {
++		write_dc(WIN_OPTIONS, 0);
++	} else {
++		uint32 x = sHdmi.window_x
++			+ cursor.x * sHdmi.window_width / sHdmi.width;
++		uint32 y = sHdmi.window_y
++			+ cursor.y * sHdmi.window_height / sHdmi.height;
++		uint32 width = max_c(cursor.width * sHdmi.window_width
++			/ sHdmi.width, 1u);
++		uint32 height = max_c(cursor.height * sHdmi.window_height
++			/ sHdmi.height, 1u);
++		width = min_c(width, sHdmi.mode.h_display - x);
++		height = min_c(height, sHdmi.mode.v_display - y);
++
++		write_dc(WIN_COLOR_DEPTH, COLOR_DEPTH_B8G8R8A8);
++		write_dc(WIN_BYTE_SWAP, 0);
++		write_dc(WIN_POSITION, (y << 16) | x);
++		write_dc(WIN_SIZE, (height << 16) | width);
++		write_dc(WIN_PRESCALED_SIZE, (cursor.height << 16)
++			| (cursor.width * 4));
++		write_dc(WIN_H_INITIAL_DDA, 0);
++		write_dc(WIN_V_INITIAL_DDA, 0);
++		write_dc(WIN_DDA_INCREMENT,
++			(dda_increment(cursor.height, height) << 16)
++				| dda_increment(cursor.width, width));
++		write_dc(WIN_LINE_STRIDE, CURSOR_BYTES_PER_ROW);
++		write_dc(WIN_BUF_STRIDE, 0);
++		write_dc(WIN_BUFFER_ADDR_MODE, 0);
++		write_dc(WINBUF_START_ADDR, cursor.physical);
++		write_dc(WINBUF_ADDR_H_OFFSET, cursor.skip_x * 4);
++		write_dc(WINBUF_ADDR_V_OFFSET, cursor.skip_y);
++		write_dc(WIN_OPTIONS, WIN_OPTIONS_ENABLE);
++	}
++	write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_A_SELECT);
++
++	write_dc(DC_CMD_STATE_CONTROL, STATE_WIN_C_UPDATE);
++	read_dc(DC_CMD_STATE_CONTROL);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_WIN_C_ACT_REQ);
++}
++
++
++/*!	The cursor (window C) blends by its alpha over the frame buffer
++	(window A), which takes what the cursor leaves.
++*/
++static void
++setup_cursor_blending()
++{
++	write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_C_SELECT);
++	write_dc(WIN_BLEND_NOKEY, BLEND_FIX_255);
++	write_dc(WIN_BLEND_1WIN, BLEND_ALPHA_255);
++	write_dc(WIN_BLEND_2WIN_X, BLEND_ALPHA_255);
++	write_dc(WIN_BLEND_2WIN_Y, BLEND_ALPHA_255);
++	write_dc(WIN_BLEND_3WIN, BLEND_ALPHA_255);
++
++	write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_A_SELECT);
++	write_dc(WIN_BLEND_2WIN_X, BLEND_FIX_255);
++	write_dc(WIN_BLEND_2WIN_Y, BLEND_DEPENDENT);
++	write_dc(WIN_BLEND_3WIN, BLEND_DEPENDENT);
++}
++
++
++/*!	Window B of display controller B: the scaling filters and the BT.601
++	color space conversion, as window B of controller A has them.
++*/
++static void
++setup_overlay_window()
++{
++	write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_B_SELECT);
++	for (uint32 phase = 0; phase < 16; phase++) {
++		write_dc(WINC_H_FILTER_P00 + phase,
++			((8 * phase) << 16) | ((128 - 8 * phase) << 8));
++		write_dc(WINC_V_FILTER_P00 + phase, 128 - 8 * phase);
++	}
++	static const uint32 kCsc[] = { 0xf0, 298, 0, 409, 0x400 - 100,
++		0x400 - 208, 516, 0 };
++	for (size_t i = 0; i < B_COUNT_OF(kCsc); i++)
++		write_dc(WINC_CSC_YOF + i, kCsc[i]);
++
++	// opaque, under the cursor
++	write_dc(WIN_BLEND_NOKEY, BLEND_FIX_255);
++	write_dc(WIN_BLEND_1WIN, BLEND_FIX_255);
++	write_dc(WIN_BLEND_2WIN_X, BLEND_DEPENDENT);
++	write_dc(WIN_BLEND_2WIN_Y, BLEND_DEPENDENT);
++	write_dc(WIN_BLEND_3WIN, BLEND_DEPENDENT);
++	write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_A_SELECT);
++}
++
++
++/*!	A video on the whole screen, in its proportions: window B alone. */
++static void
++program_video_window()
++{
++	const hdmi_video& video = sHdmi.video;
++	const hdmi_mode& mode = sHdmi.mode;
++	uint32 width = mode.h_display;
++	uint32 height = video.height * width / video.width;
++	if (height > mode.v_display) {
++		height = mode.v_display;
++		width = video.width * height / video.height;
++	}
++	uint32 x = (mode.h_display - width) / 2;
++	uint32 y = (mode.v_display - height) / 2;
++	uint32 hIncrement = dda_increment(video.width, width);
++	uint32 vIncrement = dda_increment(video.height, height);
++
++	write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_B_SELECT);
++	write_dc(WIN_COLOR_DEPTH, video.color_depth);
++	write_dc(WIN_BYTE_SWAP, video.byte_swap);
++	write_dc(WIN_POSITION, (y << 16) | x);
++	write_dc(WIN_SIZE, (height << 16) | width);
++	write_dc(WIN_PRESCALED_SIZE, (video.height << 16)
++		| (video.width * video.bytes_per_pixel));
++	write_dc(WIN_H_INITIAL_DDA, 0);
++	write_dc(WIN_V_INITIAL_DDA, 0);
++	write_dc(WIN_DDA_INCREMENT, (vIncrement << 16) | hIncrement);
++	write_dc(WIN_LINE_STRIDE, video.bytes_per_row);
++	write_dc(WIN_BUF_STRIDE, 0);
++	write_dc(WIN_BUFFER_ADDR_MODE, 0);
++	write_dc(WINBUF_START_ADDR, video.physical);
++	write_dc(WINBUF_ADDR_H_OFFSET, 0);
++	write_dc(WINBUF_ADDR_V_OFFSET, 0);
++	write_dc(WIN_OPTIONS, video.options);
++	write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_A_SELECT);
++
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_UPDATE | STATE_WIN_A_UPDATE
++		| STATE_WIN_B_UPDATE);
++	read_dc(DC_CMD_STATE_CONTROL);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_ACT_REQ
++		| STATE_WIN_A_ACT_REQ | STATE_WIN_B_ACT_REQ);
++}
++
++
++/*!	The video at the same place of the mirrored picture as on the panel. */
++static void
++program_overlay_window()
++{
++	if (sHdmi.video.enabled) {
++		program_video_window();
++		return;
++	}
++
++	const hdmi_overlay& overlay = sHdmi.overlay;
++	uint32 x = sHdmi.window_x + overlay.x * sHdmi.window_width / sHdmi.width;
++	uint32 y = sHdmi.window_y
++		+ overlay.y * sHdmi.window_height / sHdmi.height;
++	uint32 width = overlay.width * sHdmi.window_width / sHdmi.width;
++	uint32 height = overlay.height * sHdmi.window_height / sHdmi.height;
++	width = min_c(width, sHdmi.mode.h_display - x);
++	height = min_c(height, sHdmi.mode.v_display - y);
++	uint32 hIncrement = dda_increment(overlay.source_width, width);
++	uint32 vIncrement = dda_increment(overlay.source_height, height);
++	uint32 maxHIncrement = overlay.bytes_per_pixel == 2 ? 0x8000 : 0x4000;
++	bool visible = overlay.visible && width > 1 && height > 1
++		&& hIncrement <= maxHIncrement && vIncrement <= MAX_V_DDA;
++
++	write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_B_SELECT);
++	if (!visible)
++		write_dc(WIN_OPTIONS, 0);
++	else {
++		write_dc(WIN_COLOR_DEPTH, overlay.color_depth);
++		write_dc(WIN_BYTE_SWAP, overlay.byte_swap);
++		write_dc(WIN_POSITION, (y << 16) | x);
++		write_dc(WIN_SIZE, (height << 16) | width);
++		write_dc(WIN_PRESCALED_SIZE, (overlay.source_height << 16)
++			| (overlay.source_width * overlay.bytes_per_pixel));
++		write_dc(WIN_H_INITIAL_DDA, 0);
++		write_dc(WIN_V_INITIAL_DDA, 0);
++		write_dc(WIN_DDA_INCREMENT, (vIncrement << 16) | hIncrement);
++		write_dc(WIN_LINE_STRIDE, overlay.bytes_per_row);
++		write_dc(WIN_BUF_STRIDE, 0);
++		write_dc(WIN_BUFFER_ADDR_MODE, 0);
++		write_dc(WINBUF_START_ADDR, overlay.physical);
++		write_dc(WINBUF_ADDR_H_OFFSET,
++			overlay.source_x * overlay.bytes_per_pixel);
++		write_dc(WINBUF_ADDR_V_OFFSET, overlay.source_y);
++		write_dc(WIN_OPTIONS, overlay.options);
++	}
++
++	// The frame buffer gives way to the video where it has the key color
++	write_dc(DC_DISP_COLOR_KEY0_LOWER, overlay.key_lower & 0xffffff);
++	write_dc(DC_DISP_COLOR_KEY0_UPPER, overlay.key_upper & 0xffffff);
++	write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_A_SELECT);
++	uint32 under = overlay.color_key ? BLEND_CKEY0 : 0;
++	write_dc(WIN_BLEND_2WIN_X, under);
++	write_dc(WIN_BLEND_3WIN, visible ? under : BLEND_DEPENDENT);
++
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_UPDATE | STATE_WIN_A_UPDATE
++		| STATE_WIN_B_UPDATE);
++	read_dc(DC_CMD_STATE_CONTROL);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_ACT_REQ
++		| STATE_WIN_A_ACT_REQ | STATE_WIN_B_ACT_REQ);
++}
++
++
++static void
++start_display_controller()
++{
++	const hdmi_mode& mode = sHdmi.mode;
++
++	write_car(CAR_CLK_SOURCE_DISP2, CAR_SOURCE_PLL_D_OUT0);
++	enable_block(CAR_CLK_OUT_ENB_L, CAR_RST_DEVICES_L, CAR_DISP2_BIT, true);
++
++	write_dc(DC_CMD_INT_ENABLE, 0);
++	write_dc(DC_CMD_INT_MASK, 0);
++	write_dc(DC_DISP_MEM_HIGH_PRIORITY, 0x00202020);
++	write_dc(DC_DISP_MEM_HIGH_PRIORITY_TIMER, 0x00010101);
++	write_dc(DC_DISP_BORDER_COLOR, 0);
++
++	// Pixel clock = the controller clock (shift clock divider 0)
++	write_dc(DC_DISP_CLOCK_CONTROL, 0);
++	write_dc(DC_DISP_INTERFACE_CONTROL, 0);
++	write_dc(DC_DISP_TIMING_OPTIONS, 1);	// vsync at the first pixel
++	write_dc(DC_DISP_REF_TO_SYNC, (1 << 16) | 1);
++	write_dc(DC_DISP_SYNC_WIDTH, ((mode.v_sync_end - mode.v_sync_start) << 16)
++		| (mode.h_sync_end - mode.h_sync_start));
++	write_dc(DC_DISP_BACK_PORCH, ((mode.v_total - mode.v_sync_end) << 16)
++		| (mode.h_total - mode.h_sync_end));
++	write_dc(DC_DISP_FRONT_PORCH, ((mode.v_sync_start - mode.v_display) << 16)
++		| (mode.h_sync_start - mode.h_display));
++	write_dc(DC_DISP_ACTIVE, ((uint32)mode.v_display << 16) | mode.h_display);
++	write_dc(DC_DISP_COLOR_CONTROL, BASE_COLOR_SIZE_888);
++
++	// The HDMI video preamble comes from H pulse 2
++	uint32 pulseStart = 1 + (mode.h_sync_end - mode.h_sync_start)
++		+ (mode.h_total - mode.h_sync_end) - 10;
++	write_dc(DC_DISP_SIGNAL_OPTIONS0, H_PULSE2_ENABLE);
++	write_dc(DC_DISP_H_PULSE2_CONTROL, PULSE_QUAL_VACTIVE | PULSE_LAST_END_A);
++	write_dc(DC_DISP_H_PULSE2_POSITION_A, ((pulseStart + 8) << 16)
++		| pulseStart);
++
++	static const uint32 kOtherWindows[] = { WINDOW_B_SELECT,
++		WINDOW_C_SELECT };
++	for (size_t i = 0; i < B_COUNT_OF(kOtherWindows); i++) {
++		write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, kOtherWindows[i]);
++		write_dc(WIN_OPTIONS, 0);
++	}
++	setup_cursor_blending();
++	setup_overlay_window();
++	program_mirror_window();
++	program_cursor_window();
++	program_overlay_window();
++
++	write_dc(DC_CMD_DISPLAY_COMMAND, DISPLAY_CTRL_C_DISPLAY);
++	write_dc(DC_CMD_DISPLAY_POWER_CONTROL, DISPLAY_POWER_ALL);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_UPDATE);
++	read_dc(DC_CMD_STATE_CONTROL);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_ACT_REQ);
++}
++
++
++static void
++stop_display_controller()
++{
++	write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_A_SELECT);
++	write_dc(WIN_OPTIONS, 0);
++	write_dc(DC_DISP_WIN_OPTIONS, 0);
++	write_dc(DC_CMD_DISPLAY_COMMAND, 0);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_UPDATE | STATE_WIN_A_UPDATE);
++	read_dc(DC_CMD_STATE_CONTROL);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_ACT_REQ
++		| STATE_WIN_A_ACT_REQ);
++	snooze(40000);
++	write_dc(DC_CMD_DISPLAY_POWER_CONTROL, 0);
++
++	enable_block(CAR_CLK_OUT_ENB_L, CAR_RST_DEVICES_L, CAR_DISP2_BIT, false);
++}
++
++
++//	#pragma mark - HDMI block
++
++
++/*!	Writes an infoframe (3 header bytes, a checksum and the payload) into
++	the header register at \a word and the subpack registers after it.
++*/
++static void
++write_infoframe(uint32 word, uint8* frame, size_t size)
++{
++	uint8 sum = 0;
++	frame[3] = 0;
++	for (size_t i = 0; i < size; i++)
++		sum += frame[i];
++	frame[3] = 0x100 - sum;
++
++	write_hdmi(word++, frame[0] | (frame[1] << 8) | (frame[2] << 16));
++	// subpacks of 7 bytes: 4 in the low word, 3 in the high one
++	for (size_t i = 3; i < size; i += 7) {
++		uint32 low = 0, high = 0;
++		for (size_t j = 0; j < 4 && i + j < size; j++)
++			low |= (uint32)frame[i + j] << (j * 8);
++		for (size_t j = 0; j < 3 && i + 4 + j < size; j++)
++			high |= (uint32)frame[i + 4 + j] << (j * 8);
++		write_hdmi(word++, low);
++		write_hdmi(word++, high);
++	}
++}
++
++
++/*!	Audio clock regeneration and the audio infoframe for the 44.1 kHz
++	stereo that the tegra_audio driver sends through the S/PDIF controller:
++	N = 6272 (the HDMI recommendation for 44.1 kHz), CTS = pixel clock * N /
++	(128 * 44100).
++*/
++static void
++setup_audio_packets()
++{
++	const uint32 n = 6272;
++	uint32 cts = (uint32)(((uint64)sHdmi.mode.pixel_clock * 1000 * n
++		+ 128 * 44100 / 2) / (128 * 44100));
++
++	write_hdmi(HDMI_AUDIO_CNTRL0, AUDIO_CNTRL0_FRAMES_PER_BLOCK(0xc0)
++		| AUDIO_CNTRL0_ERROR_TOLERANCE(6)
++		| (sHdmi.tmds.audio_auto ? 0 : AUDIO_CNTRL0_SOURCE_SPDIF));
++
++	write_hdmi(HDMI_ACR_CTRL, 0);
++	write_hdmi(HDMI_AUDIO_N, AUDIO_N_RESETF | AUDIO_N_GENERATE_ALTERNATE
++		| AUDIO_N_VALUE(n - 1));
++	// One pair of registers per sample rate; only the 44.1 kHz one is
++	// enabled (enabling all of them made a television lose the picture)
++	for (uint32 i = 0; i < 7; i++) {
++		write_hdmi(HDMI_ACR_SUBPACK_HIGH(i), i == 1
++			? ACR_SUBPACK_N(n) | ACR_ENABLE : 0);
++		write_hdmi(HDMI_ACR_SUBPACK_LOW(i), i == 1
++			? ACR_SUBPACK_CTS(cts) : 0);
++	}
++	write_hdmi(HDMI_SPARE, SPARE_HW_CTS
++		| (sHdmi.tmds.hardware_cts ? 0 : SPARE_FORCE_SW_CTS)
++		| SPARE_CTS_RESET_VAL(1));
++	write_hdmi(HDMI_AUDIO_N, read_hdmi(HDMI_AUDIO_N) & ~AUDIO_N_RESETF);
++
++	// Limits of the measured sample rate, in audio clocks per 8 frames
++	static const uint32 kRates[] = { 32000, 44100, 48000, 88200, 96000,
++		176400, 192000 };
++	for (size_t i = 0; i < B_COUNT_OF(kRates); i++) {
++		uint32 rate = kRates[i];
++		uint32 delta = rate > 96000 ? 2 : rate > 48000 ? 6 : 9;
++		uint32 eightHalf = (8 * (uint64)HDMI_AUDIO_CLOCK) / (rate * 128);
++		write_hdmi(HDMI_AUDIO_FS(i), AUDIO_FS_LOW(eightHalf - delta)
++			| AUDIO_FS_HIGH(eightHalf + delta));
++	}
++
++	// Two channels, everything else from the stream; only the first 10
++	// bytes fit the registers
++	uint8 frame[14] = {};
++	frame[0] = 0x84;	// type
++	frame[1] = 1;		// version
++	frame[2] = 10;		// length
++	frame[4] = 1;		// channel count - 1
++	write_infoframe(HDMI_AUDIO_INFOFRAME_HEADER, frame, 10);
++	write_hdmi(HDMI_AUDIO_INFOFRAME_CTRL, INFOFRAME_CTRL_ENABLE);
++	write_hdmi(HDMI_GENERIC_CTRL, read_hdmi(HDMI_GENERIC_CTRL)
++		| GENERIC_CTRL_AUDIO);
++}
++
++
++/*!	The AVI infoframe: RGB, 16:9 or 4:3 picture, the CEA mode if it is one. */
++static void
++write_avi_infoframe()
++{
++	const hdmi_mode& mode = sHdmi.mode;
++	uint8 frame[17] = {};
++	frame[0] = 0x82;	// type
++	frame[1] = 2;		// version
++	frame[2] = 13;		// length
++	frame[4] = 0x10;	// RGB, active format present
++	bool wide = mode.h_display * 3 > mode.v_display * 4 + mode.v_display / 2;
++	frame[5] = (wide ? 0x20 : 0x10) | 0x08;	// picture aspect, same active
++	frame[7] = mode.vic;
++	write_infoframe(HDMI_AVI_INFOFRAME_HEADER, frame, sizeof(frame));
++	write_hdmi(HDMI_AVI_INFOFRAME_CTRL, INFOFRAME_CTRL_ENABLE);
++}
++
++
++static status_t
++start_hdmi(bool hdmiSink)
++{
++	const hdmi_mode& mode = sHdmi.mode;
++
++	write_car(CAR_CLK_SOURCE_HDMI, CAR_SOURCE_PLL_D_OUT0);
++	enable_block(CAR_CLK_OUT_ENB_H, CAR_RST_DEVICES_H, CAR_HDMI_BIT, true);
++
++	// Power the serializer's PLL up
++	write_hdmi(HDMI_SOR_PLL0, read_hdmi(HDMI_SOR_PLL0) & ~SOR_PLL_PDBG);
++	spin(20);
++	write_hdmi(HDMI_SOR_PLL0, read_hdmi(HDMI_SOR_PLL0) & ~SOR_PLL_PWR);
++
++	write_hdmi(HDMI_VSYNC_WINDOW, VSYNC_WINDOW_ENABLE | VSYNC_WINDOW_START(0x200)
++		| VSYNC_WINDOW_END(0x210));
++	// CEA modes on HDMI sinks have limited range RGB, DVI full range
++	write_hdmi(HDMI_INPUT_CONTROL, HDMI_SOURCE_DISPLAY_B
++		| (hdmiSink && mode.vic > 1 ? HDMI_VIDEO_RANGE_LIMITED : 0));
++
++	// Reference clock in quarters of MHz
++	uint32 quarters = mode.pixel_clock / 1000 * 4;
++	write_hdmi(HDMI_SOR_REFCLK, SOR_REFCLK_DIV_INT(quarters >> 2)
++		| SOR_REFCLK_DIV_FRAC(quarters));
++
++	uint32 hBlank = mode.h_total - mode.h_display;
++	uint32 control = HDMI_CTRL_REKEY(HDMI_REKEY)
++		| HDMI_CTRL_MAX_AC_PACKET((hBlank - HDMI_REKEY - 18) / 32);
++	if (hdmiSink)
++		control |= HDMI_CTRL_ENABLE;
++	write_hdmi(HDMI_CTRL, control);
++	if (hdmiSink) {
++		write_avi_infoframe();
++		setup_audio_packets();
++	} else {
++		write_hdmi(HDMI_AVI_INFOFRAME_CTRL, 0);
++		write_hdmi(HDMI_AUDIO_INFOFRAME_CTRL, 0);
++	}
++
++	// TMDS settings of the Tegra 2: pre-emphasis above 27 MHz
++	const tmds_settings& tmds = sHdmi.tmds;
++	bool slow = mode.pixel_clock <= 27000;
++	uint32 preEmphasis = slow ? 0 : tmds.pre_emphasis;
++	write_hdmi(HDMI_SOR_PLL0, SOR_PLL_BG_V17_S(3) | SOR_PLL_ICHPMP(1)
++		| SOR_PLL_RESISTORSEL | SOR_PLL_VCOCAP(slow ? 0 : tmds.vco_cap)
++		| SOR_PLL_TX_REG_LOAD(3));
++	write_hdmi(HDMI_SOR_PLL1, SOR_PLL_TMDS_TERM_ENABLE
++		| (preEmphasis != 0 ? SOR_PLL_PE_EN : 0));
++	write_hdmi(HDMI_PE_CURRENT, PE_CURRENT_ALL(preEmphasis));
++	write_hdmi(HDMI_SOR_LANE_DRIVE_CURRENT,
++		DRIVE_CURRENT_ALL(tmds.drive_current) | DRIVE_CURRENT_FUSE_OVERRIDE);
++
++	write_hdmi(HDMI_SOR_SEQ_CTL, SOR_SEQ_PD_PC(8) | SOR_SEQ_PD_PC_ALT(8));
++	uint32 instruction = SOR_SEQ_INST_WAIT_TIME(1) | SOR_SEQ_INST_WAIT_VSYNC
++		| SOR_SEQ_INST_HALT | SOR_SEQ_INST_DRIVE_PWM_LOW;
++	write_hdmi(HDMI_SOR_SEQ_INST(0), instruction);
++	write_hdmi(HDMI_SOR_SEQ_INST(8), instruction);
++
++	uint32 custom = read_hdmi(HDMI_SOR_CSTM);
++	custom &= ~(SOR_CSTM_ROTCLK(0xf) | SOR_CSTM_LVDS_ENABLE
++		| SOR_CSTM_MODE_MASK);
++	custom |= SOR_CSTM_ROTCLK(2) | SOR_CSTM_PLLDIV | SOR_CSTM_MODE_TMDS;
++	write_hdmi(HDMI_SOR_CSTM, custom);
++
++	// Start the serializer
++	write_hdmi(HDMI_SOR_PWR, SOR_PWR_NORMAL_STATE_PU | SOR_PWR_SETTING_NEW);
++	write_hdmi(HDMI_SOR_PWR, SOR_PWR_NORMAL_STATE_PU);
++	bigtime_t timeout = system_time() + 100000;
++	while ((read_hdmi(HDMI_SOR_PWR) & SOR_PWR_SETTING_NEW) != 0) {
++		if (system_time() > timeout) {
++			ERROR("the serializer does not power up\n");
++			return B_TIMED_OUT;
++		}
++		spin(10);
++	}
++
++	uint32 state = SOR_STATE_CRCMODE_COMPLETE | SOR_STATE_OWNER_HEAD0
++		| SOR_STATE_SUBOWNER_BOTH | SOR_STATE_PROTOCOL_TMDS_A;
++	if (!mode.h_sync_positive)
++		state |= SOR_STATE_HSYNC_NEGATIVE;
++	if (!mode.v_sync_positive)
++		state |= SOR_STATE_VSYNC_NEGATIVE;
++	write_hdmi(HDMI_SOR_STATE2, state);
++
++	state = SOR_STATE_HEAD_OPMODE_AWAKE | SOR_STATE_ORMODE_NORMAL;
++	write_hdmi(HDMI_SOR_STATE1, state);
++	write_hdmi(HDMI_SOR_STATE0, 0);
++	write_hdmi(HDMI_SOR_STATE0, SOR_STATE_UPDATE);
++	write_hdmi(HDMI_SOR_STATE1, state | SOR_STATE_ATTACHED);
++	write_hdmi(HDMI_SOR_STATE0, 0);
++
++	// Display controller B feeds the HDMI block
++	write_dc(DC_DISP_WIN_OPTIONS, HDMI_ENABLE);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_UPDATE);
++	read_dc(DC_CMD_STATE_CONTROL);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_ACT_REQ);
++	return B_OK;
++}
++
++
++static void
++stop_hdmi()
++{
++	write_hdmi(HDMI_AVI_INFOFRAME_CTRL, 0);
++	write_hdmi(HDMI_AUDIO_INFOFRAME_CTRL, 0);
++	write_hdmi(HDMI_GENERIC_CTRL, 0);
++	write_hdmi(HDMI_SOR_PLL0, read_hdmi(HDMI_SOR_PLL0) | SOR_PLL_PWR
++		| SOR_PLL_PDBG);
++	enable_block(CAR_CLK_OUT_ENB_H, CAR_RST_DEVICES_H, CAR_HDMI_BIT, false);
++}
++
++
++//	#pragma mark - connect and disconnect
++
++
++static void
++disconnect()
++{
++	if (!sHdmi.active)
++		return;
++
++	stop_display_controller();
++	stop_hdmi();
++	write_car(CAR_PLLD_BASE, 0);
++	set_hdmi_power(false);
++	sHdmi.active = false;
++	dprintf("tegra_dc: hdmi: screen unplugged\n");
++}
++
++
++static void
++connect()
++{
++	void* settings = load_driver_settings("tegra_dc");
++	tmds_settings& tmds = sHdmi.tmds;
++	// "hdmi_output false" leaves the HDMI block off with a screen plugged in
++	sHdmi.output_enabled = get_driver_boolean_parameter(settings,
++		"hdmi_output", true, true);
++	if (!sHdmi.output_enabled) {
++		unload_driver_settings(settings);
++		dprintf("tegra_dc: hdmi: output turned off in the settings\n");
++		return;
++	}
++	// "hdmi_dvi true" sends plain DVI even to HDMI sinks
++	tmds.force_dvi = get_driver_boolean_parameter(settings, "hdmi_dvi", false,
++		true);
++	tmds.pre_emphasis = min_c(strtoul(get_driver_parameter(settings,
++		"hdmi_pre_emphasis", "12", "12"), NULL, 0), 0xfu);
++		// 12 = 6 mA, as Linux has it for the Tegra 2
++	tmds.drive_current = min_c(strtoul(get_driver_parameter(settings,
++		"hdmi_drive_current", "15", "15"), NULL, 0), 0x3fu);
++	const char* modeName = get_driver_parameter(settings, "hdmi_mode", NULL,
++		NULL);
++	tmds.force_720p = modeName != NULL && strcmp(modeName, "720p") == 0;
++	tmds.preferred_mode = modeName != NULL
++		&& strcmp(modeName, "preferred") == 0;
++	tmds.hardware_cts = get_driver_boolean_parameter(settings, "hdmi_hw_cts",
++		false, true);
++	tmds.audio_auto = get_driver_boolean_parameter(settings,
++		"hdmi_audio_auto", true, true);
++	tmds.vco_cap = min_c(strtoul(get_driver_parameter(settings,
++		"hdmi_vco_cap", "1", "1"), NULL, 0), 0xfu);
++	unload_driver_settings(settings);
++
++	status_t status = set_hdmi_power(true);
++	if (status != B_OK) {
++		ERROR("cannot power the HDMI block: %s\n", strerror(status));
++		return;
++	}
++
++	// The screen may need a while after the hot plug line rises before it
++	// answers on the DDC bus (a television took more than a second)
++	uint8 edid[EDID_SIZE];
++	uint32 edidSize = 0;
++	for (int32 attempt = 0; attempt < 10; attempt++) {
++		snooze(200000);
++		setup_ddc();
++		status = read_edid(edid, &edidSize);
++		if (status == B_OK)
++			break;
++		ERROR("EDID attempt %" B_PRId32 ": %s, I2C status %#" B_PRIx32 "\n",
++			attempt, strerror(status), sHdmi.i2c[I2C_INT_STATUS / 4]);
++	}
++
++	bool hdmiSink = true;
++	sHdmi.mode = k720p;
++	sHdmi.screen_name[0] = '\0';
++	sHdmi.has_edid = status == B_OK;
++	if (status == B_OK) {
++		hdmiSink = is_hdmi_sink(edid, edidSize);
++		hdmi_mode chosen;
++		if (!tmds.force_720p && choose_mode(edid, edidSize,
++				tmds.preferred_mode, chosen))
++			sHdmi.mode = chosen;
++		char name[14] = "";
++		for (uint32 offset = 0x36; offset < 0x7e; offset += 18) {
++			const uint8* descriptor = edid + offset;
++			if (descriptor[0] == 0 && descriptor[1] == 0
++				&& descriptor[3] == 0xfc) {
++				for (int32 i = 0; i < 13; i++) {
++					char c = descriptor[5 + i];
++					name[i] = c == '\n' ? '\0' : c;
++					if (c == '\n')
++						break;
++				}
++				name[13] = '\0';
++			}
++		}
++		dprintf("tegra_dc: hdmi: EDID of \"%s\", %s sink\n", name,
++			hdmiSink ? "HDMI" : "DVI");
++		strlcpy(sHdmi.screen_name, name, sizeof(sHdmi.screen_name));
++	} else
++		ERROR("no EDID (%s), trying 1280x720\n", strerror(status));
++
++	sHdmi.hdmi_sink = hdmiSink;
++	if (tmds.force_dvi)
++		hdmiSink = false;
++	sHdmi.sending_dvi = !hdmiSink;
++
++	const hdmi_mode& mode = sHdmi.mode;
++	status = set_pll_d(mode.pixel_clock);
++	if (status != B_OK) {
++		set_hdmi_power(false);
++		return;
++	}
++
++	sHdmi.active = true;
++	start_display_controller();
++	status = start_hdmi(hdmiSink);
++	if (status != B_OK) {
++		disconnect();
++		return;
++	}
++
++	dprintf("tegra_dc: hdmi: %ux%u, %" B_PRIu32 " kHz, totals %ux%u, VIC %u, "
++		"%s, pre-emphasis %" B_PRIu32 ", drive %" B_PRIu32 ", VCO cap %"
++		B_PRIu32 "%s%s\n", mode.h_display, mode.v_display, mode.pixel_clock,
++		mode.h_total, mode.v_total, mode.vic, hdmiSink ? "HDMI" : "DVI",
++		tmds.pre_emphasis, tmds.drive_current, tmds.vco_cap,
++		tmds.hardware_cts ? ", hardware CTS" : "",
++		tmds.audio_auto ? ", audio source auto" : "");
++}
++
++
++static status_t
++hot_plug_thread(void*)
++{
++	bool plugged = false;
++	int32 stable = 0;
++	while (!sHdmi.quit) {
++		bool now = screen_plugged();
++		stable = now != plugged ? stable + 1 : 0;
++		if (stable >= 2) {
++			// the line kept its new level for two polls
++			plugged = now;
++			stable = 0;
++			MutexLocker locker(sHdmi.lock);
++			sHdmi.plugged = plugged;
++			if (plugged)
++				connect();
++			else
++				disconnect();
++		}
++		snooze(POLL_INTERVAL);
++	}
++	return B_OK;
++}
++
++
++//	#pragma mark - interface
++
++
++static void
++unmap_all()
++{
++	delete_area(sHdmi.hdmi_area);
++	delete_area(sHdmi.dc_area);
++	delete_area(sHdmi.i2c_area);
++	delete_area(sHdmi.gpio_area);
++	delete_area(sHdmi.car_area);
++	sHdmi.hdmi_area = sHdmi.dc_area = sHdmi.i2c_area = sHdmi.gpio_area
++		= sHdmi.car_area = -1;
++}
++
++
++status_t
++hdmi_start(uint32 physical, uint16 width, uint16 height, uint32 colorDepth,
++	uint32 bytesPerRow)
++{
++	memset(&sHdmi, 0, sizeof(sHdmi));
++	sHdmi.thread = -1;
++	sHdmi.output_enabled = true;
++
++	// "hdmi false" in the driver settings leaves the HDMI block off
++	void* settings = load_driver_settings("tegra_dc");
++	bool enabled = get_driver_boolean_parameter(settings, "hdmi", true, true);
++	unload_driver_settings(settings);
++	if (!enabled)
++		return B_OK;
++
++	sHdmi.car_area = sHdmi.gpio_area = sHdmi.i2c_area = sHdmi.dc_area
++		= sHdmi.hdmi_area = -1;
++	mutex_init(&sHdmi.lock, "tegra_dc hdmi");
++	sHdmi.physical = physical;
++	sHdmi.width = width;
++	sHdmi.height = height;
++	sHdmi.color_depth = colorDepth;
++	sHdmi.bytes_per_row = bytesPerRow;
++
++	sHdmi.car = map_registers("tegra_dc hdmi car", TEGRA20_CAR_BASE,
++		B_PAGE_SIZE, &sHdmi.car_area);
++	sHdmi.gpio = map_registers("tegra_dc hdmi gpio", TEGRA20_GPIO_BASE,
++		B_PAGE_SIZE, &sHdmi.gpio_area);
++	sHdmi.i2c = map_registers("tegra_dc ddc", TEGRA20_I2C2_BASE & ~0xfff,
++		B_PAGE_SIZE, &sHdmi.i2c_area);
++	sHdmi.dc = map_registers("tegra_dc b registers", TEGRA20_DC_B_BASE,
++		TEGRA20_DC_SIZE, &sHdmi.dc_area);
++	sHdmi.hdmi = map_registers("tegra_dc hdmi registers", TEGRA20_HDMI_BASE,
++		HDMI_SIZE, &sHdmi.hdmi_area);
++	if (sHdmi.car == NULL || sHdmi.gpio == NULL || sHdmi.i2c == NULL
++		|| sHdmi.dc == NULL || sHdmi.hdmi == NULL) {
++		unmap_all();
++		mutex_destroy(&sHdmi.lock);
++		return B_NO_MEMORY;
++	}
++	sHdmi.i2c += (TEGRA20_I2C2_BASE & 0xfff) / 4;
++
++	setup_hot_plug_pin();
++	sHdmi.thread = spawn_kernel_thread(&hot_plug_thread, "tegra_dc hot plug",
++		B_LOW_PRIORITY, NULL);
++	if (sHdmi.thread < 0) {
++		status_t status = sHdmi.thread;
++		unmap_all();
++		mutex_destroy(&sHdmi.lock);
++		return status;
++	}
++	resume_thread(sHdmi.thread);
++	return B_OK;
++}
++
++
++void
++hdmi_stop()
++{
++	// thread ids are positive; before hdmi_start() it is 0
++	if (sHdmi.thread <= 0)
++		return;
++
++	sHdmi.quit = true;
++	status_t result;
++	wait_for_thread(sHdmi.thread, &result);
++	sHdmi.thread = -1;
++
++	mutex_lock(&sHdmi.lock);
++	disconnect();
++	mutex_unlock(&sHdmi.lock);
++	unmap_all();
++	mutex_destroy(&sHdmi.lock);
++}
++
++
++void
++hdmi_set_source(uint32 colorDepth, uint32 bytesPerRow)
++{
++	// thread ids are positive; before hdmi_start() it is 0
++	if (sHdmi.thread <= 0)
++		return;
++
++	MutexLocker locker(sHdmi.lock);
++	sHdmi.color_depth = colorDepth;
++	sHdmi.bytes_per_row = bytesPerRow;
++	if (sHdmi.active)
++		program_mirror_window();
++}
++
++
++void
++hdmi_set_overlay(const hdmi_overlay& overlay)
++{
++	// thread ids are positive; before hdmi_start() it is 0
++	if (sHdmi.thread <= 0)
++		return;
++
++	MutexLocker locker(sHdmi.lock);
++	sHdmi.overlay = overlay;
++	if (sHdmi.active)
++		program_overlay_window();
++}
++
++
++void
++hdmi_get_status(tegra_dc_hdmi_status& status)
++{
++	memset(&status, 0, sizeof(status));
++	// thread ids are positive; before hdmi_start() it is 0
++	if (sHdmi.thread <= 0)
++		return;
++
++	MutexLocker locker(sHdmi.lock);
++	status.plugged = sHdmi.plugged;
++	status.active = sHdmi.active;
++	status.enabled = sHdmi.output_enabled;
++	status.video = sHdmi.video.enabled;
++	status.has_edid = sHdmi.has_edid;
++	status.hdmi_sink = sHdmi.hdmi_sink;
++	status.dvi = sHdmi.sending_dvi;
++	strlcpy(status.screen_name, sHdmi.screen_name,
++		sizeof(status.screen_name));
++	if (sHdmi.active) {
++		status.width = sHdmi.mode.h_display;
++		status.height = sHdmi.mode.v_display;
++		status.pixel_clock = sHdmi.mode.pixel_clock;
++		status.h_total = sHdmi.mode.h_total;
++		status.v_total = sHdmi.mode.v_total;
++	}
++}
++
++
++void
++hdmi_reconnect()
++{
++	if (sHdmi.thread <= 0)
++		return;
++
++	MutexLocker locker(sHdmi.lock);
++	disconnect();
++	if (sHdmi.plugged)
++		connect();
++}
++
++
++void
++hdmi_set_video(const hdmi_video& video)
++{
++	// thread ids are positive; before hdmi_start() it is 0
++	if (sHdmi.thread <= 0)
++		return;
++
++	MutexLocker locker(sHdmi.lock);
++	bool changed = video.enabled != sHdmi.video.enabled;
++	sHdmi.video = video;
++	if (!sHdmi.active)
++		return;
++	if (changed) {
++		program_mirror_window();
++		program_cursor_window();
++	}
++	program_overlay_window();
++}
++
++
++void
++hdmi_set_cursor(bool visible, uint32 physical, int32 x, int32 y,
++	uint32 width, uint32 height, uint32 skipX, uint32 skipY)
++{
++	// thread ids are positive; before hdmi_start() it is 0
++	if (sHdmi.thread <= 0)
++		return;
++
++	MutexLocker locker(sHdmi.lock);
++	auto& cursor = sHdmi.cursor;
++	cursor.visible = visible;
++	cursor.physical = physical;
++	cursor.x = x;
++	cursor.y = y;
++	cursor.width = width;
++	cursor.height = height;
++	cursor.skip_x = skipX;
++	cursor.skip_y = skipY;
++	if (sHdmi.active)
++		program_cursor_window();
++}
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.h b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.h
+new file mode 100644
+index 0000000000..b9f7c40a0d
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/hdmi.h
+@@ -0,0 +1,71 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef TEGRA_DC_HDMI_H
++#define TEGRA_DC_HDMI_H
++
++
++#include <SupportDefs.h>
++
++
++// The second display controller and the HDMI block show the panel's frame
++// buffer on an external screen while one is plugged in. The color depth is
++// a window color depth code of the display controller.
++
++status_t hdmi_start(uint32 physical, uint16 width, uint16 height,
++	uint32 colorDepth, uint32 bytesPerRow);
++void hdmi_stop();
++void hdmi_set_source(uint32 colorDepth, uint32 bytesPerRow);
++
++// The cursor: the part of the 64x64 B8G8R8A8 image at \a physical that is
++// on the panel at \a x, \a y, starting \a skipX, \a skipY into the image
++void hdmi_set_cursor(bool visible, uint32 physical, int32 x, int32 y,
++	uint32 width, uint32 height, uint32 skipX, uint32 skipY);
++
++// The video overlay, as window B of the panel's controller shows it
++struct hdmi_overlay {
++	bool	visible;
++	uint32	physical;		// of the source buffer
++	uint32	color_depth;
++	uint32	byte_swap;
++	uint32	options;		// window options: enable, filters, CSC
++	uint32	bytes_per_pixel;
++	uint32	bytes_per_row;
++	uint32	source_x;		// in pixels
++	uint32	source_y;
++	uint32	source_width;
++	uint32	source_height;
++	uint32	x;				// on the panel
++	uint32	y;
++	uint32	width;
++	uint32	height;
++	bool	color_key;
++	uint32	key_lower;
++	uint32	key_upper;
++};
++
++void hdmi_set_overlay(const hdmi_overlay& overlay);
++
++// A video shown on the whole HDMI screen instead of the mirrored panel
++struct hdmi_video {
++	bool	enabled;
++	uint32	physical;		// of the frame
++	uint32	color_depth;
++	uint32	byte_swap;
++	uint32	options;		// window options: enable, filters, CSC
++	uint32	bytes_per_pixel;
++	uint32	bytes_per_row;
++	uint32	width;
++	uint32	height;
++};
++
++void hdmi_set_video(const hdmi_video& video);
++
++struct tegra_dc_hdmi_status;
++void hdmi_get_status(tegra_dc_hdmi_status& status);
++// stops the output and starts it again with the driver settings
++void hdmi_reconnect();
++
++
++#endif	// TEGRA_DC_HDMI_H
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp b/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
+new file mode 100644
+index 0000000000..409e1fd80a
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
+@@ -0,0 +1,1468 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++/*!	Driver for the display controller of the NVIDIA Tegra 2 (Tegra20), as in
++	the Toshiba AC100. Register descriptions come from the Tegra 2 Technical
++	Reference Manual, chapter 29 "Display Controller".
++
++	The firmware (U-Boot) has set the panel up: clocks, pins, timings and
++	window A scanning out a 16 bit frame buffer from memory it reserved. This
++	driver keeps all of that and only changes window A: its pixel format and
++	line stride, to offer 32 bit as well as 16 bit. It also takes the vertical
++	blank interrupt for the retrace semaphore.
++
++	The driver only publishes its device when it finds this state. Otherwise
++	app_server keeps using the generic frame buffer driver.
++*/
++
++
++#include <stdio.h>
++#include <string.h>
++
++#include <KernelExport.h>
++#include <OS.h>
++#include <boot_item.h>
++#include <frame_buffer_console.h>
++#include <graphic_driver.h>
++#include <lock.h>
++#include <util/AutoLock.h>
++#include <vm/vm.h>
++
++#include <libfdt.h>
++
++#include "hdmi.h"
++#include "tegra_dc_info.h"
++
++
++//#define TRACE_TEGRA_DC
++#ifdef TRACE_TEGRA_DC
++#	define TRACE(x...) dprintf("tegra_dc: " x)
++#else
++#	define TRACE(x...) ;
++#endif
++#define ERROR(x...) dprintf("tegra_dc: " x)
++
++
++extern void* gFDT;
++
++
++#define VESA_EDID_BOOT_INFO			"vesa_edid/v1"
++
++#define TEGRA20_CAR_BASE			0x60006000
++#define CAR_RST_DEVICES_L			0x004
++#define CAR_CLK_OUT_ENB_L			0x010
++#define CAR_DISP1_BIT				(1u << 27)
++#define CAR_PWM_BIT					(1u << 17)
++
++// The panel backlight: channel 0 of the PWM controller. The embedded
++// controller driver (nvec) changes it too, for the brightness keys and the
++// lid; the register itself is the state both start from.
++#define TEGRA20_PWM_BASE			0x7000a000
++#define PWM_ENABLE					(1u << 31)
++#define PWM_DUTY_SHIFT				16
++#define PWM_DUTY_MASK				(0x1ffu << 16)	// 0 - 256
++
++#define TEGRA20_DC_A_BASE			0x54200000
++#define TEGRA20_DC_SIZE				0x10000
++#define TEGRA20_DC_A_INTERRUPT		(32 + 73)
++
++// The memory the firmware reserved for its frame buffer. The kernel keeps
++// it out of its free memory, up to its last 192KB (the physical page pool).
++#define SCANOUT_BASE				0x1f800000
++#define SCANOUT_SIZE				0x500000
++
++// The cursor image, 64x64 B8G8R8A8, after room for a 32 bit frame buffer
++#define CURSOR_OFFSET				0x400000
++#define CURSOR_BYTES_PER_ROW		(TEGRA_DC_CURSOR_SIZE * 4)
++
++#define PANEL_WIDTH					1024
++#define PANEL_HEIGHT				600
++
++// Display controller registers, word offsets (TRM 29.7 - 29.15)
++#define DC_CMD_INT_STATUS			0x037
++#define DC_CMD_INT_MASK				0x038
++#define DC_CMD_INT_ENABLE			0x039
++#define DC_CMD_INT_TYPE				0x03a
++#define DC_CMD_INT_POLARITY			0x03b
++#define DC_CMD_STATE_CONTROL		0x041
++#define DC_DISP_MEM_HIGH_PRIORITY	0x403
++#define DC_DISP_MEM_HIGH_PRIORITY_TIMER	0x404
++#define DC_DISP_SYNC_WIDTH			0x407
++#define DC_DISP_BACK_PORCH			0x408
++#define DC_DISP_DISP_ACTIVE			0x409
++#define DC_DISP_FRONT_PORCH			0x40a
++#define DC_DISP_DISP_CLOCK_CONTROL	0x42e
++#define DC_DISP_DATA_ENABLE_OPTIONS	0x432
++
++#define INT_V_BLANK					(1u << 2)
++
++#define STATE_GENERAL_ACT_REQ		(1u << 0)
++#define STATE_WIN_A_ACT_REQ			(1u << 1)
++#define STATE_WIN_B_ACT_REQ			(1u << 2)
++#define STATE_WIN_C_ACT_REQ			(1u << 3)
++#define STATE_GENERAL_UPDATE		(1u << 8)
++#define STATE_WIN_A_UPDATE			(1u << 9)
++#define STATE_WIN_B_UPDATE			(1u << 10)
++#define STATE_WIN_C_UPDATE			(1u << 11)
++
++// The window registers (TRM 29.10 - 29.15) are those of the window that
++// DC_CMD_DISPLAY_WINDOW_HEADER selects. The per window apertures Linux uses
++// (0xa00, 0xc00, 0xe00) are not separate windows on the AC100: they all
++// reach the selected one.
++#define DC_CMD_DISPLAY_WINDOW_HEADER	0x042
++#define WINDOW_A_SELECT				(1u << 4)
++#define WINDOW_B_SELECT				(1u << 5)
++#define WINDOW_C_SELECT				(1u << 6)
++
++// Window B/C scaling filters and color space conversion (TRM 29.12)
++#define WINC_H_FILTER_P00			0x601
++#define WINC_CSC_YOF				0x611
++#define WINC_CSC_KYRGB				0x612
++#define WINC_CSC_KUR				0x613
++#define WINC_CSC_KVR				0x614
++#define WINC_CSC_KUG				0x615
++#define WINC_CSC_KVG				0x616
++#define WINC_CSC_KUB				0x617
++#define WINC_CSC_KVB				0x618
++#define WINC_V_FILTER_P00			0x619
++
++#define DC_DISP_COLOR_KEY0_LOWER	0x436
++#define DC_DISP_COLOR_KEY0_UPPER	0x437
++
++#define WIN_OPTIONS					0x700
++#define WIN_BYTE_SWAP				0x701
++#define WIN_COLOR_DEPTH				0x703
++#define WIN_POSITION				0x704
++#define WIN_SIZE					0x705
++#define WIN_PRESCALED_SIZE			0x706
++#define WIN_H_INITIAL_DDA			0x707
++#define WIN_V_INITIAL_DDA			0x708
++#define WIN_DDA_INCREMENT			0x709
++#define WIN_LINE_STRIDE				0x70a
++#define WIN_BUF_STRIDE				0x70b
++#define WIN_BUFFER_ADDR_MODE		0x70d
++#define WIN_BLEND_NOKEY				0x70f
++#define WIN_BLEND_1WIN				0x710
++#define WIN_BLEND_2WIN_X			0x711	// A: with B, C: with A
++#define WIN_BLEND_2WIN_Y			0x712	// A: with C, C: with B
++#define WIN_BLEND_3WIN				0x713
++#define WINBUF_START_ADDR			0x800
++#define WINBUF_ADDR_H_OFFSET		0x806
++#define WINBUF_ADDR_V_OFFSET		0x808
++
++#define DDA_INCREMENT_1_TO_1		0x10001000
++
++// Blend control (TRM 29.10.18 - 29.10.21)
++#define BLEND_WEIGHT1(x)			((uint32)(x) << 16)
++#define BLEND_WEIGHT0(x)			((uint32)(x) << 8)
++#define BLEND_CONTROL_FIX			(0u << 2)
++#define BLEND_CONTROL_ALPHA			(1u << 2)
++#define BLEND_CONTROL_DEPENDENT		(2u << 2)
++
++#define BLEND_CKEY0					1u
++
++#define WIN_OPTIONS_COLOR_EXPAND	(1u << 6)
++#define WIN_OPTIONS_H_FILTER		(1u << 8)
++#define WIN_OPTIONS_V_FILTER		(1u << 10)
++#define WIN_OPTIONS_CSC				(1u << 18)
++
++#define COLOR_DEPTH_YCbCr422		16
++#define BYTE_SWAP_SWAP2				1
++
++// Largest downscaling: the DDA steps are 4.12 fixed point
++#define MAX_H_DDA_2_BYTES			0x8000
++#define MAX_H_DDA_4_BYTES			0x4000
++#define MAX_V_DDA					0xf000
++
++#define MAX_OVERLAY_BUFFERS			16
++#define WIN_OPTIONS_ENABLE			(1u << 30)
++
++#define COLOR_DEPTH_B5G6R5			6
++#define COLOR_DEPTH_B8G8R8A8		12
++
++// The pixel clock: PLL_P divided by the shift clock divider
++#define PLL_P_KHZ					216000
++
++
++struct tegra_dc_device {
++	mutex				lock;
++	int32				open_count;
++
++	area_id				registers_area;
++	volatile uint32*	registers;
++
++	area_id				scanout_area;
++	uint8*				scanout;
++
++	area_id				shared_area;
++	tegra_dc_shared_info* shared_info;
++
++	area_id				pwm_area;
++	volatile uint32*	pwm;
++	uint32				saved_pwm;		// while the screen sleeps
++
++	// hardware cursor, on window C
++	bool				cursor_ready;	// window C and blending set up
++	bool				cursor_shown;
++	int32				cursor_x;		// hot spot on screen
++	int32				cursor_y;
++	uint16				cursor_width;
++	uint16				cursor_height;
++	uint16				cursor_hot_x;
++	uint16				cursor_hot_y;
++
++	// video overlay, on window B
++	struct {
++		area_id			area;			// the cloneable mapping
++		area_id			memory;			// the contiguous memory itself
++		uint32			physical;
++		uint32			size;
++	}					overlay_buffers[MAX_OVERLAY_BUFFERS];
++	bool				overlay_ready;	// filters, CSC and blending set
++};
++
++
++int32 api_version = B_CUR_DRIVER_API_VERSION;
++
++static const char* sDeviceNames[] = { TEGRA_DC_DEVICE_NAME, NULL };
++static tegra_dc_device sDevice;
++
++
++static inline uint32
++read_dc(uint32 word)
++{
++	return sDevice.registers[word];
++}
++
++
++static inline void
++write_dc(uint32 word, uint32 value)
++{
++	sDevice.registers[word] = value;
++}
++
++
++/*!	Selects the window whose registers the window register offsets reach.
++	Window A stays selected otherwise, as the firmware left it.
++*/
++static inline void
++select_window(uint32 select)
++{
++	write_dc(DC_CMD_DISPLAY_WINDOW_HEADER, select);
++}
++
++
++static volatile uint32*
++map_registers(const char* name, phys_addr_t base, size_t size, area_id* _area)
++{
++	void* address;
++	*_area = map_physical_memory(name, base, size, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++	return *_area >= 0 ? (volatile uint32*)address : NULL;
++}
++
++
++/*!	Reads the panel timing the firmware programmed. The front porch register
++	holds one less than the front porch (as U-Boot programs it; it makes the
++	frame rate come out at the panel's 60 Hz).
++*/
++static void
++read_timing(display_timing& timing)
++{
++	uint32 syncWidth = read_dc(DC_DISP_SYNC_WIDTH);
++	uint32 backPorch = read_dc(DC_DISP_BACK_PORCH);
++	uint32 active = read_dc(DC_DISP_DISP_ACTIVE);
++	uint32 frontPorch = read_dc(DC_DISP_FRONT_PORCH);
++	uint32 clockControl = read_dc(DC_DISP_DISP_CLOCK_CONTROL);
++
++	timing.h_display = active & 0xffff;
++	timing.h_sync_start = timing.h_display + (frontPorch & 0xffff) + 1;
++	timing.h_sync_end = timing.h_sync_start + (syncWidth & 0xffff);
++	timing.h_total = timing.h_sync_end + (backPorch & 0xffff);
++
++	timing.v_display = active >> 16;
++	timing.v_sync_start = timing.v_display + (frontPorch >> 16) + 1;
++	timing.v_sync_end = timing.v_sync_start + (syncWidth >> 16);
++	timing.v_total = timing.v_sync_end + (backPorch >> 16);
++
++	// Shift clock divider n: the pixel clock is the source / (n / 2 + 1)
++	uint32 divider = clockControl & 0xff;
++	timing.pixel_clock = PLL_P_KHZ * 2 / (divider + 2);
++	timing.flags = 0;
++}
++
++
++static void
++fill_mode(display_mode& mode, color_space space)
++{
++	memset(&mode, 0, sizeof(display_mode));
++	mode.timing = sDevice.shared_info->timing;
++	mode.space = space;
++	mode.virtual_width = PANEL_WIDTH;
++	mode.virtual_height = PANEL_HEIGHT;
++	mode.flags = B_8_BIT_DAC | B_PARALLEL_ACCESS | B_HARDWARE_CURSOR;
++	if (sDevice.shared_info->has_backlight)
++		mode.flags |= B_DPMS;
++}
++
++
++/*!	Moves a window register change from the assembly copy through the armed
++	copy to the active one. The two steps have to be separate writes (TRM
++	29.7.28); the second one takes effect at the next frame boundary.
++*/
++static status_t
++commit_window_a()
++{
++	write_dc(DC_CMD_STATE_CONTROL, STATE_WIN_A_UPDATE);
++	read_dc(DC_CMD_STATE_CONTROL);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_WIN_A_ACT_REQ);
++
++	bigtime_t timeout = system_time() + 100000;
++	while ((read_dc(DC_CMD_STATE_CONTROL) & STATE_WIN_A_ACT_REQ) != 0) {
++		if (system_time() > timeout)
++			return B_TIMED_OUT;
++		snooze(1000);
++	}
++	return B_OK;
++}
++
++
++static status_t
++program_display_mode(const display_mode& mode)
++{
++	uint32 bytesPerPixel;
++	uint32 colorDepth;
++	uint32 kdlDepth;
++	switch (mode.space) {
++		case B_RGB16:
++			bytesPerPixel = 2;
++			colorDepth = COLOR_DEPTH_B5G6R5;
++			kdlDepth = 16;
++			break;
++		case B_RGB32:
++		case B_RGBA32:
++			bytesPerPixel = 4;
++			colorDepth = COLOR_DEPTH_B8G8R8A8;
++			kdlDepth = 32;
++			break;
++		default:
++			return B_BAD_VALUE;
++	}
++	if (mode.virtual_width != PANEL_WIDTH
++		|| mode.virtual_height != PANEL_HEIGHT
++		|| mode.timing.h_display != PANEL_WIDTH
++		|| mode.timing.v_display != PANEL_HEIGHT) {
++		return B_BAD_VALUE;
++	}
++
++	uint32 bytesPerRow = PANEL_WIDTH * bytesPerPixel;
++	if (bytesPerRow * PANEL_HEIGHT > SCANOUT_SIZE)
++		return B_BAD_VALUE;
++
++	// Start from a black screen: app_server draws everything again
++	memset(sDevice.scanout, 0, bytesPerRow * PANEL_HEIGHT);
++
++	select_window(WINDOW_A_SELECT);
++	uint32 options = read_dc(WIN_OPTIONS) | WIN_OPTIONS_ENABLE;
++	if (bytesPerPixel == 2)
++		options |= WIN_OPTIONS_COLOR_EXPAND;
++	else
++		options &= ~WIN_OPTIONS_COLOR_EXPAND;
++
++	write_dc(WIN_COLOR_DEPTH, colorDepth);
++	write_dc(WIN_OPTIONS, options);
++	write_dc(WIN_POSITION, 0);
++	write_dc(WIN_SIZE, (PANEL_HEIGHT << 16) | PANEL_WIDTH);
++	write_dc(WIN_PRESCALED_SIZE, (PANEL_HEIGHT << 16) | bytesPerRow);
++	write_dc(WIN_H_INITIAL_DDA, 0);
++	write_dc(WIN_V_INITIAL_DDA, 0);
++	write_dc(WIN_DDA_INCREMENT, DDA_INCREMENT_1_TO_1);
++	write_dc(WIN_LINE_STRIDE, bytesPerRow);
++	write_dc(WINBUF_START_ADDR, SCANOUT_BASE);
++	write_dc(WINBUF_ADDR_H_OFFSET, 0);
++	write_dc(WINBUF_ADDR_V_OFFSET, 0);
++
++	status_t status = commit_window_a();
++	if (status != B_OK) {
++		ERROR("window A did not take the new mode\n");
++		return status;
++	}
++
++	tegra_dc_shared_info& info = *sDevice.shared_info;
++	fill_mode(info.current_mode, (color_space)mode.space);
++	info.bytes_per_row = bytesPerRow;
++	hdmi_set_source(colorDepth, bytesPerRow);
++
++	// The kernel debugger writes the screen too
++	frame_buffer_update((addr_t)sDevice.scanout, PANEL_WIDTH, PANEL_HEIGHT,
++		kdlDepth, bytesPerRow);
++
++	dprintf("tegra_dc: %dx%d, %" B_PRIu32 " bits per pixel\n", PANEL_WIDTH,
++		PANEL_HEIGHT, kdlDepth);
++	return B_OK;
++}
++
++
++//	#pragma mark - backlight
++
++
++static bool
++pwm_running()
++{
++	area_id area;
++	volatile uint32* car = map_registers("tegra car", TEGRA20_CAR_BASE,
++		B_PAGE_SIZE, &area);
++	if (car == NULL)
++		return false;
++	bool running = (car[CAR_CLK_OUT_ENB_L / 4] & CAR_PWM_BIT) != 0
++		&& (car[CAR_RST_DEVICES_L / 4] & CAR_PWM_BIT) == 0;
++	delete_area(area);
++	return running;
++}
++
++
++static uint32
++backlight_duty()
++{
++	uint32 pwm = *sDevice.pwm;
++	if ((pwm & PWM_ENABLE) == 0)
++		return 0;
++	return (pwm & PWM_DUTY_MASK) >> PWM_DUTY_SHIFT;
++}
++
++
++static status_t
++set_backlight_duty(uint32 duty)
++{
++	if (duty < 1 || duty > 256)
++		return B_BAD_VALUE;
++	if (sDevice.shared_info->dpms_mode != B_DPMS_ON) {
++		// takes effect when the screen wakes up
++		sDevice.saved_pwm = (sDevice.saved_pwm & ~PWM_DUTY_MASK) | PWM_ENABLE
++			| (duty << PWM_DUTY_SHIFT);
++		return B_OK;
++	}
++	*sDevice.pwm = (*sDevice.pwm & ~PWM_DUTY_MASK) | PWM_ENABLE
++		| (duty << PWM_DUTY_SHIFT);
++	return B_OK;
++}
++
++
++/*!	The panel has no power saving modes of its own here: all of them switch
++	the backlight off, and on again as it was.
++*/
++static status_t
++set_screen_power(uint32 mode)
++{
++	uint32& current = sDevice.shared_info->dpms_mode;
++	if (mode != B_DPMS_ON && mode != B_DPMS_STAND_BY && mode != B_DPMS_SUSPEND
++		&& mode != B_DPMS_OFF) {
++		return B_BAD_VALUE;
++	}
++	if (mode == current)
++		return B_OK;
++
++	if (current == B_DPMS_ON) {
++		sDevice.saved_pwm = *sDevice.pwm;
++		*sDevice.pwm &= ~(PWM_DUTY_MASK | PWM_ENABLE);
++	} else if (mode == B_DPMS_ON)
++		*sDevice.pwm = sDevice.saved_pwm;
++
++	current = mode;
++	return B_OK;
++}
++
++
++//	#pragma mark - cursor
++
++
++/*!	The cursor is window C, the top window: a 64x64 B8G8R8A8 image blended
++	with its alpha over window A. Linux does the same on the Tegra 2, whose
++	own hardware cursor only has two colors.
++*/
++static void
++setup_cursor_window()
++{
++	select_window(WINDOW_C_SELECT);
++	write_dc(WIN_OPTIONS, 0);
++	write_dc(WIN_COLOR_DEPTH, COLOR_DEPTH_B8G8R8A8);
++	write_dc(WIN_H_INITIAL_DDA, 0);
++	write_dc(WIN_V_INITIAL_DDA, 0);
++	write_dc(WIN_DDA_INCREMENT, DDA_INCREMENT_1_TO_1);
++	write_dc(WIN_LINE_STRIDE, CURSOR_BYTES_PER_ROW);
++	write_dc(WIN_BUF_STRIDE, 0);
++	write_dc(WIN_BUFFER_ADDR_MODE, 0);
++	write_dc(WINBUF_START_ADDR, SCANOUT_BASE + CURSOR_OFFSET);
++
++	// Window C by the alpha of its pixels, wherever it is
++	const uint32 alpha = BLEND_CONTROL_ALPHA | BLEND_WEIGHT1(255)
++		| BLEND_WEIGHT0(255);
++	write_dc(WIN_BLEND_NOKEY, BLEND_WEIGHT1(255) | BLEND_WEIGHT0(255));
++	write_dc(WIN_BLEND_1WIN, alpha);
++	write_dc(WIN_BLEND_2WIN_X, alpha);
++	write_dc(WIN_BLEND_2WIN_Y, alpha);
++	write_dc(WIN_BLEND_3WIN, alpha);
++
++	// Window A takes what window C leaves
++	select_window(WINDOW_A_SELECT);
++	write_dc(WIN_BLEND_2WIN_Y, BLEND_CONTROL_DEPENDENT);
++	if (!sDevice.overlay_ready) {
++		// with the video, configure_overlay() decides how A and B blend
++		write_dc(WIN_BLEND_3WIN, BLEND_CONTROL_DEPENDENT);
++	}
++
++	// High priority memory requests for window C too, as U-Boot set them for
++	// window A
++	write_dc(DC_DISP_MEM_HIGH_PRIORITY,
++		(read_dc(DC_DISP_MEM_HIGH_PRIORITY) & ~(0x7fu << 16)) | (0x20u << 16));
++	write_dc(DC_DISP_MEM_HIGH_PRIORITY_TIMER,
++		(read_dc(DC_DISP_MEM_HIGH_PRIORITY_TIMER) & ~(0x3fu << 16))
++			| (1u << 16));
++
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_UPDATE | STATE_WIN_A_UPDATE
++		| STATE_WIN_C_UPDATE);
++	read_dc(DC_CMD_STATE_CONTROL);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_ACT_REQ | STATE_WIN_A_ACT_REQ
++		| STATE_WIN_C_ACT_REQ);
++
++	sDevice.cursor_ready = true;
++}
++
++
++/*!	Places window C over the cursor image. A window must lie inside the
++	active display, and its position cannot be negative: a cursor partly
++	off the screen is cropped, by starting to read the image further in.
++	The change takes effect at the next frame.
++*/
++static void
++update_cursor_window()
++{
++	int32 left = sDevice.cursor_x - sDevice.cursor_hot_x;
++	int32 top = sDevice.cursor_y - sDevice.cursor_hot_y;
++	int32 right = left + sDevice.cursor_width;
++	int32 bottom = top + sDevice.cursor_height;
++
++	int32 skipX = left < 0 ? -left : 0;
++	int32 skipY = top < 0 ? -top : 0;
++	if (right > PANEL_WIDTH)
++		right = PANEL_WIDTH;
++	if (bottom > PANEL_HEIGHT)
++		bottom = PANEL_HEIGHT;
++	left += skipX;
++	top += skipY;
++
++	bool visible = sDevice.cursor_shown && right > left && bottom > top;
++	hdmi_set_cursor(visible, SCANOUT_BASE + CURSOR_OFFSET, left, top,
++		visible ? right - left : 0, visible ? bottom - top : 0, skipX, skipY);
++
++	select_window(WINDOW_C_SELECT);
++	if (!visible) {
++		write_dc(WIN_OPTIONS, 0);
++	} else {
++		uint32 width = right - left;
++		uint32 height = bottom - top;
++		write_dc(WIN_POSITION, (top << 16) | left);
++		write_dc(WIN_SIZE, (height << 16) | width);
++		write_dc(WIN_PRESCALED_SIZE, (height << 16) | (width * 4));
++		write_dc(WINBUF_ADDR_H_OFFSET, skipX * 4);
++		write_dc(WINBUF_ADDR_V_OFFSET, skipY);
++		write_dc(WIN_OPTIONS, WIN_OPTIONS_ENABLE);
++	}
++	select_window(WINDOW_A_SELECT);
++
++	write_dc(DC_CMD_STATE_CONTROL, STATE_WIN_C_UPDATE);
++	read_dc(DC_CMD_STATE_CONTROL);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_WIN_C_ACT_REQ);
++}
++
++
++static status_t
++load_cursor_image(const tegra_dc_cursor_bitmap& cursor)
++{
++	if (cursor.width == 0 || cursor.height == 0
++		|| cursor.width > TEGRA_DC_CURSOR_SIZE
++		|| cursor.height > TEGRA_DC_CURSOR_SIZE
++		|| cursor.hot_x >= cursor.width || cursor.hot_y >= cursor.height
++		|| cursor.bytes_per_row < cursor.width * 4u) {
++		return B_BAD_VALUE;
++	}
++
++	// Copy the image row by row, transparent around it
++	uint8* image = sDevice.scanout + CURSOR_OFFSET;
++	uint8 row[CURSOR_BYTES_PER_ROW];
++	for (uint32 y = 0; y < TEGRA_DC_CURSOR_SIZE; y++) {
++		memset(row, 0, sizeof(row));
++		if (y < cursor.height
++			&& user_memcpy(row, (const uint8*)cursor.bits
++				+ y * cursor.bytes_per_row, cursor.width * 4) != B_OK) {
++			return B_BAD_ADDRESS;
++		}
++		memcpy(image + y * CURSOR_BYTES_PER_ROW, row, sizeof(row));
++	}
++
++	if (!sDevice.cursor_ready)
++		setup_cursor_window();
++
++	sDevice.cursor_width = cursor.width;
++	sDevice.cursor_height = cursor.height;
++	sDevice.cursor_hot_x = cursor.hot_x;
++	sDevice.cursor_hot_y = cursor.hot_y;
++	update_cursor_window();
++	return B_OK;
++}
++
++
++//	#pragma mark - overlay
++
++
++/*!	Physically contiguous memory for a video frame, mapped write combining as
++	device memory: the clones in app_server and in the application then get
++	the same memory type, the display controller does not see the caches.
++*/
++static status_t
++allocate_overlay_buffer(tegra_dc_overlay_buffer& buffer)
++{
++	int32 slot = -1;
++	for (int32 i = 0; i < MAX_OVERLAY_BUFFERS; i++) {
++		if (sDevice.overlay_buffers[i].area < 0) {
++			slot = i;
++			break;
++		}
++	}
++	if (slot < 0)
++		return B_NO_MEMORY;
++	if (buffer.size == 0 || buffer.size > 16 * 1024 * 1024)
++		return B_BAD_VALUE;
++
++	uint32 size = (buffer.size + B_PAGE_SIZE - 1) & ~(B_PAGE_SIZE - 1);
++	void* address;
++	area_id memory = create_area("tegra_dc overlay memory", &address,
++		B_ANY_KERNEL_ADDRESS, size, B_32_BIT_CONTIGUOUS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
++	if (memory < 0)
++		return memory;
++
++	physical_entry entry;
++	status_t status = get_memory_map(address, size, &entry, 1);
++	if (status == B_OK) {
++		memset(address, 0, size);
++		status = vm_set_area_memory_type(memory, entry.address,
++			B_WRITE_COMBINING_MEMORY);
++	}
++	area_id area = -1;
++	if (status == B_OK) {
++		void* mapping;
++		area = map_physical_memory("tegra_dc overlay", entry.address, size,
++			B_ANY_KERNEL_ADDRESS | B_WRITE_COMBINING_MEMORY,
++			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA | B_CLONEABLE_AREA,
++			&mapping);
++		if (area < 0)
++			status = area;
++	}
++
++	area_id clone = -1;
++	if (status == B_OK) {
++		// app_server clones it again into the application drawing the video
++		void* cloneAddress;
++		clone = vm_clone_area(B_CURRENT_TEAM, "tegra_dc overlay buffer",
++			&cloneAddress, B_ANY_ADDRESS,
++			B_READ_AREA | B_WRITE_AREA | B_CLONEABLE_AREA,
++			REGION_NO_PRIVATE_MAP, area, true);
++		if (clone < 0)
++			status = clone;
++		else
++			buffer.address = cloneAddress;
++	}
++	if (status != B_OK) {
++		delete_area(area);
++		delete_area(memory);
++		return status;
++	}
++
++	sDevice.overlay_buffers[slot].area = area;
++	sDevice.overlay_buffers[slot].memory = memory;
++	sDevice.overlay_buffers[slot].physical = entry.address;
++	sDevice.overlay_buffers[slot].size = size;
++
++	buffer.handle = area;
++	buffer.area = clone;
++	buffer.physical = entry.address;
++	return B_OK;
++}
++
++
++static int32
++find_overlay_buffer(area_id handle)
++{
++	for (int32 i = 0; i < MAX_OVERLAY_BUFFERS; i++) {
++		if (handle >= 0 && sDevice.overlay_buffers[i].area == handle)
++			return i;
++	}
++	return -1;
++}
++
++
++static void
++free_overlay_buffer(int32 slot)
++{
++	delete_area(sDevice.overlay_buffers[slot].area);
++	delete_area(sDevice.overlay_buffers[slot].memory);
++	sDevice.overlay_buffers[slot].area = -1;
++	sDevice.overlay_buffers[slot].memory = -1;
++}
++
++
++/*!	Window B: the video, between window A (the desktop) and window C (the
++	cursor). Its scaling filters are linear, and its color space conversion
++	is BT.601 with video range luma.
++*/
++static void
++setup_overlay_window()
++{
++	select_window(WINDOW_B_SELECT);
++	write_dc(WIN_OPTIONS, 0);
++
++	// 6-tap horizontal filter, only the two middle taps: phase i of 16 lies
++	// i/16 of the way from pixel 2 to pixel 3
++	for (uint32 phase = 0; phase < 16; phase++) {
++		write_dc(WINC_H_FILTER_P00 + phase,
++			((8 * phase) << 16) | ((128 - 8 * phase) << 8));
++	}
++	// 2-tap vertical filter: the weight of the earlier line
++	for (uint32 phase = 0; phase < 16; phase++)
++		write_dc(WINC_V_FILTER_P00 + phase, 128 - 8 * phase);
++
++	// R = 1.164 (Y - 16) + 1.596 V, G = 1.164 (Y - 16) - 0.391 U - 0.813 V,
++	// B = 1.164 (Y - 16) + 2.018 U, in 1/256 (10 and 11 bit two's complement)
++	write_dc(WINC_CSC_YOF, 0xf0);
++	write_dc(WINC_CSC_KYRGB, 298);
++	write_dc(WINC_CSC_KUR, 0);
++	write_dc(WINC_CSC_KVR, 409);
++	write_dc(WINC_CSC_KUG, 0x400 - 100);
++	write_dc(WINC_CSC_KVG, 0x400 - 208);
++	write_dc(WINC_CSC_KUB, 516);
++	write_dc(WINC_CSC_KVB, 0);
++
++	// Window B is opaque: it takes what the cursor above it leaves
++	write_dc(WIN_BLEND_NOKEY, BLEND_WEIGHT1(255) | BLEND_WEIGHT0(255));
++	write_dc(WIN_BLEND_1WIN, BLEND_WEIGHT1(255) | BLEND_WEIGHT0(255));
++	write_dc(WIN_BLEND_2WIN_X, BLEND_CONTROL_DEPENDENT);
++	write_dc(WIN_BLEND_2WIN_Y, BLEND_CONTROL_DEPENDENT);
++	write_dc(WIN_BLEND_3WIN, BLEND_CONTROL_DEPENDENT);
++
++	// The cursor stays above the video
++	select_window(WINDOW_C_SELECT);
++	write_dc(WIN_BLEND_2WIN_Y, BLEND_CONTROL_ALPHA | BLEND_WEIGHT1(255)
++		| BLEND_WEIGHT0(255));
++
++	// High priority memory requests for window B too
++	write_dc(DC_DISP_MEM_HIGH_PRIORITY,
++		(read_dc(DC_DISP_MEM_HIGH_PRIORITY) & ~(0x7fu << 8)) | (0x20u << 8));
++	write_dc(DC_DISP_MEM_HIGH_PRIORITY_TIMER,
++		(read_dc(DC_DISP_MEM_HIGH_PRIORITY_TIMER) & ~(0x3fu << 8))
++			| (1u << 8));
++
++	select_window(WINDOW_A_SELECT);
++	sDevice.overlay_ready = true;
++}
++
++
++/*!	The DDA step from one output pixel to the next, in source pixels, 4.12
++	fixed point, so that the first and last output pixels fall on the first
++	and last source pixels.
++*/
++static uint32
++dda_increment(uint32 source, uint32 target)
++{
++	if (target <= 1 || source <= 1)
++		return 0x1000;
++	return ((source - 1) * 0x1000 + (target - 1) / 2) / (target - 1);
++}
++
++
++static status_t
++configure_overlay(const tegra_dc_overlay_config& config)
++{
++	if (!sDevice.overlay_ready)
++		setup_overlay_window();
++
++	if (!config.enable) {
++		hdmi_overlay hidden = {};
++		hdmi_set_overlay(hidden);
++
++		select_window(WINDOW_B_SELECT);
++		write_dc(WIN_OPTIONS, 0);
++		select_window(WINDOW_A_SELECT);
++		write_dc(DC_CMD_STATE_CONTROL, STATE_WIN_B_UPDATE);
++		read_dc(DC_CMD_STATE_CONTROL);
++		write_dc(DC_CMD_STATE_CONTROL, STATE_WIN_B_ACT_REQ);
++		return B_OK;
++	}
++
++	int32 slot = find_overlay_buffer(config.handle);
++	if (slot < 0)
++		return B_BAD_VALUE;
++
++	uint32 bytesPerPixel;
++	uint32 colorDepth;
++	uint32 byteSwap = 0;
++	uint32 options = WIN_OPTIONS_ENABLE;
++	uint32 maxDDA;
++	switch (config.space) {
++		case B_YCbCr422:
++			// Y0 Cb Y1 Cr: the UYVY format swapped in pairs of bytes
++			bytesPerPixel = 2;
++			colorDepth = COLOR_DEPTH_YCbCr422;
++			byteSwap = BYTE_SWAP_SWAP2;
++			options |= WIN_OPTIONS_CSC;
++			maxDDA = MAX_H_DDA_2_BYTES;
++			break;
++		case B_RGB32:
++		case B_RGBA32:
++			bytesPerPixel = 4;
++			colorDepth = COLOR_DEPTH_B8G8R8A8;
++			maxDDA = MAX_H_DDA_4_BYTES;
++			break;
++		default:
++			return B_BAD_VALUE;
++	}
++
++	uint32 sourceX = config.source_x;
++	if (bytesPerPixel == 2)
++		sourceX &= ~1u;
++	if (config.width == 0 || config.height == 0
++		|| config.source_width == 0 || config.source_height == 0
++		|| config.x + config.width > PANEL_WIDTH
++		|| config.y + config.height > PANEL_HEIGHT
++		|| (config.bytes_per_row & 7) != 0
++		|| (sourceX + config.source_width) * bytesPerPixel
++			> config.bytes_per_row
++		|| (config.source_y + config.source_height) * config.bytes_per_row
++			> sDevice.overlay_buffers[slot].size) {
++		return B_BAD_VALUE;
++	}
++
++	uint32 hIncrement = dda_increment(config.source_width, config.width);
++	uint32 vIncrement = dda_increment(config.source_height, config.height);
++	if (hIncrement > maxDDA || vIncrement > MAX_V_DDA)
++		return B_BAD_VALUE;
++	if ((config.filter & 1) != 0)
++		options |= WIN_OPTIONS_H_FILTER;
++	if ((config.filter & 2) != 0)
++		options |= WIN_OPTIONS_V_FILTER;
++
++	select_window(WINDOW_B_SELECT);
++	write_dc(WIN_COLOR_DEPTH, colorDepth);
++	write_dc(WIN_BYTE_SWAP, byteSwap);
++	write_dc(WIN_POSITION, (config.y << 16) | config.x);
++	write_dc(WIN_SIZE, (config.height << 16) | config.width);
++	write_dc(WIN_PRESCALED_SIZE, (config.source_height << 16)
++		| (config.source_width * bytesPerPixel));
++	write_dc(WIN_H_INITIAL_DDA, 0);
++	write_dc(WIN_V_INITIAL_DDA, 0);
++	write_dc(WIN_DDA_INCREMENT, (vIncrement << 16) | hIncrement);
++	write_dc(WIN_LINE_STRIDE, config.bytes_per_row);
++	write_dc(WIN_BUF_STRIDE, 0);
++	write_dc(WIN_BUFFER_ADDR_MODE, 0);
++	write_dc(WINBUF_START_ADDR, sDevice.overlay_buffers[slot].physical);
++	write_dc(WINBUF_ADDR_H_OFFSET, sourceX * bytesPerPixel);
++	write_dc(WINBUF_ADDR_V_OFFSET, config.source_y);
++	write_dc(WIN_OPTIONS, options);
++
++	// With a color key, window A gives way to the video only where it shows
++	// the key color, so windows over the video stay visible
++	write_dc(DC_DISP_COLOR_KEY0_LOWER, config.key_lower & 0xffffff);
++	write_dc(DC_DISP_COLOR_KEY0_UPPER, config.key_upper & 0xffffff);
++	select_window(WINDOW_A_SELECT);
++	uint32 under = config.color_key ? BLEND_CKEY0 : 0;
++	write_dc(WIN_BLEND_NOKEY, BLEND_WEIGHT1(255) | BLEND_WEIGHT0(255));
++	write_dc(WIN_BLEND_2WIN_X, under | BLEND_CONTROL_FIX);
++	write_dc(WIN_BLEND_3WIN, under | BLEND_CONTROL_FIX);
++
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_UPDATE | STATE_WIN_A_UPDATE
++		| STATE_WIN_B_UPDATE);
++	read_dc(DC_CMD_STATE_CONTROL);
++	write_dc(DC_CMD_STATE_CONTROL, STATE_GENERAL_ACT_REQ | STATE_WIN_A_ACT_REQ
++		| STATE_WIN_B_ACT_REQ);
++
++	hdmi_overlay mirror;
++	mirror.visible = true;
++	mirror.physical = sDevice.overlay_buffers[slot].physical;
++	mirror.color_depth = colorDepth;
++	mirror.byte_swap = byteSwap;
++	mirror.options = options;
++	mirror.bytes_per_pixel = bytesPerPixel;
++	mirror.bytes_per_row = config.bytes_per_row;
++	mirror.source_x = sourceX;
++	mirror.source_y = config.source_y;
++	mirror.source_width = config.source_width;
++	mirror.source_height = config.source_height;
++	mirror.x = config.x;
++	mirror.y = config.y;
++	mirror.width = config.width;
++	mirror.height = config.height;
++	mirror.color_key = config.color_key;
++	mirror.key_lower = config.key_lower;
++	mirror.key_upper = config.key_upper;
++	hdmi_set_overlay(mirror);
++	return B_OK;
++}
++
++
++/*!	Shows an overlay buffer on the whole HDMI screen, or the mirrored panel
++	again. Window B of display controller B has the same filters and color
++	space conversion as the panel's.
++*/
++static status_t
++set_hdmi_video(const tegra_dc_hdmi_video& config)
++{
++	hdmi_video video = {};
++	if (!config.enable) {
++		hdmi_set_video(video);
++		return B_OK;
++	}
++
++	int32 slot = find_overlay_buffer(config.handle);
++	if (slot < 0 || config.width < 2 || config.height < 2)
++		return B_BAD_VALUE;
++
++	video.options = WIN_OPTIONS_ENABLE | WIN_OPTIONS_H_FILTER
++		| WIN_OPTIONS_V_FILTER;
++	switch (config.space) {
++		case B_YCbCr422:
++			video.bytes_per_pixel = 2;
++			video.color_depth = COLOR_DEPTH_YCbCr422;
++			video.byte_swap = BYTE_SWAP_SWAP2;
++			video.options |= WIN_OPTIONS_CSC;
++			break;
++		case B_RGB32:
++		case B_RGBA32:
++			video.bytes_per_pixel = 4;
++			video.color_depth = COLOR_DEPTH_B8G8R8A8;
++			break;
++		default:
++			return B_BAD_VALUE;
++	}
++	if ((config.bytes_per_row & 7) != 0
++		|| config.width * video.bytes_per_pixel > config.bytes_per_row
++		|| (uint32)config.height * config.bytes_per_row
++			> sDevice.overlay_buffers[slot].size) {
++		return B_BAD_VALUE;
++	}
++
++	video.enabled = true;
++	video.physical = sDevice.overlay_buffers[slot].physical;
++	video.bytes_per_row = config.bytes_per_row;
++	video.width = config.width;
++	video.height = config.height;
++	hdmi_set_video(video);
++	return B_OK;
++}
++
++
++//	#pragma mark - interrupts
++
++
++static int32
++vblank_interrupt(void* data)
++{
++	uint32 status = read_dc(DC_CMD_INT_STATUS);
++	if (status == 0)
++		return B_UNHANDLED_INTERRUPT;
++
++	// write 1 to clear
++	write_dc(DC_CMD_INT_STATUS, status);
++	if ((status & INT_V_BLANK) == 0)
++		return B_HANDLED_INTERRUPT;
++
++	sDevice.shared_info->vblank_count++;
++
++	// Wake whoever waits for the retrace, without letting the count grow
++	sem_id sem = sDevice.shared_info->vblank_sem;
++	int32 count;
++	if (get_sem_count(sem, &count) == B_OK && count < 0) {
++		release_sem_etc(sem, -count, B_DO_NOT_RESCHEDULE);
++		return B_INVOKE_SCHEDULER;
++	}
++	return B_HANDLED_INTERRUPT;
++}
++
++
++static void
++enable_vblank_interrupt(bool enable)
++{
++	// The driver owns all the display controller interrupts. Start from all
++	// of them off and nothing pending, then enable V_BLANK: edge triggered,
++	// default polarity.
++	write_dc(DC_CMD_INT_MASK, 0);
++	write_dc(DC_CMD_INT_ENABLE, 0);
++	write_dc(DC_CMD_INT_STATUS, 0xffffffff);
++	write_dc(DC_CMD_INT_TYPE, 0);
++	write_dc(DC_CMD_INT_POLARITY, 0);
++
++	if (enable) {
++		// A set mask bit lets the interrupt through
++		write_dc(DC_CMD_INT_ENABLE, INT_V_BLANK);
++		write_dc(DC_CMD_INT_MASK, INT_V_BLANK);
++	}
++}
++
++
++static void
++uninit_device()
++{
++	hdmi_stop();
++
++	if (sDevice.overlay_ready) {
++		tegra_dc_overlay_config hide = {};
++		configure_overlay(hide);
++		sDevice.overlay_ready = false;
++	}
++	for (int32 i = 0; i < MAX_OVERLAY_BUFFERS; i++) {
++		if (sDevice.overlay_buffers[i].area >= 0)
++			free_overlay_buffer(i);
++	}
++
++	if (sDevice.shared_info != NULL) {
++		enable_vblank_interrupt(false);
++		remove_io_interrupt_handler(TEGRA20_DC_A_INTERRUPT, vblank_interrupt,
++			NULL);
++		delete_sem(sDevice.shared_info->vblank_sem);
++	}
++	delete_area(sDevice.pwm_area);
++	delete_area(sDevice.shared_area);
++	delete_area(sDevice.scanout_area);
++	delete_area(sDevice.registers_area);
++	sDevice.shared_area = sDevice.scanout_area = sDevice.registers_area = -1;
++	sDevice.pwm_area = -1;
++	sDevice.pwm = NULL;
++	sDevice.shared_info = NULL;
++	sDevice.scanout = NULL;
++	sDevice.registers = NULL;
++}
++
++
++static status_t
++init_device()
++{
++	sDevice.registers = map_registers("tegra_dc registers", TEGRA20_DC_A_BASE,
++		TEGRA20_DC_SIZE, &sDevice.registers_area);
++	if (sDevice.registers == NULL)
++		return sDevice.registers_area;
++
++	// Write combining device memory: a clone in app_server gets the same
++	// memory type, the display controller does not see the CPU caches
++	sDevice.scanout_area = map_physical_memory("tegra_dc frame buffer",
++		SCANOUT_BASE, SCANOUT_SIZE,
++		B_ANY_KERNEL_BLOCK_ADDRESS | B_WRITE_COMBINING_MEMORY,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA | B_CLONEABLE_AREA,
++		(void**)&sDevice.scanout);
++	if (sDevice.scanout_area < 0) {
++		status_t status = sDevice.scanout_area;
++		uninit_device();
++		return status;
++	}
++
++	sDevice.shared_area = create_area("tegra_dc shared info",
++		(void**)&sDevice.shared_info, B_ANY_KERNEL_ADDRESS,
++		(sizeof(tegra_dc_shared_info) + B_PAGE_SIZE - 1) & ~(B_PAGE_SIZE - 1), B_FULL_LOCK,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA | B_CLONEABLE_AREA);
++	if (sDevice.shared_area < 0) {
++		status_t status = sDevice.shared_area;
++		uninit_device();
++		return status;
++	}
++
++	tegra_dc_shared_info& info = *sDevice.shared_info;
++	memset(&info, 0, sizeof(tegra_dc_shared_info));
++	info.mode_list_area = -1;
++	info.frame_buffer_size = SCANOUT_SIZE;
++	read_timing(info.timing);
++
++	// The backlight, if the firmware left its PWM running: accessing a device
++	// without its clock hangs the bus
++	info.dpms_mode = B_DPMS_ON;
++	if (pwm_running()) {
++		sDevice.pwm = map_registers("tegra_dc backlight", TEGRA20_PWM_BASE,
++			B_PAGE_SIZE, &sDevice.pwm_area);
++		info.has_backlight = sDevice.pwm != NULL;
++	}
++
++	// The mode the firmware left
++	select_window(WINDOW_A_SELECT);
++	bool depth32 = read_dc(WIN_COLOR_DEPTH) == COLOR_DEPTH_B8G8R8A8;
++	fill_mode(info.current_mode, depth32 ? B_RGB32 : B_RGB16);
++	info.bytes_per_row = read_dc(WIN_LINE_STRIDE) & 0xffff;
++
++	edid1_info* edid = (edid1_info*)get_boot_item(VESA_EDID_BOOT_INFO, NULL);
++	if (edid != NULL) {
++		info.edid_info = *edid;
++		info.has_edid = true;
++	}
++
++	info.vblank_sem = create_sem(0, "tegra_dc retrace");
++	if (info.vblank_sem < 0) {
++		status_t status = info.vblank_sem;
++		uninit_device();
++		return status;
++	}
++	// Userland cannot acquire a kernel semaphore: give it to the team that
++	// opens the device first (app_server), as intel_extreme does
++	thread_info threadInfo;
++	if (get_thread_info(find_thread(NULL), &threadInfo) == B_OK)
++		set_sem_owner(info.vblank_sem, threadInfo.team);
++
++	status_t status = install_io_interrupt_handler(TEGRA20_DC_A_INTERRUPT,
++		vblank_interrupt, NULL, 0);
++	if (status != B_OK) {
++		ERROR("cannot install the interrupt handler: %s\n", strerror(status));
++		delete_sem(info.vblank_sem);
++		sDevice.shared_info = NULL;
++		uninit_device();
++		return status;
++	}
++	enable_vblank_interrupt(true);
++
++	// An external screen shows the same frame buffer
++	status = hdmi_start(SCANOUT_BASE, PANEL_WIDTH, PANEL_HEIGHT,
++		depth32 ? COLOR_DEPTH_B8G8R8A8 : COLOR_DEPTH_B5G6R5, info.bytes_per_row);
++	if (status != B_OK)
++		ERROR("no HDMI output: %s\n", strerror(status));
++
++	dprintf("tegra_dc: %" B_PRIu32 "x%" B_PRIu32 " panel, pixel clock %"
++		B_PRIu32 " kHz, totals %" B_PRIu32 "x%" B_PRIu32 ", %s\n",
++		(uint32)info.timing.h_display, (uint32)info.timing.v_display,
++		info.timing.pixel_clock, (uint32)info.timing.h_total,
++		(uint32)info.timing.v_total, depth32 ? "32 bit" : "16 bit");
++	return B_OK;
++}
++
++
++//	#pragma mark - device hooks
++
++
++static status_t
++tegra_dc_open(const char* name, uint32 flags, void** _cookie)
++{
++	MutexLocker locker(sDevice.lock);
++	if (sDevice.open_count == 0) {
++		status_t status = init_device();
++		if (status != B_OK)
++			return status;
++	}
++	sDevice.open_count++;
++	*_cookie = &sDevice;
++	return B_OK;
++}
++
++
++static status_t
++tegra_dc_close(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++tegra_dc_free(void* cookie)
++{
++	MutexLocker locker(sDevice.lock);
++	if (--sDevice.open_count == 0)
++		uninit_device();
++	return B_OK;
++}
++
++
++static status_t
++tegra_dc_ioctl(void* cookie, uint32 op, void* buffer, size_t length)
++{
++	switch (op) {
++		case B_GET_ACCELERANT_SIGNATURE:
++			if (user_strlcpy((char*)buffer, TEGRA_DC_ACCELERANT_NAME,
++					B_FILE_NAME_LENGTH) < B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			return B_OK;
++
++		case TEGRA_DC_GET_PRIVATE_DATA:
++			return user_memcpy(buffer, &sDevice.shared_area, sizeof(area_id));
++
++		case TEGRA_DC_GET_DEVICE_NAME:
++			if (user_strlcpy((char*)buffer, TEGRA_DC_DEVICE_NAME,
++					B_PATH_NAME_LENGTH) < B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			return B_OK;
++
++		case TEGRA_DC_CLONE_FRAME_BUFFER:
++		{
++			void* address;
++			area_id area = vm_clone_area(B_CURRENT_TEAM,
++				"tegra_dc cloned frame buffer", &address, B_ANY_ADDRESS,
++				B_READ_AREA | B_WRITE_AREA, REGION_NO_PRIVATE_MAP,
++				sDevice.scanout_area, true);
++			if (area < 0)
++				return area;
++			return _user_get_area_info(area, (area_info*)buffer);
++		}
++
++		case TEGRA_DC_GET_BRIGHTNESS:
++		{
++			if (sDevice.pwm == NULL)
++				return B_NOT_SUPPORTED;
++			uint32 duty = backlight_duty();
++			if (sDevice.shared_info->dpms_mode != B_DPMS_ON) {
++				duty = (sDevice.saved_pwm & PWM_DUTY_MASK) >> PWM_DUTY_SHIFT;
++			}
++			return user_memcpy(buffer, &duty, sizeof(uint32));
++		}
++
++		case TEGRA_DC_SET_BRIGHTNESS:
++		case TEGRA_DC_SET_DPMS_MODE:
++		{
++			if (sDevice.pwm == NULL)
++				return B_NOT_SUPPORTED;
++			uint32 value;
++			if (length < sizeof(uint32)
++				|| user_memcpy(&value, buffer, sizeof(uint32)) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			MutexLocker locker(sDevice.lock);
++			if (op == TEGRA_DC_SET_BRIGHTNESS)
++				return set_backlight_duty(value);
++			return set_screen_power(value);
++		}
++
++		case TEGRA_DC_SET_CURSOR_BITMAP:
++		{
++			tegra_dc_cursor_bitmap cursor;
++			if (length < sizeof(cursor)
++				|| user_memcpy(&cursor, buffer, sizeof(cursor)) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			MutexLocker locker(sDevice.lock);
++			return load_cursor_image(cursor);
++		}
++
++		case TEGRA_DC_MOVE_CURSOR:
++		{
++			uint16 position[2];
++			if (length < sizeof(position)
++				|| user_memcpy(position, buffer, sizeof(position)) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			MutexLocker locker(sDevice.lock);
++			sDevice.cursor_x = position[0];
++			sDevice.cursor_y = position[1];
++			if (sDevice.cursor_ready)
++				update_cursor_window();
++			return B_OK;
++		}
++
++		case TEGRA_DC_SHOW_CURSOR:
++		{
++			uint32 show;
++			if (length < sizeof(show)
++				|| user_memcpy(&show, buffer, sizeof(show)) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			MutexLocker locker(sDevice.lock);
++			sDevice.cursor_shown = show != 0;
++			if (sDevice.cursor_ready)
++				update_cursor_window();
++			return B_OK;
++		}
++
++		case TEGRA_DC_ALLOCATE_OVERLAY_BUFFER:
++		{
++			tegra_dc_overlay_buffer overlayBuffer;
++			if (length < sizeof(overlayBuffer)
++				|| user_memcpy(&overlayBuffer, buffer, sizeof(overlayBuffer))
++					!= B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			MutexLocker locker(sDevice.lock);
++			status_t status = allocate_overlay_buffer(overlayBuffer);
++			if (status != B_OK)
++				return status;
++			return user_memcpy(buffer, &overlayBuffer, sizeof(overlayBuffer));
++		}
++
++		case TEGRA_DC_RELEASE_OVERLAY_BUFFER:
++		{
++			area_id handle;
++			if (length < sizeof(handle)
++				|| user_memcpy(&handle, buffer, sizeof(handle)) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			MutexLocker locker(sDevice.lock);
++			int32 slot = find_overlay_buffer(handle);
++			if (slot < 0)
++				return B_BAD_VALUE;
++			free_overlay_buffer(slot);
++			return B_OK;
++		}
++
++		case TEGRA_DC_CONFIGURE_OVERLAY:
++		{
++			tegra_dc_overlay_config config;
++			if (length < sizeof(config)
++				|| user_memcpy(&config, buffer, sizeof(config)) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			MutexLocker locker(sDevice.lock);
++			return configure_overlay(config);
++		}
++
++		case TEGRA_DC_GET_HDMI_STATUS:
++		{
++			tegra_dc_hdmi_status status;
++			hdmi_get_status(status);
++			if (length < sizeof(status))
++				return B_BAD_VALUE;
++			return user_memcpy(buffer, &status, sizeof(status));
++		}
++
++		case TEGRA_DC_RECONNECT_HDMI:
++			hdmi_reconnect();
++			return B_OK;
++
++		case TEGRA_DC_SET_HDMI_VIDEO:
++		{
++			tegra_dc_hdmi_video config;
++			if (length < sizeof(config)
++				|| user_memcpy(&config, buffer, sizeof(config)) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			MutexLocker locker(sDevice.lock);
++			return set_hdmi_video(config);
++		}
++
++		case TEGRA_DC_SET_DISPLAY_MODE:
++		{
++			display_mode mode;
++			if (length < sizeof(display_mode)
++				|| user_memcpy(&mode, buffer, sizeof(display_mode)) != B_OK) {
++				return B_BAD_ADDRESS;
++			}
++			MutexLocker locker(sDevice.lock);
++			return program_display_mode(mode);
++		}
++	}
++
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++static status_t
++tegra_dc_read(void* cookie, off_t position, void* buffer, size_t* _length)
++{
++	*_length = 0;
++	return B_NOT_ALLOWED;
++}
++
++
++static status_t
++tegra_dc_write(void* cookie, off_t position, const void* buffer,
++	size_t* _length)
++{
++	*_length = 0;
++	return B_NOT_ALLOWED;
++}
++
++
++static device_hooks sDeviceHooks = {
++	tegra_dc_open,
++	tegra_dc_close,
++	tegra_dc_free,
++	tegra_dc_ioctl,
++	tegra_dc_read,
++	tegra_dc_write,
++};
++
++
++//	#pragma mark - driver
++
++
++/*!	Only claims the display when the firmware left it as expected: a Tegra 2,
++	display controller A running, and window A scanning out of the memory
++	reserved for it.
++*/
++status_t
++init_hardware(void)
++{
++	if (gFDT == NULL || fdt_node_check_compatible(gFDT, 0, "nvidia,tegra20")
++			!= 0) {
++		return B_DEVICE_NOT_FOUND;
++	}
++
++	area_id carArea;
++	volatile uint32* car = map_registers("tegra car", TEGRA20_CAR_BASE,
++		B_PAGE_SIZE, &carArea);
++	if (car == NULL)
++		return B_ERROR;
++	bool running = (car[CAR_CLK_OUT_ENB_L / 4] & CAR_DISP1_BIT) != 0
++		&& (car[CAR_RST_DEVICES_L / 4] & CAR_DISP1_BIT) == 0;
++	delete_area(carArea);
++	if (!running) {
++		dprintf("tegra_dc: display controller A is not running\n");
++		return B_DEVICE_NOT_FOUND;
++	}
++
++	area_id dcArea;
++	volatile uint32* dc = map_registers("tegra_dc registers",
++		TEGRA20_DC_A_BASE, TEGRA20_DC_SIZE, &dcArea);
++	if (dc == NULL)
++		return B_ERROR;
++	dc[DC_CMD_DISPLAY_WINDOW_HEADER] = WINDOW_A_SELECT;
++	uint32 options = dc[WIN_OPTIONS];
++	uint32 start = dc[WINBUF_START_ADDR];
++	uint32 size = dc[WIN_SIZE];
++	delete_area(dcArea);
++
++	if ((options & WIN_OPTIONS_ENABLE) == 0 || start != SCANOUT_BASE
++		|| size != ((PANEL_HEIGHT << 16) | PANEL_WIDTH)) {
++		dprintf("tegra_dc: window A not as expected (options %#" B_PRIx32
++			", start %#" B_PRIx32 ", size %#" B_PRIx32 ")\n", options, start,
++			size);
++		return B_DEVICE_NOT_FOUND;
++	}
++	return B_OK;
++}
++
++
++status_t
++init_driver(void)
++{
++	memset(&sDevice, 0, sizeof(sDevice));
++	sDevice.registers_area = sDevice.scanout_area = sDevice.shared_area = -1;
++	sDevice.pwm_area = -1;
++	for (int32 i = 0; i < MAX_OVERLAY_BUFFERS; i++)
++		sDevice.overlay_buffers[i].area = sDevice.overlay_buffers[i].memory = -1;
++	mutex_init(&sDevice.lock, "tegra_dc");
++	return B_OK;
++}
++
++
++void
++uninit_driver(void)
++{
++	mutex_destroy(&sDevice.lock);
++}
++
++
++const char**
++publish_devices(void)
++{
++	return sDeviceNames;
++}
++
++
++device_hooks*
++find_device(const char* name)
++{
++	return &sDeviceHooks;
++}
+-- 
+2.39.5
+

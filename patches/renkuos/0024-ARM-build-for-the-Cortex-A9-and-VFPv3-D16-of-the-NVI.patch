@@ -1,0 +1,51 @@
+From 3899be31fca16838c9cfc809acbc35c921ddc2e3 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 27 Oct 2026 07:20:20 +0100
+Subject: [PATCH 24/63] ARM: build for the Cortex-A9 and VFPv3-D16 of the
+ NVIDIA Tegra 2
+
+Build the 32-bit ARM cross compiler and the system for ARMv7-A with a
+VFPv3-D16 unit, which is what the Tegra 2 of the Toshiba AC100 has (no
+NEON, 16 double registers), and fix the configure and library rules the
+early boot of the EFI loader and the kernel depend on.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ build/jam/SystemLibraryRules         | 4 ----
+ build/scripts/build_cross_tools_gcc4 | 4 ++--
+ 2 files changed, 2 insertions(+), 6 deletions(-)
+
+diff --git a/build/jam/SystemLibraryRules b/build/jam/SystemLibraryRules
+index b7c379ca42..574de572c4 100644
+--- a/build/jam/SystemLibraryRules
++++ b/build/jam/SystemLibraryRules
+@@ -285,10 +285,6 @@ rule TargetBootLibgcc architecture : asPath
+ 		if $(asPath) = true {
+ 			flags += path ;
+ 		}
+-		if $(architecture) = arm && $(TARGET_BOOT_LIBGCC) {
+-			# see TargetKernelLibgcc
+-			return $(TARGET_BOOT_LIBGCC) ;
+-		}
+ 		if $(architecture) = arm {
+ 			return [
+ 				BuildFeatureAttribute QUALIFIED $(architecture):gcc_syslibs_devel
+diff --git a/build/scripts/build_cross_tools_gcc4 b/build/scripts/build_cross_tools_gcc4
+index 81a33fe7c9..a8e0140d50 100755
+--- a/build/scripts/build_cross_tools_gcc4
++++ b/build/scripts/build_cross_tools_gcc4
+@@ -52,9 +52,9 @@ arm-*)
+ 	# Multilib creates a lot of confusion as the wrong libs end up being linked.
+ 	# For now, target Cortex-A8 devices.
+ 	binutilsConfigureArgs="--disable-multilib --with-float=hard
+-		--with-cpu=cortex-a8 --with-fpu=vfpv3"
++		--with-cpu=cortex-a8 --with-fpu=vfpv3-d16"
+ 	gccConfigureArgs="--disable-multilib --with-float=hard
+-		--with-cpu=cortex-a8 --with-fpu=vfpv3"
++		--with-cpu=cortex-a8 --with-fpu=vfpv3-d16"
+ 
+ 	# TODO: Disable building with TLS support for ARM until implemented.
+ 	binutilsConfigureArgs="$binutilsConfigureArgs --disable-tls"
+-- 
+2.39.5
+

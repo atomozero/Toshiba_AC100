@@ -1,0 +1,635 @@
+From ac55736958adcfc1a5b5839d88859c3e18fee05e Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 27 Oct 2026 07:20:31 +0100
+Subject: [PATCH 53/63] tegra_dc_diag: a read-only report of the Tegra 2
+ display hardware
+
+Diagnostics: reading /dev/misc/tegra_dc_diag reports the display
+controller, HDMI and interrupt controller state.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/add-ons/kernel/drivers/misc/Jamfile       |   1 +
+ .../kernel/drivers/misc/tegra_dc_diag/Jamfile |   7 +
+ .../misc/tegra_dc_diag/tegra_dc_diag.cpp      | 585 ++++++++++++++++++
+ 3 files changed, 593 insertions(+)
+ create mode 100644 src/add-ons/kernel/drivers/misc/tegra_dc_diag/Jamfile
+ create mode 100644 src/add-ons/kernel/drivers/misc/tegra_dc_diag/tegra_dc_diag.cpp
+
+diff --git a/src/add-ons/kernel/drivers/misc/Jamfile b/src/add-ons/kernel/drivers/misc/Jamfile
+index b120e5abd9..4e7c6dd916 100644
+--- a/src/add-ons/kernel/drivers/misc/Jamfile
++++ b/src/add-ons/kernel/drivers/misc/Jamfile
+@@ -18,4 +18,5 @@ KernelAddon <driver>kdl :
+ KernelAddon <driver>test :
+ 	test.c
+ 	;
++SubInclude HAIKU_TOP src add-ons kernel drivers misc tegra_dc_diag ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers misc tegra_gr2d ;
+diff --git a/src/add-ons/kernel/drivers/misc/tegra_dc_diag/Jamfile b/src/add-ons/kernel/drivers/misc/tegra_dc_diag/Jamfile
+new file mode 100644
+index 0000000000..b0ef3f3f92
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/misc/tegra_dc_diag/Jamfile
+@@ -0,0 +1,7 @@
++SubDir HAIKU_TOP src add-ons kernel drivers misc tegra_dc_diag ;
++
++UsePrivateKernelHeaders ;
++
++KernelAddon tegra_dc_diag :
++	tegra_dc_diag.cpp
++	;
+diff --git a/src/add-ons/kernel/drivers/misc/tegra_dc_diag/tegra_dc_diag.cpp b/src/add-ons/kernel/drivers/misc/tegra_dc_diag/tegra_dc_diag.cpp
+new file mode 100644
+index 0000000000..f092ee0566
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/misc/tegra_dc_diag/tegra_dc_diag.cpp
+@@ -0,0 +1,585 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++/*!	AC100 bring-up: reading /dev/misc/tegra_dc_diag reports, without changing
++	anything, how the firmware left the display hardware of the Tegra 2: the
++	clocks and resets of the display, HDMI and graphics blocks, the registers
++	of the display controllers that are running, and whether the memory the
++	firmware reserved for its frame buffer is managed by the kernel.
++	Blocks are only read when their clock is on and they are out of reset:
++	accessing a block that is not clocked hangs the bus.
++*/
++
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <string.h>
++
++#include <Drivers.h>
++#include <KernelExport.h>
++#include <vm/vm.h>
++#include <vm/vm_page.h>
++#include <vm/vm_types.h>
++#include <vm/VMArea.h>
++#include <vm/VMCache.h>
++
++
++#define TEGRA20_CAR_BASE		0x60006000
++#define TEGRA20_PMC_BASE		0x7000e400
++#define TEGRA20_DC_A_BASE		0x54200000
++#define TEGRA20_DC_B_BASE		0x54240000
++#define TEGRA20_HDMI_BASE		0x54280000
++
++// CAR, byte offsets
++#define CAR_RST_DEVICES_L		0x004
++#define CAR_RST_DEVICES_H		0x008
++#define CAR_CLK_OUT_ENB_L		0x010
++#define CAR_CLK_OUT_ENB_H		0x014
++#define CAR_PLLC_BASE			0x080
++#define CAR_PLLP_BASE			0x0a0
++#define CAR_PLLD_BASE			0x0d0
++#define CAR_CLK_SOURCE_DISP1	0x138
++#define CAR_CLK_SOURCE_DISP2	0x13c
++#define CAR_CLK_SOURCE_G3D		0x158
++#define CAR_CLK_SOURCE_G2D		0x15c
++#define CAR_CLK_SOURCE_HOST1X	0x180
++#define CAR_CLK_SOURCE_HDMI		0x18c
++
++// PMC
++#define PMC_PWRGATE_STATUS		0x38
++
++#define DC_SIZE					0x10000
++
++static const char* sDeviceNames[] = { "misc/tegra_dc_diag", NULL };
++
++int32 api_version = B_CUR_DRIVER_API_VERSION;
++
++
++struct block {
++	const char*	name;
++	bool		high;	// in the H registers, else L
++	uint32		bit;
++};
++
++static const block kBlocks[] = {
++	{ "disp1", false, 27 },
++	{ "disp2", false, 26 },
++	{ "host1x", false, 28 },
++	{ "2d", false, 21 },
++	{ "3d", false, 24 },
++	{ "hdmi", true, 19 },
++};
++
++
++struct named_register {
++	const char*	name;
++	uint32		word;	// word offset
++};
++
++// Display controller registers, word offsets (Tegra 2 TRM chapter 29)
++static const named_register kDcRegisters[] = {
++	{ "DISPLAY_COMMAND", 0x032 },
++	{ "DISPLAY_POWER_CONTROL", 0x036 },
++	{ "INT_STATUS", 0x037 },
++	{ "INT_MASK", 0x038 },
++	{ "INT_ENABLE", 0x039 },
++	{ "INT_TYPE", 0x03a },
++	{ "INT_POLARITY", 0x03b },
++	{ "STATE_ACCESS", 0x040 },
++	{ "STATE_CONTROL", 0x041 },
++	{ "WINDOW_HEADER", 0x042 },
++	{ "DISP_WIN_OPTIONS", 0x402 },
++	{ "MEM_HIGH_PRIORITY", 0x403 },
++	{ "MEM_HIGH_PRIORITY_TIMER", 0x404 },
++	{ "DISP_TIMING_OPTIONS", 0x405 },
++	{ "REF_TO_SYNC", 0x406 },
++	{ "SYNC_WIDTH", 0x407 },
++	{ "BACK_PORCH", 0x408 },
++	{ "DISP_ACTIVE", 0x409 },
++	{ "FRONT_PORCH", 0x40a },
++	{ "DISP_CLOCK_CONTROL", 0x42e },
++	{ "DISP_INTERFACE_CONTROL", 0x42f },
++	{ "DISP_COLOR_CONTROL", 0x430 },
++	{ "SHIFT_CLOCK_OPTIONS", 0x431 },
++	{ "DATA_ENABLE_OPTIONS", 0x432 },
++	{ "CURSOR_START_ADDR", 0x43e },
++	{ "CURSOR_POSITION", 0x440 },
++};
++
++// Window registers, relative to the window's WIN and WINBUF blocks
++static const named_register kWindowRegisters[] = {
++	{ "WIN_OPTIONS", 0x00 },
++	{ "BYTE_SWAP", 0x01 },
++	{ "COLOR_DEPTH", 0x03 },
++	{ "POSITION", 0x04 },
++	{ "SIZE", 0x05 },
++	{ "PRESCALED_SIZE", 0x06 },
++	{ "DDA_INCREMENT", 0x09 },
++	{ "LINE_STRIDE", 0x0a },
++	{ "BLEND_1WIN", 0x10 },
++};
++
++static const named_register kWindowBufferRegisters[] = {
++	{ "START_ADDR", 0x00 },
++	{ "ADDR_H_OFFSET", 0x06 },
++	{ "ADDR_V_OFFSET", 0x08 },
++	{ "UFLOW_STATUS", 0x0a },
++};
++
++
++static size_t
++append(char* buffer, size_t size, size_t length, const char* format, ...)
++{
++	if (length >= size)
++		return length;
++	va_list args;
++	va_start(args, format);
++	length += vsnprintf(buffer + length, size - length, format, args);
++	va_end(args);
++	return length;
++}
++
++
++static volatile uint32*
++map_registers(const char* name, phys_addr_t base, size_t size, area_id* _area)
++{
++	void* address;
++	*_area = map_physical_memory(name, base, size, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA, &address);
++	return *_area >= 0 ? (volatile uint32*)address : NULL;
++}
++
++
++static bool
++block_running(volatile uint32* car, const block& block)
++{
++	uint32 enable = car[(block.high ? CAR_CLK_OUT_ENB_H : CAR_CLK_OUT_ENB_L)
++		/ 4];
++	uint32 reset = car[(block.high ? CAR_RST_DEVICES_H : CAR_RST_DEVICES_L)
++		/ 4];
++	return (enable & (1u << block.bit)) != 0
++		&& (reset & (1u << block.bit)) == 0;
++}
++
++
++static size_t
++report_clocks(char* buffer, size_t size, size_t length, bool* _dcARunning,
++	bool* _dcBRunning)
++{
++	area_id area;
++	volatile uint32* car = map_registers("tegra car", TEGRA20_CAR_BASE,
++		B_PAGE_SIZE, &area);
++	if (car == NULL)
++		return append(buffer, size, length, "cannot map the CAR\n");
++
++	length = append(buffer, size, length, "clocks:");
++	for (size_t i = 0; i < B_COUNT_OF(kBlocks); i++) {
++		length = append(buffer, size, length, " %s %s", kBlocks[i].name,
++			block_running(car, kBlocks[i]) ? "on" : "off");
++	}
++	length = append(buffer, size, length,
++		"\nPLLC %08" B_PRIx32 ", PLLP %08" B_PRIx32 ", PLLD %08" B_PRIx32
++		"\nsources: disp1 %08" B_PRIx32 ", disp2 %08" B_PRIx32 ", host1x %08"
++		B_PRIx32 ", 2d %08" B_PRIx32 ", 3d %08" B_PRIx32 ", hdmi %08" B_PRIx32
++		"\n", car[CAR_PLLC_BASE / 4], car[CAR_PLLP_BASE / 4],
++		car[CAR_PLLD_BASE / 4], car[CAR_CLK_SOURCE_DISP1 / 4],
++		car[CAR_CLK_SOURCE_DISP2 / 4], car[CAR_CLK_SOURCE_HOST1X / 4],
++		car[CAR_CLK_SOURCE_G2D / 4], car[CAR_CLK_SOURCE_G3D / 4],
++		car[CAR_CLK_SOURCE_HDMI / 4]);
++
++	*_dcARunning = block_running(car, kBlocks[0]);
++	*_dcBRunning = block_running(car, kBlocks[1]);
++	delete_area(area);
++
++	// Legacy interrupt controllers, in front of the GIC: CPU_IER at 0x20 of
++	// each of the four (32 interrupts each)
++	volatile uint32* ictlr = map_registers("tegra ictlr", 0x60004000,
++		B_PAGE_SIZE, &area);
++	if (ictlr != NULL) {
++		length = append(buffer, size, length, "ictlr CPU_IER:");
++		for (int i = 0; i < 4; i++) {
++			length = append(buffer, size, length, " %08" B_PRIx32,
++				ictlr[(i * 0x100 + 0x20) / 4]);
++		}
++		length = append(buffer, size, length, " (DC A = #2 bit 9)\n");
++		delete_area(area);
++	}
++
++	// GIC distributor (Cortex-A9 MPCore at 0x50040000): where some device
++	// interrupts go and in which state they are
++	volatile uint32* gicd = map_registers("tegra gicd", 0x50041000,
++		B_PAGE_SIZE, &area);
++	if (gicd != NULL) {
++		static const uint32 kIrqs[] = { 63, 71, 105, 124 };
++		const volatile uint8* targets = (const volatile uint8*)gicd + 0x800;
++		for (size_t i = 0; i < B_COUNT_OF(kIrqs); i++) {
++			uint32 irq = kIrqs[i];
++			uint32 bit = 1u << (irq % 32);
++			length = append(buffer, size, length, "gic irq %" B_PRIu32
++				": target %#x, enabled %d, pending %d, active %d,"
++				" priority %#x\n", irq, targets[irq],
++				(gicd[(0x100 / 4) + irq / 32] & bit) != 0,
++				(gicd[(0x200 / 4) + irq / 32] & bit) != 0,
++				(gicd[(0x300 / 4) + irq / 32] & bit) != 0,
++				((const volatile uint8*)gicd + 0x400)[irq]);
++		}
++		delete_area(area);
++	}
++
++	volatile uint32* pmc = map_registers("tegra pmc",
++		TEGRA20_PMC_BASE & ~(B_PAGE_SIZE - 1), B_PAGE_SIZE, &area);
++	if (pmc != NULL) {
++		length = append(buffer, size, length,
++			"power partitions on: %#" B_PRIx32 " (bit 1 = 3D)\n",
++			pmc[((TEGRA20_PMC_BASE & (B_PAGE_SIZE - 1)) + PMC_PWRGATE_STATUS)
++				/ 4]);
++		delete_area(area);
++	}
++	return length;
++}
++
++
++static size_t
++report_window(char* buffer, size_t size, size_t length, volatile uint32* dc,
++	char name, uint32 windowWord, uint32 bufferWord)
++{
++	length = append(buffer, size, length, "  window %c:", name);
++	for (size_t i = 0; i < B_COUNT_OF(kWindowRegisters); i++) {
++		length = append(buffer, size, length, " %s %08" B_PRIx32,
++			kWindowRegisters[i].name,
++			dc[windowWord + kWindowRegisters[i].word]);
++	}
++	for (size_t i = 0; i < B_COUNT_OF(kWindowBufferRegisters); i++) {
++		length = append(buffer, size, length, " %s %08" B_PRIx32,
++			kWindowBufferRegisters[i].name,
++			dc[bufferWord + kWindowBufferRegisters[i].word]);
++	}
++	return append(buffer, size, length, "\n");
++}
++
++
++static size_t
++report_dc(char* buffer, size_t size, size_t length, const char* name,
++	phys_addr_t base)
++{
++	area_id area;
++	volatile uint32* dc = map_registers("tegra dc", base, DC_SIZE, &area);
++	if (dc == NULL)
++		return append(buffer, size, length, "%s: cannot map\n", name);
++
++	length = append(buffer, size, length, "%s:\n", name);
++	for (size_t i = 0; i < B_COUNT_OF(kDcRegisters); i++) {
++		length = append(buffer, size, length, "  %s %08" B_PRIx32 "\n",
++			kDcRegisters[i].name, dc[kDcRegisters[i].word]);
++	}
++
++	// The window the header selects. The per window apertures Linux uses
++	// (0xa00, 0xc00, 0xe00) all reach the selected window on the AC100, and
++	// selecting another one would change state: only this one is shown.
++	length = report_window(buffer, size, length, dc, 'h', 0x700, 0x800);
++
++	delete_area(area);
++	return length;
++}
++
++
++extern "C" status_t arm_dvc_i2c_read(uint8 address, uint8 reg, uint8* data,
++	size_t length);
++
++
++/*!	What HDMI needs, read only: the TPS6586x supplies (LDO7 = AVDD_HDMI
++	3.3 V, LDO8 = AVDD_HDMI_PLL 1.8 V), PLL_D, the pin multiplexer, and the
++	GPIO bank with the hot plug detect pin (N7).
++*/
++static size_t
++report_hdmi(char* buffer, size_t size, size_t length)
++{
++	static const uint8 kPmicRegisters[] = { 0x10, 0x11, 0x12, 0x13, 0x14,
++		0x41, 0x42, 0x43, 0x44, 0x45, 0x46 };
++	length = append(buffer, size, length, "pmic:");
++	for (size_t i = 0; i < B_COUNT_OF(kPmicRegisters); i++) {
++		uint8 value;
++		if (arm_dvc_i2c_read(0x34, kPmicRegisters[i], &value, 1) == B_OK) {
++			length = append(buffer, size, length, " %02x=%02x",
++				kPmicRegisters[i], value);
++		} else {
++			length = append(buffer, size, length, " %02x=?",
++				kPmicRegisters[i]);
++		}
++	}
++	length = append(buffer, size, length, "\n");
++
++	area_id area;
++	volatile uint32* car = map_registers("tegra car", TEGRA20_CAR_BASE,
++		B_PAGE_SIZE, &area);
++	if (car != NULL) {
++		length = append(buffer, size, length, "car: RST_L %08" B_PRIx32
++			" RST_H %08" B_PRIx32 " ENB_L %08" B_PRIx32 " ENB_H %08" B_PRIx32
++			" PLLD_BASE %08" B_PRIx32 " PLLD_OUT %08" B_PRIx32 " PLLD_MISC %08"
++			B_PRIx32 " OSC_CTRL %08" B_PRIx32 "\n", car[CAR_RST_DEVICES_L / 4],
++			car[CAR_RST_DEVICES_H / 4], car[CAR_CLK_OUT_ENB_L / 4],
++			car[CAR_CLK_OUT_ENB_H / 4], car[0xd0 / 4], car[0xd4 / 4],
++			car[0xdc / 4], car[0x50 / 4]);
++		delete_area(area);
++	}
++
++	volatile uint32* misc = map_registers("tegra apb misc",
++		0x70000000, B_PAGE_SIZE, &area);
++	if (misc != NULL) {
++		length = append(buffer, size, length, "tristate:");
++		for (uint32 offset = 0x14; offset <= 0x20; offset += 4) {
++			length = append(buffer, size, length, " %08" B_PRIx32,
++				misc[offset / 4]);
++		}
++		length = append(buffer, size, length, "\npinmux:");
++		for (uint32 offset = 0x80; offset <= 0x9c; offset += 4) {
++			length = append(buffer, size, length, " %08" B_PRIx32,
++				misc[offset / 4]);
++		}
++		length = append(buffer, size, length, "\npull:");
++		for (uint32 offset = 0xa0; offset <= 0xb0; offset += 4) {
++			length = append(buffer, size, length, " %08" B_PRIx32,
++				misc[offset / 4]);
++		}
++		length = append(buffer, size, length, "\n");
++		delete_area(area);
++	}
++
++	// The HDMI block's registers, while its clock runs and it is out of
++	// reset (bit 19 of the H registers)
++	if (car != NULL) {
++		car = map_registers("tegra car", TEGRA20_CAR_BASE, B_PAGE_SIZE, &area);
++		bool hdmiRunning = car != NULL && (car[CAR_CLK_OUT_ENB_H / 4]
++			& (1u << 19)) != 0 && (car[CAR_RST_DEVICES_H / 4] & (1u << 19)) == 0;
++		if (car != NULL)
++			delete_area(area);
++		volatile uint32* hdmi = hdmiRunning ? map_registers("tegra hdmi",
++			TEGRA20_HDMI_BASE, B_PAGE_SIZE, &area) : NULL;
++		if (hdmi != NULL) {
++			static const struct { uint32 first, last; } kRanges[] = {
++				{ 0x01, 0x03 }, { 0x1e, 0x2a }, { 0x35, 0x39 }, { 0x44, 0x46 },
++				{ 0x4f, 0x51 }, { 0x55, 0x5a }, { 0x7e, 0x8c }, { 0x95, 0x99 },
++			};
++			length = append(buffer, size, length, "hdmi:");
++			for (size_t i = 0; i < B_COUNT_OF(kRanges); i++) {
++				for (uint32 word = kRanges[i].first; word <= kRanges[i].last;
++						word++) {
++					length = append(buffer, size, length, "%s%02" B_PRIx32 "=%08"
++						B_PRIx32, word == kRanges[i].first ? "\n " : " ", word,
++						hdmi[word]);
++				}
++			}
++			length = append(buffer, size, length, "\n");
++			delete_area(area);
++		}
++	}
++
++	// GPIO ports M..P are bank 3: CNF, OE, OUT, IN at 0x00/0x10/0x20/0x30
++	volatile uint32* gpio = map_registers("tegra gpio", 0x6000d000,
++		B_PAGE_SIZE, &area);
++	if (gpio != NULL) {
++		volatile uint32* bank = gpio + 0x180 / 4;
++		length = append(buffer, size, length, "gpio port N: CNF %02" B_PRIx32
++			" OE %02" B_PRIx32 " OUT %02" B_PRIx32 " IN %02" B_PRIx32
++			" (hot plug = bit 7)\n", bank[0x04 / 4] & 0xff,
++			bank[0x14 / 4] & 0xff, bank[0x24 / 4] & 0xff,
++			bank[0x34 / 4] & 0xff);
++		delete_area(area);
++	}
++	return length;
++}
++
++
++static size_t
++report_memory(char* buffer, size_t size, size_t length)
++{
++	// The firmware frame buffer and the memory above it, in 1MB steps
++	length = append(buffer, size, length, "managed pages from 0x1f000000:");
++	for (phys_addr_t start = 0x1f000000; start < 0x20000000;
++			start += 0x100000) {
++		uint32 managed = 0, free = 0;
++		for (phys_addr_t address = start; address < start + 0x100000;
++				address += B_PAGE_SIZE) {
++			vm_page* page = vm_lookup_page(address / B_PAGE_SIZE);
++			if (page == NULL)
++				continue;
++			managed++;
++			if (page->State() == PAGE_STATE_FREE
++				|| page->State() == PAGE_STATE_CLEAR) {
++				free++;
++			}
++		}
++		length = append(buffer, size, length, " %" B_PRIx64 ":%"
++			B_PRIu32 "/%" B_PRIu32, (uint64)start, managed, free);
++	}
++	length = append(buffer, size, length, " (managed/free of 256)\n");
++
++	// Page states of the firmware frame buffer region, and whether the
++	// pages belong to a cache (an area)
++	static const char* kStates[] = { "active", "inactive", "modified",
++		"cached", "free", "clear", "wired", "unused" };
++	uint32 counts[8] = {};
++	uint32 inCache = 0;
++	phys_addr_t lastCached = 0;
++	for (phys_addr_t address = 0x1f800000; address < 0x20000000;
++			address += B_PAGE_SIZE) {
++		vm_page* page = vm_lookup_page(address / B_PAGE_SIZE);
++		if (page == NULL)
++			continue;
++		counts[page->State() & 7]++;
++		if (page->Cache() != NULL) {
++			if (inCache == 0 || address != lastCached + B_PAGE_SIZE) {
++				if (inCache != 0) {
++					length = append(buffer, size, length, "-%" B_PRIx64
++						" ", (uint64)(lastCached + B_PAGE_SIZE));
++				}
++				VMArea* area = page->Cache()->areas.Head();
++				length = append(buffer, size, length, "cached run %"
++					B_PRIx64 " (area \"%s\")", (uint64)address,
++					area != NULL ? area->name : "-");
++			}
++			lastCached = address;
++			inCache++;
++		}
++	}
++	if (inCache != 0) {
++		length = append(buffer, size, length, "-%" B_PRIx64 "\n",
++			(uint64)(lastCached + B_PAGE_SIZE));
++	}
++	length = append(buffer, size, length, "0x1f800000-0x20000000:");
++	for (int i = 0; i < 8; i++) {
++		if (counts[i] != 0) {
++			length = append(buffer, size, length, " %s %" B_PRIu32, kStates[i],
++				counts[i]);
++		}
++	}
++	return append(buffer, size, length, ", %" B_PRIu32 " in a cache\n",
++		inCache);
++}
++
++
++//	#pragma mark - device hooks
++
++
++static status_t
++diag_open(const char* name, uint32 flags, void** _cookie)
++{
++	*_cookie = NULL;
++	return B_OK;
++}
++
++
++static status_t
++diag_close(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++diag_free(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++diag_control(void* cookie, uint32 op, void* arg, size_t length)
++{
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++static status_t
++diag_read(void* cookie, off_t position, void* buffer, size_t* _length)
++{
++	const size_t kSize = 8192;
++	char* text = (char*)malloc(kSize);
++	if (text == NULL)
++		return B_NO_MEMORY;
++
++	bool dcARunning = false, dcBRunning = false;
++	size_t textLength = report_clocks(text, kSize, 0, &dcARunning,
++		&dcBRunning);
++	if (dcARunning)
++		textLength = report_dc(text, kSize, textLength, "DC A",
++			TEGRA20_DC_A_BASE);
++	if (dcBRunning)
++		textLength = report_dc(text, kSize, textLength, "DC B",
++			TEGRA20_DC_B_BASE);
++	textLength = report_memory(text, kSize, textLength);
++	textLength = report_hdmi(text, kSize, textLength);
++	if (textLength >= kSize)
++		textLength = kSize - 1;
++
++	status_t status = B_OK;
++	if (position < 0 || (size_t)position >= textLength)
++		*_length = 0;
++	else {
++		size_t length = min_c(*_length, textLength - (size_t)position);
++		if (user_memcpy(buffer, text + position, length) != B_OK)
++			status = B_BAD_ADDRESS;
++		else
++			*_length = length;
++	}
++	free(text);
++	return status;
++}
++
++
++static status_t
++diag_write(void* cookie, off_t position, const void* buffer, size_t* _length)
++{
++	*_length = 0;
++	return B_NOT_ALLOWED;
++}
++
++
++static device_hooks sDeviceHooks = {
++	diag_open,
++	diag_close,
++	diag_free,
++	diag_control,
++	diag_read,
++	diag_write,
++};
++
++
++//	#pragma mark - driver
++
++
++status_t
++init_hardware(void)
++{
++	return B_OK;
++}
++
++
++status_t
++init_driver(void)
++{
++	return B_OK;
++}
++
++
++void
++uninit_driver(void)
++{
++}
++
++
++const char**
++publish_devices(void)
++{
++	return sDeviceNames;
++}
++
++
++device_hooks*
++find_device(const char* name)
++{
++	return &sDeviceHooks;
++}
+-- 
+2.39.5
+

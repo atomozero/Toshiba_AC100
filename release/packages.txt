@@ -1,0 +1,45 @@
+# Packages of the AC100 release image, besides the system; what they need
+# is added by scripts/release-packages.py.
+
+# network: the internal Wi-Fi and HTTPS
+wpa_supplicant
+ralink_wifi_firmwares
+ca_root_certificates
+
+# applications
+webpositive
+salagiochi
+ac100_install
+cricket
+haiku_softphone
+atomo123
+bepdf
+genio
+localsend
+wonderbrush3
+rtelevision
+glu
+
+# command line
+git
+curl
+wget
+openssh
+less
+nano
+htop_rivoreo
+grep
+sed
+gawk
+findutils
+diffutils
+tar
+gzip
+xz_utils
+zip
+unzip
+rsync
+file
+which
+tree
+mandoc

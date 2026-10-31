@@ -1,7 +1,7 @@
-From d7312af64b3bc58c4e6dc17deafd01222a5cf7b4 Mon Sep 17 00:00:00 2001
+From f43c443a06bf0d8dac653b63ca4c249571c75ac7 Mon Sep 17 00:00:00 2001
 From: atomozero <bernardi.andrea@gmail.com>
-Date: Sat, 17 Oct 2026 12:01:36 +0200
-Subject: [PATCH 004/270] SupportDefs: use a strong compare-and-swap in
+Date: Tue, 20 Oct 2026 18:10:17 +0200
+Subject: [PATCH 04/63] SupportDefs: use a strong compare-and-swap in
  atomic_test_and_set()
 
 atomic_test_and_set() and atomic_test_and_set64() used a weak
@@ -14,6 +14,8 @@ On ARM this let __mutex_lock() believe it owned a mutex it had never
 locked, ending in 'mutex was not actually locked!' in launch_daemon,
 net_server and others. x86 is not affected, as its CAS never fails
 spuriously.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
 ---
  headers/os/support/SupportDefs.h | 4 ++--
  1 file changed, 2 insertions(+), 2 deletions(-)
@@ -40,3 +42,6 @@ index 85b8affc98..ac2be17a3b 100644
  		__ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
  	return testAgainst;
  }
+-- 
+2.39.5
+

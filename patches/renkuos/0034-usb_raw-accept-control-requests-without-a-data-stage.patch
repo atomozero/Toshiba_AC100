@@ -1,0 +1,61 @@
+From df44aea2f7b1d2cca8fa35928445fdbae55629ae Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 27 Oct 2026 07:20:25 +0100
+Subject: [PATCH 34/63] usb_raw: accept control requests without a data stage
+ and buffer
+
+NULL is not a user address, so a request with no data failed on ARM.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../kernel/drivers/bus/usb/usb_raw.cpp        | 23 ++++++++++++-------
+ 1 file changed, 15 insertions(+), 8 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp b/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp
+index 5654d99294..517985ef2d 100644
+--- a/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp
++++ b/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp
+@@ -721,16 +721,22 @@ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+ 			if (length < sizeof(command.control))
+ 				return B_BUFFER_OVERFLOW;
+ 
+-			void *controlData = malloc(command.control.length);
+-			if (controlData == NULL)
+-				return B_NO_MEMORY;
++			// requests without a data stage may come without a buffer
++			void *controlData = NULL;
++			if (command.control.length > 0) {
++				controlData = malloc(command.control.length);
++				if (controlData == NULL)
++					return B_NO_MEMORY;
++			}
+ 			MemoryDeleter dataDeleter(controlData);
+ 
+ 			bool inTransfer = (command.control.request_type
+ 				& USB_ENDPOINT_ADDR_DIR_IN) != 0;
+-			if (!IS_USER_ADDRESS(command.control.data)
+-				|| (!inTransfer && user_memcpy(controlData,
+-					command.control.data, command.control.length) != B_OK)) {
++			if (command.control.length > 0
++				&& (!IS_USER_ADDRESS(command.control.data)
++					|| (!inTransfer && user_memcpy(controlData,
++						command.control.data, command.control.length)
++							!= B_OK))) {
+ 				return B_BAD_ADDRESS;
+ 			}
+ 
+@@ -758,8 +764,9 @@ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+ 
+ 			if (command.control.status == B_OK)
+ 				status = B_OK;
+-			if (inTransfer && user_memcpy(command.control.data, controlData,
+-				command.control.length) != B_OK) {
++			if (inTransfer && command.control.length > 0
++				&& user_memcpy(command.control.data, controlData,
++					command.control.length) != B_OK) {
+ 				status = B_BAD_ADDRESS;
+ 			}
+ 			break;
+-- 
+2.39.5
+

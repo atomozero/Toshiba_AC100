@@ -1,0 +1,34 @@
+From d4ab2051085218c65bef92e6e188777ef3f81a7f Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 27 Oct 2026 07:20:30 +0100
+Subject: [PATCH 47/63] Tracker: don't let the thumbnail stream delete a bitmap
+ on the stack
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/kits/tracker/Thumbnails.cpp | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/src/kits/tracker/Thumbnails.cpp b/src/kits/tracker/Thumbnails.cpp
+index 83ed4f1be2..58c4218765 100644
+--- a/src/kits/tracker/Thumbnails.cpp
++++ b/src/kits/tracker/Thumbnails.cpp
+@@ -215,9 +215,12 @@ GenerateThumbnailJob::Execute()
+ 		BBitmap* thumbPointer = &thumb;
+ 		BBitmapStream thumbStream(thumbPointer);
+ 		BMallocIO stream;
+-		if (BTranslatorRoster::Default()->Translate(&thumbStream,
+-					NULL, NULL, &stream, B_WEBP_FORMAT) == B_OK
+-				&& thumbStream.DetachBitmap(&thumbPointer) == B_OK) {
++		status_t translated = BTranslatorRoster::Default()->Translate(
++			&thumbStream, NULL, NULL, &stream, B_WEBP_FORMAT);
++		// the stream must never delete the bitmap, which lives on the stack,
++		// also when there is no WebP translator
++		if (thumbStream.DetachBitmap(&thumbPointer) == B_OK
++				&& translated == B_OK) {
+ 			// write WebP image data into an attribute
+ 			status = fFile->WriteAttr(kAttrThumbnail, B_RAW_TYPE, 0,
+ 				stream.Buffer(), stream.BufferLength());
+-- 
+2.39.5
+

@@ -1,0 +1,378 @@
+From d2ad833151252dc548b6306dbdd733512b41fe83 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 27 Oct 2026 07:20:31 +0100
+Subject: [PATCH 54/63] kernel: copy the syslog to AC100LOG.TXT on the EFI
+ system partition
+
+Diagnostics: the log scrolls by too fast on screen and the AC100 has no
+serial port. The image comes with a preallocated AC100LOG.TXT; its
+clusters are written directly on the partition, without mounting it, so
+the volume stays clean whenever the machine is switched off. The syslog
+buffer is 256 KB.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/system/kernel/debug/debug.cpp |  28 ++-
+ src/system/kernel/fs/vfs_boot.cpp | 280 ++++++++++++++++++++++++++++++
+ 2 files changed, 306 insertions(+), 2 deletions(-)
+
+diff --git a/src/system/kernel/debug/debug.cpp b/src/system/kernel/debug/debug.cpp
+index cde05273ca..ac7aa3c550 100644
+--- a/src/system/kernel/debug/debug.cpp
++++ b/src/system/kernel/debug/debug.cpp
+@@ -95,13 +95,33 @@ static bool sDebugScreenEnabled = false;
+ static bool sBlueScreenOutput = true;
+ static bool sEmergencyKeysEnabled = true;
+ static spinlock sSpinlock = B_SPINLOCK_INITIALIZER;
++
++static struct ring_buffer* sSyslogBuffer;
++static uint32 sSyslogLines;
++
++
++/*!	Copies the syslog buffer into \a buffer, returns the size.
++	\a _lines is set to the number of lines written to the syslog so far.
++*/
++size_t
++debug_copy_syslog(char* buffer, size_t size, uint32* _lines)
++{
++	InterruptsSpinLocker locker(sSpinlock);
++	if (_lines != NULL)
++		*_lines = sSyslogLines;
++	if (sSyslogBuffer == NULL || buffer == NULL)
++		return 0;
++	size_t readable = ring_buffer_readable(sSyslogBuffer);
++	if (readable > size)
++		readable = size;
++	return ring_buffer_peek(sSyslogBuffer, 0, buffer, readable);
++}
+ static int32 sDebuggerOnCPU = -1;
+ 
+ static sem_id sSyslogNotify = -1;
+ static thread_id sSyslogWriter = -1;
+ static port_id sSyslogPort = -1;
+ static struct syslog_message* sSyslogMessage;
+-static struct ring_buffer* sSyslogBuffer;
+ static size_t sSyslogBufferOffset = 0;
+ 	// (relative) buffer offset of the yet unsent syslog messages
+ static bool sSyslogDropped = false;
+@@ -117,7 +137,7 @@ static const char* sCurrentKernelDebuggerMessagePrefix;
+ static const char* sCurrentKernelDebuggerMessage;
+ static va_list sCurrentKernelDebuggerMessageArgs;
+ 
+-#define DEFAULT_SYSLOG_BUFFER_SIZE 65536
++#define DEFAULT_SYSLOG_BUFFER_SIZE 262144
+ #define OUTPUT_BUFFER_SIZE 1024
+ static char sOutputBuffer[OUTPUT_BUFFER_SIZE];
+ static char sInterruptOutputBuffer[OUTPUT_BUFFER_SIZE];
+@@ -1327,6 +1347,10 @@ syslog_write(const char* text, int32 length, bool notify)
+ 	}
+ 
+ 	ring_buffer_write(sSyslogBuffer, (uint8*)text, length);
++	for (int32 i = 0; i < length; i++) {
++		if (text[i] == '\n')
++			sSyslogLines++;
++	}
+ 
+ 	if (notify)
+ 		release_sem_etc(sSyslogNotify, 1, B_DO_NOT_RESCHEDULE);
+diff --git a/src/system/kernel/fs/vfs_boot.cpp b/src/system/kernel/fs/vfs_boot.cpp
+index b2b7ebb35a..a03a7ab237 100644
+--- a/src/system/kernel/fs/vfs_boot.cpp
++++ b/src/system/kernel/fs/vfs_boot.cpp
+@@ -32,6 +32,276 @@
+ 
+ #include "vfs_net_boot.h"
+ 
++#include <ByteOrder.h>
++#include <fcntl.h>
++#include <stdlib.h>
++#include <string.h>
++
++
++// Diagnostics: write the syslog to the EFI system partition, which can be
++// read on any PC, as the log scrolls by too fast on screen. The image comes
++// with a preallocated AC100LOG.TXT there; its clusters are written directly
++// on the partition, without mounting it: mounting the FAT volume again and
++// again did not work, and this way the volume stays clean whenever the
++// machine is switched off.
++extern size_t debug_copy_syslog(char* buffer, size_t size, uint32* _lines);
++
++static char sEspPath[B_PATH_NAME_LENGTH];
++
++static const size_t kEspSectorSize = 512;
++static const char* sEspStep = "";
++static const int32 kEspMaxClusters = 1024;
++
++
++struct esp_log_file {
++	int			fd;
++	off_t		entryOffset;
++		// of the directory entry, to update the file size
++	off_t		clusterOffsets[kEspMaxClusters];
++	int32		clusterCount;
++	size_t		clusterSize;
++};
++
++
++static uint16
++esp_read16(const uint8* data)
++{
++	return data[0] | (data[1] << 8);
++}
++
++
++static uint32
++esp_read32(const uint8* data)
++{
++	return esp_read16(data) | ((uint32)esp_read16(data + 2) << 16);
++}
++
++
++static bool
++esp_read(int fd, off_t offset, void* buffer, size_t size)
++{
++	return _kern_read(fd, offset, buffer, size) == (ssize_t)size;
++}
++
++
++/*!	Reads a FAT entry: the device is only read in whole sectors.
++*/
++static bool
++esp_read_fat_entry(int fd, off_t offset, bool fat32, uint32* _value)
++{
++	uint8 sector[kEspSectorSize];
++	off_t sectorOffset = offset & ~(off_t)(kEspSectorSize - 1);
++	if (!esp_read(fd, sectorOffset, sector, sizeof(sector)))
++		return false;
++
++	const uint8* data = sector + (offset - sectorOffset);
++	*_value = fat32 ? esp_read32(data) & 0x0fffffff : esp_read16(data);
++	return true;
++}
++
++
++/*!	Finds AC100LOG.TXT in the root directory of the FAT16 or FAT32 volume
++	opened as \a file->fd and collects the offsets of its clusters.
++*/
++static status_t
++esp_find_log_file(esp_log_file* file)
++{
++	uint8 sector[kEspSectorSize];
++	sEspStep = "boot sector";
++	if (!esp_read(file->fd, 0, sector, sizeof(sector)))
++		return B_IO_ERROR;
++
++	uint32 bytesPerSector = esp_read16(sector + 11);
++	uint32 sectorsPerCluster = sector[13];
++	uint32 reservedSectors = esp_read16(sector + 14);
++	uint32 fatCount = sector[16];
++	uint32 rootEntries = esp_read16(sector + 17);
++	uint32 totalSectors = esp_read16(sector + 19);
++	if (totalSectors == 0)
++		totalSectors = esp_read32(sector + 32);
++	uint32 fatSectors = esp_read16(sector + 22);
++	if (fatSectors == 0)
++		fatSectors = esp_read32(sector + 36);
++	if (bytesPerSector != kEspSectorSize || sectorsPerCluster == 0
++		|| fatCount == 0 || fatSectors == 0)
++		return B_BAD_DATA;
++
++	uint32 rootSectors = (rootEntries * 32 + bytesPerSector - 1)
++		/ bytesPerSector;
++	uint32 firstDataSector = reservedSectors + fatCount * fatSectors
++		+ rootSectors;
++	uint32 clusters = (totalSectors - firstDataSector) / sectorsPerCluster;
++	if (clusters < 4085)
++		return B_NOT_SUPPORTED;
++	bool fat32 = clusters >= 65525;
++
++	file->clusterSize = bytesPerSector * sectorsPerCluster;
++	off_t fatOffset = (off_t)reservedSectors * bytesPerSector;
++	off_t dataOffset = (off_t)firstDataSector * bytesPerSector;
++
++	// the root directory is a fixed area on FAT16, a cluster chain on FAT32
++	uint32 rootCluster = fat32 ? esp_read32(sector + 44) : 0;
++	off_t rootOffset = fatOffset + (off_t)fatCount * fatSectors
++		* bytesPerSector;
++	size_t rootSize = (size_t)rootSectors * bytesPerSector;
++
++	uint32 firstCluster = 0;
++	sEspStep = "root directory";
++	for (int32 i = 0; firstCluster == 0 && i < 64; i++) {
++		if (fat32) {
++			if (rootCluster < 2 || rootCluster >= 0x0ffffff8)
++				break;
++			rootOffset = dataOffset + (off_t)(rootCluster - 2)
++				* file->clusterSize;
++			rootSize = file->clusterSize;
++		} else if (i > 0)
++			break;
++
++		for (size_t offset = 0; offset < rootSize; offset += kEspSectorSize) {
++			if (!esp_read(file->fd, rootOffset + offset, sector,
++					sizeof(sector)))
++				return B_IO_ERROR;
++
++			for (size_t entry = 0; entry < kEspSectorSize; entry += 32) {
++				const uint8* data = sector + entry;
++				if (data[0] == 0)
++					break;
++				if (data[0] == 0xe5 || data[11] == 0x0f
++					|| memcmp(data, "AC100LOGTXT", 11) != 0)
++					continue;
++
++				firstCluster = esp_read16(data + 26)
++					| (fat32 ? (uint32)esp_read16(data + 20) << 16 : 0);
++				file->entryOffset = rootOffset + offset + entry;
++				break;
++			}
++			if (firstCluster != 0)
++				break;
++		}
++
++		if (fat32 && firstCluster == 0) {
++			if (!esp_read_fat_entry(file->fd, fatOffset + rootCluster * 4,
++					true, &rootCluster))
++				return B_IO_ERROR;
++		}
++	}
++	if (firstCluster == 0)
++		return B_ENTRY_NOT_FOUND;
++
++	// follow the cluster chain
++	sEspStep = "FAT";
++	file->clusterCount = 0;
++	uint32 cluster = firstCluster;
++	while (cluster >= 2 && cluster < clusters + 2
++		&& file->clusterCount < kEspMaxClusters) {
++		file->clusterOffsets[file->clusterCount++] = dataOffset
++			+ (off_t)(cluster - 2) * file->clusterSize;
++
++		if (!esp_read_fat_entry(file->fd, fatOffset + cluster * (fat32 ? 4 : 2),
++				fat32, &cluster))
++			return B_IO_ERROR;
++	}
++
++	return file->clusterCount > 0 ? B_OK : B_BAD_DATA;
++}
++
++
++static status_t
++esp_write_log(esp_log_file* file, char* buffer, size_t size)
++{
++	size_t capacity = file->clusterCount * file->clusterSize;
++	if (size > capacity) {
++		// keep the end of the log
++		memmove(buffer, buffer + size - capacity, capacity);
++		size = capacity;
++	}
++
++	// whole sectors only, the rest of the last one is padded with blanks
++	size_t written = (size + kEspSectorSize - 1) & ~(kEspSectorSize - 1);
++	memset(buffer + size, ' ', written - size);
++
++	sEspStep = "data write";
++	for (size_t offset = 0; offset < written; offset += file->clusterSize) {
++		size_t length = min_c(file->clusterSize, written - offset);
++		if (_kern_write(file->fd, file->clusterOffsets[offset
++				/ file->clusterSize], buffer + offset, length)
++				!= (ssize_t)length)
++			return B_IO_ERROR;
++	}
++
++	// let the file end where the log does
++	sEspStep = "directory update";
++	uint8 sector[kEspSectorSize];
++	off_t sectorOffset = file->entryOffset & ~(off_t)(kEspSectorSize - 1);
++	if (!esp_read(file->fd, sectorOffset, sector, sizeof(sector)))
++		return B_IO_ERROR;
++	uint8* sizeField = sector + (file->entryOffset - sectorOffset) + 28;
++	uint32 fileSize = B_HOST_TO_LENDIAN_INT32((uint32)size);
++	if (memcmp(sizeField, &fileSize, 4) != 0) {
++		memcpy(sizeField, &fileSize, 4);
++		if (_kern_write(file->fd, sectorOffset, sector, sizeof(sector))
++				!= (ssize_t)sizeof(sector))
++			return B_IO_ERROR;
++	}
++
++	return B_OK;
++}
++
++
++static status_t
++syslog_to_esp_thread(void*)
++{
++	const size_t kSize = 262144;
++	static esp_log_file file;
++	char* buffer = (char*)malloc(kSize + kEspSectorSize);
++	if (buffer == NULL)
++		return B_NO_MEMORY;
++
++	// the disk may still be scanned, e.g. when it is not the boot disk
++	sEspStep = "open";
++	for (int32 i = 0; i < 30; i++) {
++		file.fd = _kern_open(-1, sEspPath, O_RDWR, 0);
++		if (file.fd >= 0)
++			break;
++		snooze(1000000);
++	}
++	status_t status = file.fd < 0 ? file.fd : esp_find_log_file(&file);
++	if (status != B_OK) {
++		// leave the disk alone, the boot needs it more than the log
++		dprintf("syslog: no AC100LOG.TXT on %s: %s at step \"%s\"\n",
++			sEspPath, strerror(status), sEspStep);
++		if (file.fd >= 0)
++			_kern_close(file.fd);
++		free(buffer);
++		return status;
++	}
++	dprintf("syslog: copied to AC100LOG.TXT on %s (%" B_PRId32 " KB)\n",
++		sEspPath, (int32)(file.clusterCount * file.clusterSize / 1024));
++
++	// write after every 10 new lines, and at least every 2 seconds while
++	// there is anything new
++	uint32 writtenLines = 0;
++	bigtime_t lastWrite = 0;
++	while (true) {
++		snooze(250000);
++
++		uint32 lines;
++		debug_copy_syslog(NULL, 0, &lines);
++		if (lines == writtenLines || (lines - writtenLines < 10
++				&& system_time() - lastWrite < 2000000))
++			continue;
++
++		size_t size = debug_copy_syslog(buffer, kSize, &lines);
++		status = esp_write_log(&file, buffer, size);
++		if (status != B_OK)
++			continue;
++		writtenLines = lines;
++		lastWrite = system_time();
++	}
++
++	return B_OK;
++}
++
+ 
+ //#define TRACE_VFS
+ #ifdef TRACE_VFS
+@@ -570,6 +840,16 @@ vfs_mount_boot_file_system(kernel_args* args)
+ 		if (bootDevice >= 0) {
+ 			dprintf("Mounted boot partition: %s\n", path.Path());
+ 			gReadOnlyBootDevice = readOnly;
++
++			// the EFI system partition is the first one of the boot disk
++			strlcpy(sEspPath, path.Path(), sizeof(sEspPath));
++			char* last = strrchr(sEspPath, '/');
++			if (last != NULL && !readOnly) {
++				strlcpy(last + 1, "0", sizeof(sEspPath) - (last + 1 - sEspPath));
++				thread_id thread = spawn_kernel_thread(&syslog_to_esp_thread,
++					"syslog to ESP", B_URGENT_DISPLAY_PRIORITY, NULL);
++				resume_thread(thread);
++			}
+ 			break;
+ 		}
+ 	}
+-- 
+2.39.5
+

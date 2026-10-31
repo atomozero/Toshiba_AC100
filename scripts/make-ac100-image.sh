@@ -10,6 +10,10 @@
 #   non ha i registri d16-d31 (libstdc++ li usa gia' nel costruttore statico).
 #   Le versioni D16 vengono dal bootstrap build (~/haiku-arm/haiku-bs) e, per
 #   zstd e ICU, da una ricompilazione con la toolchain D16 (ZSTD_HPKG, ICU_HPKG).
+# - con RELEASE=<elenco> (release/packages.txt) l'immagine da distribuire: solo
+#   i pacchetti dell'elenco e quelli che servono loro (scripts/release-packages.py,
+#   cartelle in RELEASE_DIRS), niente file e programmi di prova, sulla
+#   Scrivania SalaGiochi, "Add games" e "Install to internal memory".
 set -e
 OUT=${1:?uso: $0 <immagine di uscita>}
 # G=~/haiku-arm/haiku-renku/generated.arm per l'immagine da RenkuOS
@@ -112,7 +116,26 @@ replace ncurses6-6.2-1-arm.hpkg $R/ncurses6_bootstrap-6.6-1-arm.hpkg
 replace coreutils-8.22-1-arm.hpkg "$(d16 coreutils $R/coreutils_bootstrap-9.9-1-arm.hpkg)"
 replace zstd-1.5.5-1-arm.hpkg "$(d16 zstd $ZSTD_HPKG)"
 cmds+=("cp -f :$ICU_HPKG $P/icu-57.2-1-arm.hpkg")
-if [ -n "$APPS_DIR" ]; then
+if [ -n "${RELEASE:-}" ]; then
+	PP=$G/objects/haiku/arm/packaging/packages
+	export PACKAGE_TOOL=$T_TOOLS/package/package
+	base=("$PP/haiku.hpkg" "$PP/haiku_datatranslators.hpkg" "$PP/haiku_loader.hpkg"
+		"$G"/download/noto-*-any.hpkg "$(d16 zlib $R/zlib_bootstrap-1.3.2-1-arm.hpkg)"
+		"$(d16 bash $R/bash_bootstrap-5.3-1-arm.hpkg)"
+		"$(d16 coreutils $R/coreutils_bootstrap-9.9-1-arm.hpkg)"
+		"$(d16 zstd $ZSTD_HPKG)" "$ICU_HPKG" "$SYSLIBS_HPKG"
+		$R/freetype_bootstrap-2.13.3-1-arm.hpkg $R/ncurses6_bootstrap-6.6-1-arm.hpkg)
+	for f in "$APPS_DIR"/openssl-[0-9]*-arm.hpkg; do base+=("$f"); done
+	list=$(python3 "$(dirname "$0")/release-packages.py" "$RELEASE" "${base[@]}" \
+		-- $RELEASE_DIRS "$R")
+	for f in $list; do
+		case "$(basename "$f")" in
+			zlib-[0-9]*|bash-[0-9]*|coreutils-[0-9]*|zstd-[0-9]*|openssl-[0-9]*) continue ;;
+		esac
+		cmds+=("cp -f :$f $P/$(basename "$f")")
+	done
+	echo "$list" > "$T/release-packages.txt"
+elif [ -n "$APPS_DIR" ]; then
 	for f in "$APPS_DIR"/*.hpkg "$EXTRA_DIR"/*.hpkg; do
 		[ -f "$f" ] || continue
 		# zlib, bash, coreutils e zstd sono gia' stati messi sopra
@@ -144,6 +167,16 @@ if [ -n "$APPS_DIR" ]; then
 	# per python3.11: libffi dal bootstrap
 	ls "$APPS_DIR"/libffi-[0-9]*-arm.hpkg > /dev/null 2>&1 \
 		|| cmds+=("cp -f :$R/libffi_bootstrap-3.4.6-1-arm.hpkg $P/libffi_bootstrap-3.4.6-1-arm.hpkg")
+fi
+
+if [ -n "${RELEASE:-}" ]; then
+	A=/boot/system/apps
+	cmds+=("mkdir -p /myfs/home/Desktop"
+		"ln -s $A/SalaGiochi/SalaGiochi /myfs/home/Desktop/SalaGiochi"
+		"ln -s $A/SalaGiochi/AddGames '/myfs/home/Desktop/Add games'"
+		"ln -s '$A/Install to internal memory' '/myfs/home/Desktop/Install to internal memory'")
+	bfs "${cmds[@]}" "ls $P" "ls -l /myfs/home/Desktop"
+	exit 0
 fi
 
 # file audio e video di prova sulla Scrivania (scripts/make-test-media.py)

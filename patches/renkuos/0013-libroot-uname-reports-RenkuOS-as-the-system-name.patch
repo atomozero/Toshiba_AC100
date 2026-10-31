@@ -1,0 +1,35 @@
+From 503316c39d410131355a60a3e8e957cd2ae2206f Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 24 Oct 2026 01:18:59 +0200
+Subject: [PATCH 13/63] libroot: uname() reports RenkuOS as the system name
+
+uname -s, and the sysname field of struct utsname, still said "Haiku".
+Report the name of the system that is actually running.
+
+Software that tells systems apart by this name (config.guess, CMake's
+CMAKE_SYSTEM_NAME, Python's platform module, build scripts that test
+`uname -s`) will no longer recognise the system as Haiku; such checks
+need to accept RenkuOS too, or this name may be better kept for
+compatibility. Raising it here for discussion.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/system/libroot/posix/sys/uname.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/system/libroot/posix/sys/uname.c b/src/system/libroot/posix/sys/uname.c
+index 1dd0decf6f..352bec8ff9 100644
+--- a/src/system/libroot/posix/sys/uname.c
++++ b/src/system/libroot/posix/sys/uname.c
+@@ -36,7 +36,7 @@ uname(struct utsname *info)
+ 
+ 	get_system_info(&systemInfo);
+ 
+-	strlcpy(info->sysname, "Haiku", sizeof(info->sysname));
++	strlcpy(info->sysname, "RenkuOS", sizeof(info->sysname));
+ 
+ 	haikuRevision = __get_haiku_revision();
+ 	if (haikuRevision[0] != '\0')
+-- 
+2.39.5
+

@@ -1,0 +1,260 @@
+From 3265cec892ac425f41320824e0794ce2806b4a4c Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 20 Oct 2026 18:10:21 +0200
+Subject: [PATCH 09/63] media: copy structures out of messages before using
+ them
+
+BMessage::FindData() returns pointers into the message's data, which is
+not aligned. media_server used the media_node of a notification request in
+place and died with SIGBUS on ARM, where the compiler copies it with
+multi-word loads. Copy the nodes, sources, destinations and formats found in
+messages before using them.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/kits/media/DefaultMediaTheme.cpp      | 44 ++++++++++------
+ src/kits/media/MediaFormats.cpp           | 19 ++++---
+ src/servers/media/NotificationManager.cpp | 62 +++++++++++++++--------
+ 3 files changed, 84 insertions(+), 41 deletions(-)
+
+diff --git a/src/kits/media/DefaultMediaTheme.cpp b/src/kits/media/DefaultMediaTheme.cpp
+index 799ae8763b..61207d2e3a 100644
+--- a/src/kits/media/DefaultMediaTheme.cpp
++++ b/src/kits/media/DefaultMediaTheme.cpp
+@@ -26,12 +26,32 @@
+ #include <TextControl.h>
+ #include <Window.h>
+ 
++#include <string.h>
++
+ #include "MediaDebug.h"
+ 
+ 
+ using namespace BPrivate;
+ 
+ 
++/*!	Copies the node of a parameter notification out of \a message: the data
++	in a message is not aligned, using it in place can fault on some CPUs
++	(ARM).
++*/
++static bool
++find_node(BMessage* message, media_node& node)
++{
++	const void* data;
++	ssize_t size;
++	if (message->FindData("node", B_RAW_TYPE, &data, &size) != B_OK
++		|| size != sizeof(media_node)) {
++		return false;
++	}
++	memcpy((void*)&node, data, sizeof(media_node));
++	return true;
++}
++
++
+ namespace BPrivate {
+ 
+ namespace DefaultMediaControls {
+@@ -570,14 +590,12 @@ ContinuousMessageFilter::Filter(BMessage *message, BHandler **target)
+ 	}
+ 	if (message->what == B_MEDIA_NEW_PARAMETER_VALUE) {
+ 		// update view from parameter -- if the message concerns us
+-		const media_node* node;
++		media_node node;
+ 		int32 parameterID;
+-		ssize_t size;
+ 		if (message->FindInt32("parameter", &parameterID) != B_OK
+ 			|| fParameter.ID() != parameterID
+-			|| message->FindData("node", B_RAW_TYPE, (const void**)&node,
+-					&size) != B_OK
+-			|| fParameter.Web()->Node() != *node)
++			|| !find_node(message, node)
++			|| fParameter.Web()->Node() != node)
+ 			return B_DISPATCH_MESSAGE;
+ 
+ 		_UpdateControl();
+@@ -659,14 +677,12 @@ DiscreteMessageFilter::Filter(BMessage *message, BHandler **target)
+ 
+ 	if (message->what == B_MEDIA_NEW_PARAMETER_VALUE) {
+ 		TRACE("DiscreteMessageFilter::Filter: Got a new parameter value\n");
+-		const media_node* node;
++		media_node node;
+ 		int32 parameterID;
+-		ssize_t size;
+ 		if (message->FindInt32("parameter", &parameterID) != B_OK
+ 			|| fParameter.ID() != parameterID
+-			|| message->FindData("node", B_RAW_TYPE, (const void**)&node,
+-					&size) != B_OK
+-			|| fParameter.Web()->Node() != *node)
++			|| !find_node(message, node)
++			|| fParameter.Web()->Node() != node)
+ 			return B_DISPATCH_MESSAGE;
+ 
+ 		int32 value = 0;
+@@ -757,14 +773,12 @@ TextMessageFilter::Filter(BMessage *message, BHandler **target)
+ 
+ 	if (message->what == B_MEDIA_NEW_PARAMETER_VALUE) {
+ 		TRACE("TextMessageFilter::Filter: Got a new parameter value\n");
+-		const media_node* node;
++		media_node node;
+ 		int32 parameterID;
+-		ssize_t size;
+ 		if (message->FindInt32("parameter", &parameterID) != B_OK
+ 			|| fParameter.ID() != parameterID
+-			|| message->FindData("node", B_RAW_TYPE, (const void**)&node,
+-					&size) != B_OK
+-			|| fParameter.Web()->Node() != *node)
++			|| !find_node(message, node)
++			|| fParameter.Web()->Node() != node)
+ 			return B_DISPATCH_MESSAGE;
+ 
+ 		if (BTextControl *textControl = dynamic_cast<BTextControl *>(control)) {
+diff --git a/src/kits/media/MediaFormats.cpp b/src/kits/media/MediaFormats.cpp
+index 4f3b9e0eea..c9f3d5659f 100644
+--- a/src/kits/media/MediaFormats.cpp
++++ b/src/kits/media/MediaFormats.cpp
+@@ -391,21 +391,28 @@ update_media_formats()
+ 	for (; index < sFormats.CountItems() && index < count; index++) {
+ 		meta_format* item = sFormats.ItemAt(index);
+ 
+-		const meta_format* newItem;
++		// the data in the message is not aligned
++		const void* newItem;
+ 		ssize_t size;
+ 		if (reply.FindData("formats", MEDIA_META_FORMAT_TYPE, index,
+-				(const void**)&newItem, &size) == B_OK)
+-			*item = *newItem;
++				&newItem, &size) == B_OK && size == sizeof(meta_format)) {
++			alignas(meta_format) char buffer[sizeof(meta_format)];
++			memcpy(buffer, newItem, sizeof(meta_format));
++			*item = *(const meta_format*)buffer;
++		}
+ 	}
+ 
+ 	// allocate additional formats
+ 
+ 	for (; index < count; index++) {
+-		const meta_format* newItem;
++		const void* newItem;
+ 		ssize_t size;
+ 		if (reply.FindData("formats", MEDIA_META_FORMAT_TYPE, index,
+-				(const void**)&newItem, &size) == B_OK)
+-			sFormats.AddItem(new meta_format(*newItem));
++				&newItem, &size) == B_OK && size == sizeof(meta_format)) {
++			alignas(meta_format) char buffer[sizeof(meta_format)];
++			memcpy(buffer, newItem, sizeof(meta_format));
++			sFormats.AddItem(new meta_format(*(const meta_format*)buffer));
++		}
+ 	}
+ 
+ 	// remove no longer used formats
+diff --git a/src/servers/media/NotificationManager.cpp b/src/servers/media/NotificationManager.cpp
+index 09b7715c5a..28e3051f7a 100644
+--- a/src/servers/media/NotificationManager.cpp
++++ b/src/servers/media/NotificationManager.cpp
+@@ -29,6 +29,8 @@
+ 
+ #include "NotificationManager.h"
+ 
++#include <string.h>
++
+ #include <Autolock.h>
+ #include <Locker.h>
+ #include <Message.h>
+@@ -86,9 +88,13 @@ NotificationManager::RequestNotifications(BMessage *msg)
+ 	msg->FindMessenger(NOTIFICATION_PARAM_MESSENGER, &messenger);
+ 	msg->FindInt32(NOTIFICATION_PARAM_TEAM, &team);
+ 	msg->FindInt32(NOTIFICATION_PARAM_WHAT, &what);
+-	msg->FindData("node", B_RAW_TYPE, reinterpret_cast<const void **>(&node),
+-		&nodeSize);
++	const void* nodeData;
++	media_node nodeCopy;
++	msg->FindData("node", B_RAW_TYPE, &nodeData, &nodeSize);
+ 	ASSERT(nodeSize == sizeof(media_node));
++	// the data in the message is not aligned
++	memcpy((void*)&nodeCopy, nodeData, sizeof(nodeCopy));
++	node = &nodeCopy;
+ 
+ 	Notification n;
+ 	n.messenger = messenger;
+@@ -122,9 +128,13 @@ NotificationManager::CancelNotifications(BMessage *msg)
+ 	msg->FindMessenger(NOTIFICATION_PARAM_MESSENGER, &messenger);
+ 	msg->FindInt32(NOTIFICATION_PARAM_TEAM, &team);
+ 	msg->FindInt32(NOTIFICATION_PARAM_WHAT, &what);
+-	msg->FindData("node", B_RAW_TYPE, reinterpret_cast<const void **>(&node),
+-		&nodeSize);
++	const void* nodeData;
++	media_node nodeCopy;
++	msg->FindData("node", B_RAW_TYPE, &nodeData, &nodeSize);
+ 	ASSERT(nodeSize == sizeof(media_node));
++	// the data in the message is not aligned
++	memcpy((void*)&nodeCopy, nodeData, sizeof(nodeCopy));
++	node = &nodeCopy;
+ 
+ 	TRACE("NotificationManager::CancelNotifications node %ld, team %ld, what "
+ 		"%#lx\n", node->node, team, what);
+@@ -173,9 +183,6 @@ NotificationManager::CancelNotifications(BMessage *msg)
+ void
+ NotificationManager::SendNotifications(BMessage *msg)
+ {
+-	const media_source *source;
+-	const media_destination *destination;
+-	const media_node *node;
+ 	ssize_t size;
+ 	int32 what;
+ 
+@@ -210,24 +217,39 @@ NotificationManager::SendNotifications(BMessage *msg)
+ 			case B_MEDIA_PARAMETER_CHANGED:
+ 			case B_MEDIA_NODE_STOPPED:
+ 			case B_MEDIA_WEB_CHANGED:
+-				msg->FindData("node", B_RAW_TYPE,
+-					reinterpret_cast<const void **>(&node), &size);
+-				ASSERT(size == sizeof(media_node));
+-				if (n->node != *node)
++			{
++				// the data in the message is not aligned
++				const void* data;
++				media_node nodeCopy;
++				if (msg->FindData("node", B_RAW_TYPE, &data, &size) != B_OK
++					|| size != sizeof(media_node))
+ 					continue;
++				memcpy((void*)&nodeCopy, data, sizeof(nodeCopy));
++				if (n->node != nodeCopy)
++					continue;
++			}
+ 				break;
+ 
+ 			case B_MEDIA_FORMAT_CHANGED:
+-				msg->FindData("source", B_RAW_TYPE,
+-					reinterpret_cast<const void **>(&source), &size);
+-				ASSERT(size == sizeof(media_source));
+-				msg->FindData("destination", B_RAW_TYPE,
+-					reinterpret_cast<const void **>(&destination), &size);
+-				ASSERT(size == sizeof(media_destination));
+-
+-				if (n->node.port != source->port
+-					&& n->node.port != destination->port)
++			{
++				// the data in the message is not aligned
++				const void* data;
++				media_source sourceCopy;
++				media_destination destinationCopy;
++				if (msg->FindData("source", B_RAW_TYPE, &data, &size) != B_OK
++					|| size != sizeof(media_source))
+ 					continue;
++				memcpy((void*)&sourceCopy, data, sizeof(sourceCopy));
++				if (msg->FindData("destination", B_RAW_TYPE, &data, &size)
++						!= B_OK
++					|| size != sizeof(media_destination))
++					continue;
++				memcpy((void*)&destinationCopy, data, sizeof(destinationCopy));
++
++				if (n->node.port != sourceCopy.port
++					&& n->node.port != destinationCopy.port)
++					continue;
++			}
+ 				break;
+ 		}
+ 
+-- 
+2.39.5
+

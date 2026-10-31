@@ -1,0 +1,60 @@
+From be166ef7bd240858ffc72034849efd7b66ba4349 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 26 Oct 2026 23:42:05 +0100
+Subject: [PATCH 10/63] media: no unaligned access to a flattened BParameterWeb
+
+BParameterWeb and its groups read and wrote the values of a flattened web
+in place, but after a string they are not aligned anymore. This raised
+SIGBUS on ARM (Media preferences, the Deskbar volume control).
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/kits/media/ParameterWeb.cpp | 18 +++++++-----------
+ 1 file changed, 7 insertions(+), 11 deletions(-)
+
+diff --git a/src/kits/media/ParameterWeb.cpp b/src/kits/media/ParameterWeb.cpp
+index bd5eb4186a..72ee817da6 100644
+--- a/src/kits/media/ParameterWeb.cpp
++++ b/src/kits/media/ParameterWeb.cpp
+@@ -18,6 +18,7 @@
+ 
+ #include <new>
+ #include <string.h>
++#include <type_traits>
+ 
+ #include <MediaNode.h>
+ #include <MediaRoster.h>
+@@ -171,11 +172,10 @@ static const ssize_t kAdditionalDiscreteParameterSize = sizeof(ssize_t);
+ template<class Type> Type
+ read_from_buffer(const void **_buffer)
+ {
+-	const Type *typedBuffer = static_cast<const Type *>(*_buffer);
+-	Type value = *typedBuffer;
+-
+-	typedBuffer++;
+-	*_buffer = static_cast<const void *>(typedBuffer);
++	// the flattened data does not have to be aligned
++	typename std::remove_const<Type>::type value;
++	memcpy((void*)&value, *_buffer, sizeof(Type));
++	*_buffer = static_cast<const uint8 *>(*_buffer) + sizeof(Type);
+ 
+ 	return value;
+ }
+@@ -224,12 +224,8 @@ reserve_in_buffer(void **_buffer)
+ template<class Type> void
+ write_to_buffer(void **_buffer, Type value)
+ {
+-	Type *typedBuffer = static_cast<Type *>(*_buffer);
+-
+-	*typedBuffer = value;
+-	typedBuffer++;
+-
+-	*_buffer = static_cast<void *>(typedBuffer);
++	memcpy(*_buffer, (const void*)&value, sizeof(Type));
++	*_buffer = static_cast<uint8 *>(*_buffer) + sizeof(Type);
+ }
+ 
+ 
+-- 
+2.39.5
+

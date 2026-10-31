@@ -1,0 +1,36 @@
+From 84523cc0cf75f0bd5c528641125580f77d1278bb Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Mon, 26 Oct 2026 23:42:05 +0100
+Subject: [PATCH 11/63] libicon: no unaligned access to archived matrices
+
+Transformable used the matrix it found in an archive in place, where it
+does not have to be aligned. This raised SIGBUS on ARM in applications
+loading icons.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/libs/icon/transformable/Transformable.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/libs/icon/transformable/Transformable.cpp b/src/libs/icon/transformable/Transformable.cpp
+index 137684f1db..f19c33f33e 100644
+--- a/src/libs/icon/transformable/Transformable.cpp
++++ b/src/libs/icon/transformable/Transformable.cpp
+@@ -88,8 +88,13 @@ Transformable::StoreTo(double matrix[matrix_size]) const
+ 
+ 
+ void
+-Transformable::LoadFrom(const double matrix[matrix_size])
++Transformable::LoadFrom(const double _matrix[matrix_size])
+ {
++	// the matrix often comes straight from an archive, where it does not
++	// have to be aligned
++	double matrix[matrix_size];
++	memcpy(matrix, _matrix, sizeof(matrix));
++
+ 	// before calling the potentially heavy TransformationChanged()
+ 	// hook function, make sure that the transformation
+ 	// really changed
+-- 
+2.39.5
+

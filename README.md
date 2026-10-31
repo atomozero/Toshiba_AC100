@@ -6,6 +6,13 @@ FPU and no NEON, 512 MB of RAM, 16 GB eMMC.
 
 *Il resto della documentazione è in italiano.*
 
+## Download
+
+A ready-to-use microSD image is published on the
+[releases page](https://github.com/atomozero/Toshiba_AC100/releases). Write it to a
+microSD card of 8 GB or more and start the AC100 from it with U-Boot: the steps are in
+[INSTALL.md](INSTALL.md). Nothing is written to the internal eMMC unless you choose to.
+
 ## Cosa funziona
 
 | Componente | Stato |
@@ -23,7 +30,8 @@ FPU and no NEON, 512 MB of RAM, 16 GB eMMC.
 | Spegnimento | funziona |
 | Riavvio | richiede U-Boot sull'eMMC |
 | GPU 2D (GR2D via host1x) | prime prove, non ancora usata dal sistema |
-| Bluetooth, webcam, GPU 3D, sospensione | da fare |
+| Bluetooth: tastiere, mouse e gamepad HID (provato con un Xbox Wireless Controller e l'adattatore CSR interno) | funziona |
+| Webcam, GPU 3D, sospensione | da fare |
 
 Dettagli in [docs/STATUS.md](docs/STATUS.md) e [docs/ROADMAP.md](docs/ROADMAP.md).
 

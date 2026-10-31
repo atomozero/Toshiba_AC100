@@ -1,0 +1,1431 @@
+From d62584e126adc6db96d66d238e8f403a08e7db6b Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 27 Oct 2026 07:20:25 +0100
+Subject: [PATCH 33/63] usb, ehci: the USB controllers of the NVIDIA Tegra 2
+
+- use non-cacheable memory for DMA on ARM
+- support device tree controllers with an integrated transaction
+  translator (ChipIdea), only in host mode; no split transactions to the
+  root hub, no NAK count reload for full and low speed endpoints
+- bring the UTMI PHY up, with the Tegra 2 transceiver settings and TX
+  FIFO threshold, and the controller with the external ULPI PHY, moving
+  the system clock off PLLP_OUT4 first
+- the AHB performance settings of the Tegra 2 TRM
+- order descriptor writes before register writes on ARM
+- the device manager looks for USB host controllers on generic nodes
+- the bounded port retries are enabled on 32-bit ARM too
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/add-ons/kernel/bus_managers/usb/Hub.cpp   |   18 +-
+ .../usb/PhysicalMemoryAllocator.cpp           |   10 +
+ src/add-ons/kernel/bus_managers/usb/Stack.cpp |    7 +
+ src/add-ons/kernel/busses/usb/ehci.cpp        | 1014 +++++++++++++++--
+ src/add-ons/kernel/busses/usb/ehci.h          |   22 +
+ src/add-ons/kernel/busses/usb/ehci_hardware.h |   13 +
+ .../kernel/device_manager/device_manager.cpp  |    2 +
+ 7 files changed, 983 insertions(+), 103 deletions(-)
+
+diff --git a/src/add-ons/kernel/bus_managers/usb/Hub.cpp b/src/add-ons/kernel/bus_managers/usb/Hub.cpp
+index b7eaef1ec3..ab9d9aef4a 100644
+--- a/src/add-ons/kernel/bus_managers/usb/Hub.cpp
++++ b/src/add-ons/kernel/bus_managers/usb/Hub.cpp
+@@ -16,14 +16,16 @@
+ 
+ 
+ // The bounded per-port retry/power-cycle backoff below is enabled on x86,
+-// 32- and 64-bit. It was written for the early-boot behaviour of old
+-// 32-bit-only machines (the Sony VAIO P's Intel SCH companions and its
+-// EC-powered internal devices); on x86_64 it stops a device that keeps
+-// failing setup from being reset several times a second for as long as it
+-// stays plugged in. Those are the only places it has been exercised; every
+-// other architecture keeps servicing a failing port on every poll, exactly
+-// as before. The compiler drops the guarded code entirely.
+-#if defined(__i386__) || defined(__x86_64__)
++// 32- and 64-bit, and on 32-bit ARM. It was written for the early-boot
++// behaviour of old 32-bit-only machines (the Sony VAIO P's Intel SCH
++// companions and its EC-powered internal devices); on x86_64 it stops a
++// device that keeps failing setup from being reset several times a second
++// for as long as it stays plugged in, and so it does on ARM (the internal
++// camera of the Toshiba AC100). Those are the only places it has been
++// exercised; every other architecture keeps servicing a failing port on
++// every poll, exactly as before. The compiler drops the guarded code
++// entirely.
++#if defined(__i386__) || defined(__x86_64__) || defined(__arm__)
+ static const bool kBoundedPortRetries = true;
+ #else
+ static const bool kBoundedPortRetries = false;
+diff --git a/src/add-ons/kernel/bus_managers/usb/PhysicalMemoryAllocator.cpp b/src/add-ons/kernel/bus_managers/usb/PhysicalMemoryAllocator.cpp
+index 8734a13c55..cee33deea5 100644
+--- a/src/add-ons/kernel/bus_managers/usb/PhysicalMemoryAllocator.cpp
++++ b/src/add-ons/kernel/bus_managers/usb/PhysicalMemoryAllocator.cpp
+@@ -16,6 +16,10 @@
+ #include "PhysicalMemoryAllocator.h"
+ #include "usb_dma.h"
+ 
++#ifdef __ARM__
++#	include <vm/vm.h>
++#endif
++
+ 
+ //#define TRACE_PHYSICAL_MEMORY_ALLOCATOR
+ #ifdef TRACE_PHYSICAL_MEMORY_ALLOCATOR
+@@ -100,6 +104,12 @@ PhysicalMemoryAllocator::PhysicalMemoryAllocator(const char *name,
+ 
+ 	fPhysicalBase = physicalEntry.address;
+ 
++#ifdef __ARM__
++	// The controllers access this memory by DMA, which is not coherent with
++	// the data cache on ARM
++	vm_set_area_memory_type(fArea, fPhysicalBase, B_WRITE_COMBINING_MEMORY);
++#endif
++
+ 	fNoMemoryCondition.Init(this, "USB PMA");
+ 	fStatus = B_OK;
+ }
+diff --git a/src/add-ons/kernel/bus_managers/usb/Stack.cpp b/src/add-ons/kernel/bus_managers/usb/Stack.cpp
+index ef6ea9b82c..05e48f599d 100644
+--- a/src/add-ons/kernel/bus_managers/usb/Stack.cpp
++++ b/src/add-ons/kernel/bus_managers/usb/Stack.cpp
+@@ -349,6 +349,13 @@ Stack::AllocateArea(void **logicalAddress, phys_addr_t *physicalAddress, size_t
+ 		return B_ERROR;
+ 	}
+ 
++#ifdef __ARM__
++	// The controllers access this memory by DMA, which is not coherent with
++	// the data cache on ARM
++	vm_set_area_memory_type(area, physicalEntry.address,
++		B_WRITE_COMBINING_MEMORY);
++#endif
++
+ 	memset(logAddress, 0, size);
+ 	if (logicalAddress)
+ 		*logicalAddress = logAddress;
+diff --git a/src/add-ons/kernel/busses/usb/ehci.cpp b/src/add-ons/kernel/busses/usb/ehci.cpp
+index 72187b0de1..6ec4e48142 100644
+--- a/src/add-ons/kernel/busses/usb/ehci.cpp
++++ b/src/add-ons/kernel/busses/usb/ehci.cpp
+@@ -11,6 +11,7 @@
+ #include <stdio.h>
+ 
+ #include <driver_settings.h>
++#include <bus/FDT.h>
+ #include <bus/PCI.h>
+ #include <USB3.h>
+ #include <KernelExport.h>
+@@ -41,9 +42,617 @@ typedef struct {
+ 
+ 	device_node* node;
+ 	device_node* driver_node;
++
++	// for controllers on a device tree (FDT) bus
++	bool is_fdt;
++	phys_addr_t registers;
++	size_t registers_size;
++	size_t capability_offset;
++	uint32 irq;
++	uint32 flags;
+ } ehci_pci_sim_info;
+ 
+ 
++// #pragma mark - NVIDIA Tegra 2 UTMI PHY
++
++
++#define TEGRA20_CAR_BASE				0x60006000
++#define TEGRA20_AHB_BASE				0x6000c000
++#define TEGRA20_AHB_REGISTERS			0x004	// the TRM's offsets start here
++#define AHB_ARBITRATION_PRIORITY_CTRL	0x004
++#define AHB_PRIORITY_WEIGHT(x)			((uint32)(x) << 29)
++#define AHB_GIZMO_AHB_MEM				0x00c
++#define AHB_GIZMO_ENB_FAST_REARBITRATE	(1 << 2)
++#define AHB_GIZMO_IMMEDIATE				(1 << 18)
++#define AHB_PREFETCH_ENABLE				(1U << 31)
++#define AHB_PREFETCH_MST_ID(x)			((uint32)(x) << 26)
++#define AHB_PREFETCH_MST_ID_MASK		(0x1fU << 26)
++#define AHB_PREFETCH_ADDR_BNDRY(x)		((uint32)(x) << 21)
++#define AHB_PREFETCH_INACTIVITY_TIMEOUT(x)	((uint32)(x) & 0xffff)
++#define TEGRA_CAR_RST_DEVICES(bank)		(0x04 + (bank) * 4)
++#define TEGRA_CAR_CLK_OUT_ENB(bank)		(0x10 + (bank) * 4)
++#define TEGRA_CAR_OSC_CTRL				0x50
++#define TEGRA_CLOCK_USBD				22
++	// the first controller, which also holds the shared UTMI pad registers
++
++// controller registers, from the start of the controller
++#define TEGRA_USB_ICUSB_CTRL			0x16c
++#define TEGRA_USB_PORTSC1				0x184
++#define TEGRA_USB_SUSP_CTRL				0x400
++#define TEGRA_USB_PHY_VBUS_SENSORS		0x404
++#define TEGRA_UTMIP_PLL_CFG1			0x804
++#define TEGRA_UTMIP_XCVR_CFG0			0x808
++#define TEGRA_UTMIP_BIAS_CFG0			0x80c
++#define TEGRA_UTMIP_HSRX_CFG0			0x810
++#define TEGRA_UTMIP_HSRX_CFG1			0x814
++#define TEGRA_UTMIP_TX_CFG0				0x820
++#define TEGRA_UTMIP_MISC_CFG1			0x828
++#define TEGRA_UTMIP_DEBOUNCE_CFG0		0x82c
++#define TEGRA_UTMIP_BAT_CHRG_CFG0		0x830
++#define TEGRA_UTMIP_SPARE_CFG0			0x834
++#define TEGRA_UTMIP_XCVR_CFG1			0x838
++#define TEGRA_UTMIP_BIAS_CFG1			0x83c
++
++#define UTMIP_PHY_ENB					(1 << 12)
++#define UTMIP_RESET						(1 << 11)
++#define USB_PHY_CLK_VALID				(1 << 7)
++#define VBUS_B_SESS_VLD_SW_VALUE		(1 << 12)
++#define VBUS_B_SESS_VLD_SW_EN			(1 << 11)
++#define UTMIP_PHY_XTAL_CLOCKEN			(1 << 30)
++#define UTMIP_OTGPD						(1 << 11)
++#define UTMIP_BIASPD					(1 << 10)
++#define UTMIP_FS_PREAMBLE_J				(1 << 19)
++#define UTMIP_PD_CHRG					(1 << 0)
++#define FUSE_SETUP_SEL					(1 << 3)
++#define UTMIP_XCVR_LSBIAS_SE			(1 << 21)
++#define UTMIP_FORCE_PD_POWERDOWN		(1 << 14)
++#define UTMIP_FORCE_PD2_POWERDOWN		(1 << 16)
++#define UTMIP_FORCE_PDZI_POWERDOWN		(1 << 18)
++#define UTMIP_FORCE_PDDISC_POWERDOWN	(1 << 0)
++#define UTMIP_FORCE_PDCHRP_POWERDOWN	(1 << 2)
++#define UTMIP_FORCE_PDDR_POWERDOWN		(1 << 4)
++#define IC_ENB1							(1 << 3)
++#define UTMIP_XCVR_SETUP(x)				((x) & 0xf)
++#define UTMIP_XCVR_SETUP_MSB(x)			((((x) & 0x70) >> 4) << 22)
++#define UTMIP_XCVR_LSRSLEW(x)			(((x) & 0x3) << 8)
++#define UTMIP_XCVR_LSFSLEW(x)			(((x) & 0x3) << 10)
++#define UTMIP_XCVR_TERM_RANGE_ADJ(x)	(((x) & 0xf) << 18)
++#define TEGRA_PORTSC_PTS_MASK			(3U << 30)
++#define TEGRA_PORTSC_STS				(1 << 29)
++
++// ULPI (USB2 with an external PHY)
++#define TEGRA20_APB_MISC_BASE			0x70000000
++#define TEGRA20_GPIO_BASE				0x6000d000
++#define TEGRA_CAR_PLLP_OUTB				0x0a8
++#define TEGRA_CAR_SCLK_BURST_POLICY		0x028
++#define TEGRA_SCLK_SOURCE_PLLP_OUT4		2
++#define TEGRA_SCLK_SOURCE_PLLP_OUT3		3
++#define TEGRA_CLOCK_CDEV2				(64 + 29)	// CLK_ENB_DEV2_OUT
++#define TEGRA_TRISTATE_REG_A			0x014
++#define TEGRA_TRISTATE_REG_B			0x018
++#define TEGRA_TRISTATE_REG_D			0x020
++#define TEGRA_PIN_MUX_CTL_A				0x080
++#define TEGRA_PIN_MUX_CTL_C				0x088
++#define TEGRA_GPIO_REG(gpio, reg)		(((gpio) / 32) * 0x80 \
++	+ (((gpio) / 8) % 4) * 4 + (reg))
++#define TEGRA_GPIO_MSK_CNF				0x800
++#define TEGRA_GPIO_MSK_OE				0x810
++#define TEGRA_GPIO_MSK_OUT				0x820
++#define TEGRA_USB_ULPI_VIEWPORT			0x170
++#define TEGRA_ULPI_TIMING_CTRL_0		0x424
++#define TEGRA_ULPI_TIMING_CTRL_1		0x428
++#define USB_SUSP_CLR					(1 << 5)
++#define ULPI_PHY_ENB					(1 << 13)
++#define UHSIC_RESET						(1 << 14)
++#define ULPI_OUTPUT_PINMUX_BYP			(1 << 10)
++#define ULPI_CLKOUT_PINMUX_BYP			(1 << 11)
++#define ULPI_DATA_TRIMMER_LOAD			(1 << 0)
++#define ULPI_DATA_TRIMMER_SEL(x)		(((x) & 0x7) << 1)
++#define ULPI_STPDIRNXT_TRIMMER_LOAD		(1 << 16)
++#define ULPI_STPDIRNXT_TRIMMER_SEL(x)	(((x) & 0x7) << 17)
++#define ULPI_DIR_TRIMMER_LOAD			(1 << 24)
++#define ULPI_DIR_TRIMMER_SEL(x)			(((x) & 0x7) << 25)
++#define ULPI_VIEW_WAKEUP				(1U << 31)
++#define ULPI_VIEW_RUN					(1 << 30)
++#define ULPI_VIEW_WRITE					(1 << 29)
++#define ULPI_VIEW_ADDR(x)				(((x) & 0xff) << 16)
++
++// PLL-U delays per oscillator frequency (OSC_CTRL[31:30]: 13, 19.2, 12 and
++// 26 MHz): enable delay, stable count, active delay, crystal frequency count,
++// debounce time, bias time
++static const uint32 kTegra20UTMITimings[4][6] = {
++	{ 0x02, 0x33, 0x05, 0x7f, 0x7ef4, 5 },
++	{ 0x03, 0x4b, 0x06, 0xbb, 0xbb80, 7 },
++	{ 0x02, 0x2f, 0x04, 0x76, 0x7530, 5 },
++	{ 0x04, 0x66, 0x09, 0xfe, 0xfde8, 9 },
++};
++
++
++static inline void
++tegra_set_bits(volatile uint32* reg, uint32 mask, uint32 value)
++{
++	*reg = (*reg & ~mask) | value;
++}
++
++
++/*!	The AHB settings the Tegra 2 TRM asks for before a USB controller runs
++	(26.3.6 "Performance Settings for USB Controllers"): fast re-arbitration
++	on the memory port, IMMEDIATE on the controller's gizmo, the controller
++	as a high priority master with weight 7, and a prefetch channel for it.
++	Without them the controller can lose the bus to other masters for long
++	enough to miss split transaction slots.
++*/
++static void
++tegra20_usb_ahb_setup(phys_addr_t registers)
++{
++	// gizmo register, AHB master number, prefetch channel register
++	uint32 gizmo, master, prefetch;
++	switch (registers) {
++		case 0xc5000000:
++			gizmo = 0x01c; master = 6; prefetch = 0x0f0;	// USB1, CFG2
++			break;
++		case 0xc5004000:
++			gizmo = 0x078; master = 18; prefetch = 0x0e4;	// USB2, CFG4
++			break;
++		case 0xc5008000:
++			gizmo = 0x07c; master = 17; prefetch = 0x0e0;	// USB3, CFG3
++			break;
++		default:
++			return;
++	}
++
++	void* address;
++	area_id area = map_physical_memory("tegra ahb", TEGRA20_AHB_BASE,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++	if (area < B_OK)
++		return;
++#define AHB_REG(offset) \
++	((volatile uint32*)((uint8*)address + TEGRA20_AHB_REGISTERS + (offset)))
++
++	tegra_set_bits(AHB_REG(AHB_GIZMO_AHB_MEM), AHB_GIZMO_ENB_FAST_REARBITRATE,
++		AHB_GIZMO_ENB_FAST_REARBITRATE);
++	tegra_set_bits(AHB_REG(gizmo), AHB_GIZMO_IMMEDIATE, AHB_GIZMO_IMMEDIATE);
++	tegra_set_bits(AHB_REG(AHB_ARBITRATION_PRIORITY_CTRL),
++		AHB_PRIORITY_WEIGHT(7) | (1U << master),
++		AHB_PRIORITY_WEIGHT(7) | (1U << master));
++	// 64 KB boundary, the inactivity timeout the TRM asks for
++	*AHB_REG(prefetch) = AHB_PREFETCH_ENABLE | AHB_PREFETCH_MST_ID(master)
++		| AHB_PREFETCH_ADDR_BNDRY(12) | AHB_PREFETCH_INACTIVITY_TIMEOUT(0x800);
++
++#undef AHB_REG
++	delete_area(area);
++}
++
++
++static status_t
++tegra_ulpi_wait(volatile uint32* view, uint32 mask)
++{
++	bigtime_t start = system_time();
++	while ((*view & mask) != 0) {
++		if (system_time() - start > 2000)
++			return B_TIMED_OUT;
++		spin(1);
++	}
++	return B_OK;
++}
++
++
++//!	Reads a register of the external PHY through the ULPI viewport.
++static int32
++tegra_ulpi_read(volatile uint32* view, uint8 reg)
++{
++	*view = ULPI_VIEW_WAKEUP | ULPI_VIEW_WRITE;
++	if (tegra_ulpi_wait(view, ULPI_VIEW_WAKEUP) != B_OK)
++		return B_TIMED_OUT;
++	*view = ULPI_VIEW_RUN | ULPI_VIEW_ADDR(reg);
++	if (tegra_ulpi_wait(view, ULPI_VIEW_RUN) != B_OK)
++		return B_TIMED_OUT;
++	return (*view >> 8) & 0xff;
++}
++
++
++static status_t
++tegra_ulpi_write(volatile uint32* view, uint8 reg, uint8 value)
++{
++	*view = ULPI_VIEW_WAKEUP | ULPI_VIEW_WRITE;
++	if (tegra_ulpi_wait(view, ULPI_VIEW_WAKEUP) != B_OK)
++		return B_TIMED_OUT;
++	*view = ULPI_VIEW_RUN | ULPI_VIEW_WRITE | ULPI_VIEW_ADDR(reg) | value;
++	return tegra_ulpi_wait(view, ULPI_VIEW_RUN);
++}
++
++
++/*!	Returns the reset GPIO of the external ULPI PHY ("nvidia,phy-reset-gpio"
++	of the node "nvidia,phy" points to), or -1.
++*/
++static int32
++tegra_ulpi_reset_gpio(fdt_device_module_info* fdt, fdt_device* fdtDevice,
++	bool* _activeLow)
++{
++	// older device trees have the GPIO in the controller's node
++	int length;
++	const uint32* gpio = (const uint32*)fdt->get_prop(fdtDevice,
++		"nvidia,phy-reset-gpio", &length);
++	if (gpio != NULL && length >= 12) {
++		*_activeLow = (B_BENDIAN_TO_HOST_INT32(gpio[2]) & 1) != 0;
++		return B_BENDIAN_TO_HOST_INT32(gpio[1]);
++	}
++
++	const uint32* phy = (const uint32*)fdt->get_prop(fdtDevice, "nvidia,phy",
++		&length);
++	if (phy == NULL || length < 4)
++		return -1;
++
++	device_node* busNode = fdt->get_bus(fdtDevice);
++	fdt_bus_module_info* busModule;
++	struct fdt_bus* bus;
++	if (busNode == NULL || gDeviceManager->get_driver(busNode,
++			(driver_module_info**)&busModule, (void**)&bus) != B_OK) {
++		return -1;
++	}
++	device_node* phyNode = busModule->node_by_phandle(bus,
++		B_BENDIAN_TO_HOST_INT32(phy[0]));
++	fdt_device_module_info* phyModule;
++	fdt_device* phyDevice;
++	if (phyNode == NULL || gDeviceManager->get_driver(phyNode,
++			(driver_module_info**)&phyModule, (void**)&phyDevice) != B_OK) {
++		return -1;
++	}
++
++	gpio = (const uint32*)phyModule->get_prop(phyDevice,
++		"nvidia,phy-reset-gpio", &length);
++	if (gpio == NULL || length < 12)
++		return -1;
++	*_activeLow = (B_BENDIAN_TO_HOST_INT32(gpio[2]) & 1) != 0;
++	return B_BENDIAN_TO_HOST_INT32(gpio[1]);
++}
++
++
++/*!	Brings up a Tegra 2 USB controller with an external ULPI PHY (the USB2
++	controller), following the TRM (26.3.3) and Linux: the 24 MHz link clock
++	on the CDEV2 pad, the ULPI pins, the PHY reset GPIO, then the link.
++*/
++static status_t
++tegra20_ulpi_phy_init(fdt_device_module_info* fdt, fdt_device* fdtDevice,
++	phys_addr_t registers, uint32 clock)
++{
++	bool activeLow = true;
++	int32 resetGPIO = tegra_ulpi_reset_gpio(fdt, fdtDevice, &activeLow);
++
++	volatile uint32* car;
++	area_id carArea = map_physical_memory("tegra car", TEGRA20_CAR_BASE,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&car);
++	volatile uint8* misc;
++	area_id miscArea = map_physical_memory("tegra apb misc",
++		TEGRA20_APB_MISC_BASE, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&misc);
++	volatile uint8* gpio;
++	area_id gpioArea = map_physical_memory("tegra gpio", TEGRA20_GPIO_BASE,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&gpio);
++	volatile uint8* usb;
++	area_id usbArea = map_physical_memory("tegra usb phy", registers,
++		0x1000, B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++		(void**)&usb);
++	if (carArea < B_OK || miscArea < B_OK || gpioArea < B_OK
++		|| usbArea < B_OK) {
++		delete_area(carArea);
++		delete_area(miscArea);
++		delete_area(gpioArea);
++		delete_area(usbArea);
++		return B_NO_MEMORY;
++	}
++#define MISC_REG(offset)	((volatile uint32*)(misc + (offset)))
++#define GPIO_REG(offset)	((volatile uint32*)(gpio + (offset)))
++#define USB_REG(offset)		((volatile uint32*)(usb + (offset)))
++
++	// The link clock: PLLP_OUT4 at 24 MHz (216 / 9) out of the CDEV2 pad.
++	// The boot firmware may run the system clock from PLLP_OUT4 (108 MHz):
++	// move it to PLLP_OUT3 (72 MHz, left as it is) first, as Linux moves it
++	// away (to PLLC_OUT1) before setting PLLP_OUT4 to 24 MHz.
++	uint32 sclk = car[TEGRA_CAR_SCLK_BURST_POLICY / 4];
++	uint32 newSclk = sclk;
++	for (int shift = 0; shift < 16; shift += 4) {
++		if (((sclk >> shift) & 0xf) == TEGRA_SCLK_SOURCE_PLLP_OUT4) {
++			newSclk = (newSclk & ~(0xfU << shift))
++				| (TEGRA_SCLK_SOURCE_PLLP_OUT3 << shift);
++		}
++	}
++	uint32 outb = car[TEGRA_CAR_PLLP_OUTB / 4];
++	if (newSclk != sclk && (outb >> 24) != 16) {
++		if ((outb & 3) != 3) {
++			TRACE_MODULE_ERROR("ULPI: the system clock runs from PLLP_OUT4 "
++				"and PLLP_OUT3 is off, no USB2\n");
++			delete_area(carArea);
++			delete_area(miscArea);
++			delete_area(gpioArea);
++			delete_area(usbArea);
++			return B_NOT_SUPPORTED;
++		}
++		car[TEGRA_CAR_SCLK_BURST_POLICY / 4] = newSclk;
++		spin(10);
++	}
++	if ((outb >> 24) != 16 || (outb & (7 << 16)) != (7 << 16)) {
++		outb &= 0xffff;
++		car[TEGRA_CAR_PLLP_OUTB / 4] = outb | (16 << 24) | (1 << 18);
++		spin(2);
++		car[TEGRA_CAR_PLLP_OUTB / 4] = outb | (16 << 24) | (7 << 16);
++	}
++	tegra_set_bits(MISC_REG(TEGRA_PIN_MUX_CTL_C), 3 << 4, 3 << 4);
++	tegra_set_bits(MISC_REG(TEGRA_TRISTATE_REG_A), 1 << 5, 0);
++
++	// the ULPI pins: UAA, UAB and UDA
++	tegra_set_bits(MISC_REG(TEGRA_PIN_MUX_CTL_A), (3 << 8) | (3 << 2) | 3,
++		(3 << 8) | (3 << 2) | 3);
++	tegra_set_bits(MISC_REG(TEGRA_TRISTATE_REG_B), (1 << 19) | (1 << 18), 0);
++	tegra_set_bits(MISC_REG(TEGRA_TRISTATE_REG_D), 1 << 13, 0);
++
++	// Reset the controller, with its clock running
++	uint32 bank = clock / 32;
++	uint32 bit = 1U << (clock % 32);
++	car[TEGRA_CAR_CLK_OUT_ENB(bank) / 4] |= bit;
++	car[TEGRA_CAR_RST_DEVICES(bank) / 4] |= bit;
++	spin(2);
++	car[TEGRA_CAR_RST_DEVICES(bank) / 4] &= ~bit;
++	spin(2);
++
++	// Hold the PHY in reset while its clock starts
++	uint32 gpioBit = 0;
++	if (resetGPIO >= 0) {
++		gpioBit = 1U << (resetGPIO % 8);
++		*GPIO_REG(TEGRA_GPIO_REG(resetGPIO, TEGRA_GPIO_MSK_OUT))
++			= (gpioBit << 8) | (activeLow ? 0 : gpioBit);
++		*GPIO_REG(TEGRA_GPIO_REG(resetGPIO, TEGRA_GPIO_MSK_OE))
++			= (gpioBit << 8) | gpioBit;
++		*GPIO_REG(TEGRA_GPIO_REG(resetGPIO, TEGRA_GPIO_MSK_CNF))
++			= (gpioBit << 8) | gpioBit;
++	}
++	uint32 cdev2 = 1U << (TEGRA_CLOCK_CDEV2 % 32);
++	car[TEGRA_CAR_CLK_OUT_ENB(TEGRA_CLOCK_CDEV2 / 32) / 4] |= cdev2;
++	snooze(5000);
++	if (resetGPIO >= 0) {
++		*GPIO_REG(TEGRA_GPIO_REG(resetGPIO, TEGRA_GPIO_MSK_OUT))
++			= (gpioBit << 8) | (activeLow ? gpioBit : 0);
++	}
++	snooze(2000);
++
++	// Select the ULPI link
++	*USB_REG(TEGRA_USB_SUSP_CTRL) |= UHSIC_RESET;
++	*USB_REG(TEGRA_ULPI_TIMING_CTRL_0)
++		|= ULPI_OUTPUT_PINMUX_BYP | ULPI_CLKOUT_PINMUX_BYP;
++	*USB_REG(TEGRA_USB_SUSP_CTRL) |= ULPI_PHY_ENB;
++
++	uint32 trimmers = ULPI_DATA_TRIMMER_SEL(4) | ULPI_STPDIRNXT_TRIMMER_SEL(4)
++		| ULPI_DIR_TRIMMER_SEL(4);
++	*USB_REG(TEGRA_ULPI_TIMING_CTRL_1) = 0;
++	*USB_REG(TEGRA_ULPI_TIMING_CTRL_1) = trimmers;
++	spin(10);
++	*USB_REG(TEGRA_ULPI_TIMING_CTRL_1) = trimmers | ULPI_DATA_TRIMMER_LOAD
++		| ULPI_STPDIRNXT_TRIMMER_LOAD | ULPI_DIR_TRIMMER_LOAD;
++
++	// Talk to the PHY: its IDs, then the VBUS fix-up Linux applies (VBUS is
++	// floating: use the external VBUS indicator)
++	volatile uint32* view = USB_REG(TEGRA_USB_ULPI_VIEWPORT);
++	int32 id[4];
++	for (int i = 0; i < 4; i++)
++		id[i] = tegra_ulpi_read(view, i);
++	status_t status = tegra_ulpi_write(view, 0x08, 0x40);
++	if (status == B_OK)
++		status = tegra_ulpi_write(view, 0x0b, 0x80);
++	if (status != B_OK) {
++		TRACE_MODULE_ERROR("ULPI PHY %02" B_PRIx32 "%02" B_PRIx32 ":%02"
++			B_PRIx32 "%02" B_PRIx32 ": setup failed: %s\n", id[1], id[0],
++			id[3], id[2], strerror(status));
++	}
++
++	*USB_REG(TEGRA_USB_SUSP_CTRL) |= USB_SUSP_CLR;
++	snooze(500);
++	*USB_REG(TEGRA_USB_SUSP_CTRL) &= ~USB_SUSP_CLR;
++
++	bigtime_t start = system_time();
++	while ((*USB_REG(TEGRA_USB_SUSP_CTRL) & USB_PHY_CLK_VALID) == 0
++		&& system_time() - start < 100000) {
++		spin(10);
++	}
++	bool valid = (*USB_REG(TEGRA_USB_SUSP_CTRL) & USB_PHY_CLK_VALID) != 0;
++#undef MISC_REG
++#undef GPIO_REG
++#undef USB_REG
++
++	delete_area(usbArea);
++	delete_area(gpioArea);
++	delete_area(miscArea);
++	delete_area(carArea);
++
++	if (!valid)
++		return B_TIMED_OUT;
++
++	tegra20_usb_ahb_setup(registers);
++	return B_OK;
++}
++
++
++/*!	Brings the UTMI PHY of a Tegra 2 USB controller up, the way the boot
++	firmware and Linux do. The firmware may have used the controller, but left
++	it in a state where the PHY clock is not valid, and accessing the
++	controller then stalls the CPU.
++*/
++static status_t
++tegra20_utmi_phy_init(fdt_device_module_info* fdt, fdt_device* fdtDevice,
++	phys_addr_t registers)
++{
++	int length;
++	const char* phyType = (const char*)fdt->get_prop(fdtDevice, "phy_type",
++		&length);
++	if (phyType == NULL)
++		return B_OK;
++
++	const uint32* clocks = (const uint32*)fdt->get_prop(fdtDevice, "clocks",
++		&length);
++	if (clocks == NULL || length < 8)
++		return B_BAD_DATA;
++	uint32 clock = B_BENDIAN_TO_HOST_INT32(clocks[1]);
++
++	if (strcmp(phyType, "ulpi") == 0)
++		return tegra20_ulpi_phy_init(fdt, fdtDevice, registers, clock);
++	if (strcmp(phyType, "utmi") != 0)
++		return B_OK;
++
++	volatile uint32* car;
++	area_id carArea = map_physical_memory("tegra car", TEGRA20_CAR_BASE,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&car);
++	if (carArea < B_OK)
++		return carArea;
++
++	volatile uint8* usb;
++	area_id usbArea = map_physical_memory("tegra usb phy", registers,
++		0x1000, B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++		(void**)&usb);
++	volatile uint8* usb1;
++	area_id usb1Area = map_physical_memory("tegra usb1 pads",
++		registers & ~(phys_addr_t)0xffff, 0x1000, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&usb1);
++	if (usbArea < B_OK || usb1Area < B_OK) {
++		delete_area(carArea);
++		delete_area(usbArea);
++		delete_area(usb1Area);
++		return B_NO_MEMORY;
++	}
++#define USB_REG(offset)		((volatile uint32*)(usb + (offset)))
++
++	const uint32* timing
++		= kTegra20UTMITimings[car[TEGRA_CAR_OSC_CTRL / 4] >> 30];
++
++	// The shared UTMI pads are controlled through the first controller,
++	// whose clock must be running
++	uint32 usbdBit = 1U << TEGRA_CLOCK_USBD;
++	car[TEGRA_CAR_CLK_OUT_ENB(0) / 4] |= usbdBit;
++	car[TEGRA_CAR_RST_DEVICES(0) / 4] &= ~usbdBit;
++
++	// Reset the controller, with its clock running
++	uint32 bank = clock / 32;
++	uint32 bit = 1U << (clock % 32);
++	car[TEGRA_CAR_CLK_OUT_ENB(bank) / 4] |= bit;
++	car[TEGRA_CAR_RST_DEVICES(bank) / 4] |= bit;
++	spin(2);
++	car[TEGRA_CAR_RST_DEVICES(bank) / 4] &= ~bit;
++	spin(2);
++
++	// Power the shared pads up
++	*(volatile uint32*)(usb1 + TEGRA_UTMIP_BIAS_CFG0)
++		&= ~(UTMIP_OTGPD | UTMIP_BIASPD);
++
++	*USB_REG(TEGRA_USB_SUSP_CTRL) |= UTMIP_RESET | UTMIP_PHY_ENB;
++
++	// Stop the crystal clock while the PHY is configured
++	*USB_REG(TEGRA_UTMIP_MISC_CFG1) &= ~UTMIP_PHY_XTAL_CLOCKEN;
++	spin(1);
++
++	*USB_REG(TEGRA_USB_PHY_VBUS_SENSORS)
++		&= ~(VBUS_B_SESS_VLD_SW_VALUE | VBUS_B_SESS_VLD_SW_EN);
++
++	tegra_set_bits(USB_REG(TEGRA_UTMIP_MISC_CFG1), (0xfff << 6) | (0x1f << 18),
++		(timing[1] << 6) | (timing[2] << 18));
++	tegra_set_bits(USB_REG(TEGRA_UTMIP_PLL_CFG1), (0x1f << 27) | 0xfff,
++		(timing[0] << 27) | timing[3]);
++	tegra_set_bits(USB_REG(TEGRA_UTMIP_BIAS_CFG1), 0x1f << 3, timing[5] << 3);
++	tegra_set_bits(USB_REG(TEGRA_UTMIP_DEBOUNCE_CFG0), 0xffff, timing[4]);
++
++	*USB_REG(TEGRA_UTMIP_TX_CFG0) |= UTMIP_FS_PREAMBLE_J;
++	*USB_REG(TEGRA_UTMIP_BAT_CHRG_CFG0) |= UTMIP_PD_CHRG;
++	*USB_REG(TEGRA_UTMIP_XCVR_CFG0) &= ~UTMIP_XCVR_LSBIAS_SE;
++	*USB_REG(TEGRA_UTMIP_SPARE_CFG0) &= ~FUSE_SETUP_SEL;
++
++	// idle wait, elastic limit and HS sync start delay, the values all Tegra 2
++	// device trees use
++	tegra_set_bits(USB_REG(TEGRA_UTMIP_HSRX_CFG0), (0x1f << 15) | (0x1f << 10),
++		(17 << 15) | (16 << 10));
++	tegra_set_bits(USB_REG(TEGRA_UTMIP_HSRX_CFG1), 0x1f << 1, 9 << 1);
++
++	spin(1);
++	*USB_REG(TEGRA_UTMIP_MISC_CFG1) |= UTMIP_PHY_XTAL_CLOCKEN;
++
++	// Take the PHY out of reset and wait for its clock
++	*USB_REG(TEGRA_USB_SUSP_CTRL) &= ~UTMIP_RESET;
++	bigtime_t start = system_time();
++	while ((*USB_REG(TEGRA_USB_SUSP_CTRL) & USB_PHY_CLK_VALID) == 0
++		&& system_time() - start < 100000) {
++		spin(10);
++	}
++	bool valid = (*USB_REG(TEGRA_USB_SUSP_CTRL) & USB_PHY_CLK_VALID) != 0;
++
++	if (valid) {
++		*USB_REG(TEGRA_USB_ICUSB_CTRL) &= ~IC_ENB1;
++
++		// UTMI parallel interface
++		*USB_REG(TEGRA_USB_PORTSC1)
++			&= ~(TEGRA_PORTSC_PTS_MASK | TEGRA_PORTSC_STS);
++
++		// The controller reset put the transceiver settings back to their
++		// defaults: use the values of the Tegra 2 device trees (HS drive
++		// strength, FS/LS slew rates, termination), as Linux does
++		tegra_set_bits(USB_REG(TEGRA_UTMIP_XCVR_CFG0),
++			UTMIP_FORCE_PD_POWERDOWN | UTMIP_FORCE_PD2_POWERDOWN
++				| UTMIP_FORCE_PDZI_POWERDOWN | UTMIP_XCVR_SETUP(0xf)
++				| UTMIP_XCVR_SETUP_MSB(0x7f) | UTMIP_XCVR_LSRSLEW(3)
++				| UTMIP_XCVR_LSFSLEW(3),
++			UTMIP_XCVR_SETUP(9) | UTMIP_XCVR_SETUP_MSB(9)
++				| UTMIP_XCVR_LSRSLEW(1) | UTMIP_XCVR_LSFSLEW(1));
++		tegra_set_bits(USB_REG(TEGRA_UTMIP_XCVR_CFG1),
++			UTMIP_FORCE_PDDISC_POWERDOWN | UTMIP_FORCE_PDCHRP_POWERDOWN
++				| UTMIP_FORCE_PDDR_POWERDOWN | UTMIP_XCVR_TERM_RANGE_ADJ(0xf),
++			UTMIP_XCVR_TERM_RANGE_ADJ(6));
++	}
++#undef USB_REG
++
++	delete_area(usb1Area);
++	delete_area(usbArea);
++	delete_area(carArea);
++
++	if (!valid) {
++		TRACE_MODULE_ERROR("Tegra UTMI PHY clock did not become valid\n");
++		return B_TIMED_OUT;
++	}
++
++	tegra20_usb_ahb_setup(registers);
++	return B_OK;
++}
++
++
++// Device tree controllers we support
++static const struct {
++	const char* compatible;
++	size_t capability_offset;
++	uint32 flags;
++	status_t (*setup_phy)(fdt_device_module_info* fdt, fdt_device* device,
++		phys_addr_t registers);
++} kFDTControllers[] = {
++	// NVIDIA Tegra 2 (ChipIdea core)
++	{ "nvidia,tegra20-ehci", 0x100, EHCI::kIntegratedTT,
++		&tegra20_utmi_phy_init },
++};
++
++
++static int32
++find_fdt_controller(device_node* node)
++{
++	const char* compatible;
++	if (gDeviceManager->get_attr_string(node, "fdt/compatible", &compatible,
++			false) != B_OK) {
++		return -1;
++	}
++
++	for (size_t i = 0; i < B_COUNT_OF(kFDTControllers); i++) {
++		if (strcmp(compatible, kFDTControllers[i].compatible) == 0)
++			return i;
++	}
++	return -1;
++}
++
++
+ //	#pragma mark -
+ 
+ 
+@@ -62,7 +671,14 @@ init_bus(device_node* node, void** bus_cookie)
+ 	if (gUSB->get_stack((void**)&stack) != B_OK)
+ 		return B_ERROR;
+ 
+-	EHCI *ehci = new(std::nothrow) EHCI(&bus->pciinfo, bus->pci, bus->device, stack, node);
++	EHCI *ehci;
++	if (bus->is_fdt) {
++		ehci = new(std::nothrow) EHCI(bus->registers, bus->registers_size,
++			bus->capability_offset, bus->irq, bus->flags, stack, node);
++	} else {
++		ehci = new(std::nothrow) EHCI(&bus->pciinfo, bus->pci, bus->device,
++			stack, node);
++	}
+ 	if (ehci == NULL) {
+ 		return B_NO_MEMORY;
+ 	}
+@@ -128,18 +744,55 @@ init_device(device_node* node, void** device_cookie)
+ 	if (bus == NULL)
+ 		return B_NO_MEMORY;
+ 
++	bus->driver_node = node;
++
++	device_node* parent = gDeviceManager->get_parent_node(node);
++	const char* busType;
++	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &busType, false)
++			== B_OK && strcmp(busType, "fdt") == 0) {
++		int32 index = find_fdt_controller(parent);
++		fdt_device_module_info* fdt;
++		fdt_device* fdtDevice;
++		status_t status = gDeviceManager->get_driver(parent,
++			(driver_module_info**)&fdt, (void**)&fdtDevice);
++		gDeviceManager->put_node(parent);
++
++		uint64 registers, registersSize, irq;
++		if (index < 0 || status != B_OK
++			|| !fdt->get_reg(fdtDevice, 0, &registers, &registersSize)
++			|| !fdt->get_interrupt(fdtDevice, 0, NULL, &irq)) {
++			free(bus);
++			return B_ERROR;
++		}
++
++		if (kFDTControllers[index].setup_phy != NULL) {
++			status_t phyStatus = kFDTControllers[index].setup_phy(fdt,
++				fdtDevice, registers);
++			if (phyStatus != B_OK) {
++				free(bus);
++				return B_ERROR;
++			}
++		}
++
++		bus->is_fdt = true;
++		bus->registers = registers;
++		bus->registers_size = registersSize;
++		bus->capability_offset = kFDTControllers[index].capability_offset;
++		bus->irq = irq;
++		bus->flags = kFDTControllers[index].flags;
++
++		*device_cookie = bus;
++		return B_OK;
++	}
++
+ 	pci_device_module_info* pci;
+ 	pci_device* device;
+-	{
+-		device_node* pciParent = gDeviceManager->get_parent_node(node);
+-		gDeviceManager->get_driver(pciParent, (driver_module_info**)&pci,
+-			(void**)&device);
+-		gDeviceManager->put_node(pciParent);
+-	}
++	gDeviceManager->get_driver(parent, (driver_module_info**)&pci,
++		(void**)&device);
++	gDeviceManager->put_node(parent);
+ 
+ 	bus->pci = pci;
+ 	bus->device = device;
+-	bus->driver_node = node;
+ 
+ 	pci_info *pciInfo = &bus->pciinfo;
+ 	pci->get_pci_info(device, pciInfo);
+@@ -164,7 +817,7 @@ register_device(device_node* parent)
+ {
+ 	CALLED();
+ 	device_attr attrs[] = {
+-		{B_DEVICE_PRETTY_NAME, B_STRING_TYPE, {.string = "EHCI PCI"}},
++		{B_DEVICE_PRETTY_NAME, B_STRING_TYPE, {.string = "EHCI"}},
+ 		{}
+ 	};
+ 
+@@ -180,12 +833,42 @@ supports_device(device_node* parent)
+ 	const char* bus;
+ 	uint16 type, subType, api;
+ 
+-	// make sure parent is a EHCI PCI device node
++	// make sure parent is a EHCI PCI or device tree node
+ 	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
+ 		< B_OK) {
+ 		return -1;
+ 	}
+ 
++	if (strcmp(bus, "fdt") == 0) {
++		if (find_fdt_controller(parent) < 0)
++			return 0.0f;
++
++		fdt_device_module_info* fdt;
++		fdt_device* fdtDevice;
++		if (gDeviceManager->get_driver(parent, (driver_module_info**)&fdt,
++				(void**)&fdtDevice) != B_OK) {
++			return 0.0f;
++		}
++
++		int length;
++		const char* status = (const char*)fdt->get_prop(fdtDevice, "status",
++			&length);
++		if (status != NULL && strcmp(status, "okay") != 0
++			&& strcmp(status, "ok") != 0) {
++			return 0.0f;
++		}
++
++		// A dual role controller can also be wired as a device port (e.g. the
++		// USB recovery port of a Tegra), which is no host controller
++		const char* mode = (const char*)fdt->get_prop(fdtDevice, "dr_mode",
++			&length);
++		if (mode != NULL && strcmp(mode, "host") != 0)
++			return 0.0f;
++
++		TRACE_MODULE("EHCI device tree controller found!\n");
++		return 0.8f;
++	}
++
+ 	if (strcmp(bus, "pci") != 0)
+ 		return 0.0f;
+ 
+@@ -315,15 +998,14 @@ print_queue(ehci_qh *queueHead)
+ //
+ 
+ 
+-EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stack *stack,
+-	device_node* node)
++EHCI::EHCI(Stack *stack, device_node* node)
+ 	:	BusManager(stack, node),
+ 		fCapabilityRegisters(NULL),
+ 		fOperationalRegisters(NULL),
+ 		fRegisterArea(-1),
+-		fPCIInfo(info),
+-		fPci(pci),
+-		fDevice(device),
++		fPCIInfo(NULL),
++		fPci(NULL),
++		fDevice(NULL),
+ 		fStack(stack),
+ 		fEnabledInterrupts(0),
+ 		fThreshold(0),
+@@ -357,7 +1039,8 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+ 		fPortSuspendChange(0),
+ 		fInterruptPollThread(-1),
+ 		fIRQ(0),
+-		fUseMSI(false)
++		fUseMSI(false),
++		fFlags(0)
+ {
+ 	// Initialized here rather than in the member list because
+ 	// B_SPINLOCK_INITIALIZER is a brace initializer whose shape changes
+@@ -368,6 +1051,17 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+ 
+ 	// Create a lock for the isochronous transfer list
+ 	mutex_init(&fIsochronousLock, "EHCI isochronous lock");
++}
++
++
++EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stack *stack,
++	device_node* node)
++	:
++	EHCI(stack, node)
++{
++	fPCIInfo = info;
++	fPci = pci;
++	fDevice = device;
+ 
+ 	if (BusManager::InitCheck() != B_OK) {
+ 		TRACE_ERROR("bus manager failed to init\n");
+@@ -460,16 +1154,8 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+ 		fPCIInfo->u.h0.base_registers[0], physicalAddress, offset,
+ 		fPCIInfo->u.h0.base_register_sizes[0]);
+ 
+-	fRegisterArea = map_physical_memory("EHCI memory mapped registers",
+-		physicalAddress, mapSize, B_ANY_KERNEL_BLOCK_ADDRESS,
+-		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
+-		(void **)&fCapabilityRegisters);
+-	if (fRegisterArea < 0) {
+-		TRACE_ERROR("failed to map register memory\n");
++	if (_MapRegisters(physicalAddress, mapSize, offset) != B_OK)
+ 		return;
+-	}
+-
+-	fCapabilityRegisters += offset;
+ 
+ 	// Confirm an EHCI controller actually answers at this address before the
+ 	// first write, reading only the capability registers. OHCI and XHCI get
+@@ -498,22 +1184,7 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+ 		return;
+ 	}
+ 
+-	fOperationalRegisters = fCapabilityRegisters + capLength;
+-	TRACE("mapped capability registers: 0x%p\n", fCapabilityRegisters);
+-	TRACE("mapped operational registers: 0x%p\n", fOperationalRegisters);
+-
+-	TRACE("structural parameters: 0x%08" B_PRIx32 "\n",
+-		ReadCapReg32(EHCI_HCSPARAMS));
+-	TRACE("capability parameters: 0x%08" B_PRIx32 "\n",
+-		ReadCapReg32(EHCI_HCCPARAMS));
+-
+-	if (EHCI_HCCPARAMS_FRAME_CACHE(ReadCapReg32(EHCI_HCCPARAMS)))
+-		fThreshold = 2 + 8;
+-	else
+-		fThreshold = 2 + EHCI_HCCPARAMS_IPT(ReadCapReg32(EHCI_HCCPARAMS));
+-
+-	// read port count from capability register
+-	fPortCount = ReadCapReg32(EHCI_HCSPARAMS) & 0x0f;
++	_ReadCapabilities();
+ 
+ 	uint32 extendedCapPointer = ReadCapReg32(EHCI_HCCPARAMS) >> EHCI_ECP_SHIFT;
+ 	extendedCapPointer &= EHCI_ECP_MASK;
+@@ -562,13 +1233,154 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+ 		TRACE_ALWAYS("no extended capabilities register\n");
+ 	}
+ 
++	if (_PrepareController() != B_OK)
++		return;
++
++	// set up interrupts or interrupt polling now that the controller is ready
++	bool polling = _UsePolling();
++
++	if (polling) {
++		// create and run the polling thread
++		TRACE_ALWAYS("enabling ehci polling\n");
++		fInterruptPollThread = spawn_kernel_thread(InterruptPollThread,
++			"ehci interrupt poll thread", B_NORMAL_PRIORITY, (void *)this);
++		resume_thread(fInterruptPollThread);
++	} else {
++		// Find the right interrupt vector, using MSIs if available.
++		fIRQ = fPCIInfo->u.h0.interrupt_line;
++		if (fIRQ == 0xFF)
++			fIRQ = 0;
++
++		if (fPci->get_msi_count(fDevice) >= 1) {
++			uint32 msiVector = 0;
++			if (fPci->configure_msi(fDevice, 1, &msiVector) == B_OK
++				&& fPci->enable_msi(fDevice) == B_OK) {
++				TRACE_ALWAYS("using message signaled interrupts\n");
++				fIRQ = msiVector;
++				fUseMSI = true;
++			}
++		}
++
++		if (fIRQ == 0) {
++			TRACE_MODULE_ERROR("device PCI:%d:%d:%d was assigned an invalid IRQ\n",
++				fPCIInfo->bus, fPCIInfo->device, fPCIInfo->function);
++			return;
++		}
++
++		// install the interrupt handler and enable interrupts
++		install_io_interrupt_handler(fIRQ, InterruptHandler,
++			(void *)this, 0);
++	}
++
++	// ensure that interrupts are en-/disabled on the PCI device
++	command = fPci->read_pci_config(fDevice, PCI_command, 2);
++	if ((polling || fUseMSI) == ((command & PCI_command_int_disable) == 0)) {
++		if (polling || fUseMSI)
++			command &= ~PCI_command_int_disable;
++		else
++			command |= PCI_command_int_disable;
++
++		fPci->write_pci_config(fDevice, PCI_command, 2, command);
++	}
++
++	_FinishInit();
++}
++
++
++/*!	Constructor for controllers that are not on a PCI bus, e.g. described by a
++	device tree. \a capabilityOffset is the offset of the capability registers
++	from \a registers.
++*/
++EHCI::EHCI(phys_addr_t registers, size_t registersSize, size_t capabilityOffset,
++	uint32 irq, uint32 flags, Stack *stack, device_node* node)
++	:
++	EHCI(stack, node)
++{
++	fFlags = flags;
++
++	if (BusManager::InitCheck() != B_OK) {
++		TRACE_ERROR("bus manager failed to init\n");
++		return;
++	}
++
++	TRACE("constructing new EHCI host controller driver\n");
++	fInitOK = false;
++
++	size_t offset = registers % B_PAGE_SIZE;
++	if (_MapRegisters(registers - offset,
++			ROUNDUP(registersSize + offset, B_PAGE_SIZE),
++			offset + capabilityOffset) != B_OK) {
++		return;
++	}
++
++	_ReadCapabilities();
++
++	if (_PrepareController() != B_OK)
++		return;
++
++	if (_UsePolling()) {
++		TRACE_ALWAYS("enabling ehci polling\n");
++		fInterruptPollThread = spawn_kernel_thread(InterruptPollThread,
++			"ehci interrupt poll thread", B_NORMAL_PRIORITY, (void *)this);
++		resume_thread(fInterruptPollThread);
++	} else {
++		fIRQ = irq;
++		install_io_interrupt_handler(fIRQ, InterruptHandler, (void *)this, 0);
++	}
++
++	_FinishInit();
++}
++
++
++status_t
++EHCI::_MapRegisters(phys_addr_t physicalAddress, size_t mapSize,
++	size_t offset)
++{
++	fRegisterArea = map_physical_memory("EHCI memory mapped registers",
++		physicalAddress, mapSize, B_ANY_KERNEL_BLOCK_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++		(void **)&fCapabilityRegisters);
++	if (fRegisterArea < 0) {
++		TRACE_ERROR("failed to map register memory\n");
++		return fRegisterArea;
++	}
++
++	fCapabilityRegisters += offset;
++	fOperationalRegisters = fCapabilityRegisters + ReadCapReg8(EHCI_CAPLENGTH);
++	TRACE("mapped capability registers: 0x%p\n", fCapabilityRegisters);
++	TRACE("mapped operational registers: 0x%p\n", fOperationalRegisters);
++	return B_OK;
++}
++
++
++void
++EHCI::_ReadCapabilities()
++{
++	TRACE("structural parameters: 0x%08" B_PRIx32 "\n",
++		ReadCapReg32(EHCI_HCSPARAMS));
++	TRACE("capability parameters: 0x%08" B_PRIx32 "\n",
++		ReadCapReg32(EHCI_HCCPARAMS));
++
++	if (EHCI_HCCPARAMS_FRAME_CACHE(ReadCapReg32(EHCI_HCCPARAMS)))
++		fThreshold = 2 + 8;
++	else
++		fThreshold = 2 + EHCI_HCCPARAMS_IPT(ReadCapReg32(EHCI_HCCPARAMS));
++
++	// read port count from capability register
++	fPortCount = ReadCapReg32(EHCI_HCSPARAMS) & 0x0f;
++}
++
++
++status_t
++EHCI::_PrepareController()
++{
+ 	// disable interrupts
+ 	WriteOpReg(EHCI_USBINTR, 0);
+ 
+ 	// reset the host controller
+ 	if (ControllerReset() != B_OK) {
+ 		TRACE_ERROR("host controller failed to reset\n");
+-		return;
++		return B_ERROR;
+ 	}
+ 
+ 	// reset the segment register
+@@ -580,7 +1392,7 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+ 	fCleanupSem = create_sem(0, "EHCI Cleanup");
+ 	if (fFinishTransfersSem < 0 || fAsyncAdvanceSem < 0 || fCleanupSem < 0) {
+ 		TRACE_ERROR("failed to create semaphores\n");
+-		return;
++		return B_ERROR;
+ 	}
+ 
+ 	// create finisher service thread
+@@ -593,7 +1405,7 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+ 		"EHCI Isochronous Finish Transfers");
+ 	if (fFinishIsochronousTransfersSem < 0) {
+ 		TRACE_ERROR("failed to create isochronous finisher semaphore\n");
+-		return;
++		return B_ERROR;
+ 	}
+ 
+ 	// Create the isochronous finisher service thread
+@@ -607,7 +1419,13 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+ 		B_NORMAL_PRIORITY, (void *)this);
+ 	resume_thread(fCleanupThread);
+ 
+-	// set up interrupts or interrupt polling now that the controller is ready
++	return B_OK;
++}
++
++
++bool
++EHCI::_UsePolling()
++{
+ 	bool polling = false;
+ 	void *settings = load_driver_settings(B_SAFEMODE_DRIVER_SETTINGS);
+ 	if (settings != NULL) {
+@@ -616,49 +1434,14 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+ 		unload_driver_settings(settings);
+ 	}
+ 
+-	if (polling) {
+-		// create and run the polling thread
+-		TRACE_ALWAYS("enabling ehci polling\n");
+-		fInterruptPollThread = spawn_kernel_thread(InterruptPollThread,
+-			"ehci interrupt poll thread", B_NORMAL_PRIORITY, (void *)this);
+-		resume_thread(fInterruptPollThread);
+-	} else {
+-		// Find the right interrupt vector, using MSIs if available.
+-		fIRQ = fPCIInfo->u.h0.interrupt_line;
+-		if (fIRQ == 0xFF)
+-			fIRQ = 0;
+-
+-		if (fPci->get_msi_count(fDevice) >= 1) {
+-			uint32 msiVector = 0;
+-			if (fPci->configure_msi(fDevice, 1, &msiVector) == B_OK
+-				&& fPci->enable_msi(fDevice) == B_OK) {
+-				TRACE_ALWAYS("using message signaled interrupts\n");
+-				fIRQ = msiVector;
+-				fUseMSI = true;
+-			}
+-		}
+-
+-		if (fIRQ == 0) {
+-			TRACE_MODULE_ERROR("device PCI:%d:%d:%d was assigned an invalid IRQ\n",
+-				fPCIInfo->bus, fPCIInfo->device, fPCIInfo->function);
+-			return;
+-		}
+-
+-		// install the interrupt handler and enable interrupts
+-		install_io_interrupt_handler(fIRQ, InterruptHandler,
+-			(void *)this, 0);
+-	}
++	return polling;
++}
+ 
+-	// ensure that interrupts are en-/disabled on the PCI device
+-	command = fPci->read_pci_config(fDevice, PCI_command, 2);
+-	if ((polling || fUseMSI) == ((command & PCI_command_int_disable) == 0)) {
+-		if (polling || fUseMSI)
+-			command &= ~PCI_command_int_disable;
+-		else
+-			command |= PCI_command_int_disable;
+ 
+-		fPci->write_pci_config(fDevice, PCI_command, 2, command);
+-	}
++status_t
++EHCI::_FinishInit()
++{
++	phys_addr_t physicalAddress;
+ 
+ 	fEnabledInterrupts = EHCI_USBINTR_HOSTSYSERR | EHCI_USBINTR_USBERRINT
+ 		| EHCI_USBINTR_USBINT | EHCI_USBINTR_INTONAA;
+@@ -683,7 +1466,7 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+ 		&physicalAddress, frameListSize, "USB EHCI Periodic Framelist");
+ 	if (fPeriodicFrameListArea < 0) {
+ 		TRACE_ERROR("unable to allocate periodic framelist\n");
+-		return;
++		return B_ERROR;
+ 	}
+ 
+ 	if ((physicalAddress & 0xfff) != 0) {
+@@ -810,7 +1593,7 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+ 	fAsyncQueueHead = CreateQueueHead();
+ 	if (!fAsyncQueueHead) {
+ 		TRACE_ERROR("unable to allocate stray async queue head\n");
+-		return;
++		return B_ERROR;
+ 	}
+ 
+ 	fAsyncQueueHead->next_phy = fAsyncQueueHead->this_phy;
+@@ -827,6 +1610,7 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+ 
+ 	fInitOK = true;
+ 	TRACE("EHCI host controller driver constructed\n");
++	return B_OK;
+ }
+ 
+ 
+@@ -1565,7 +2349,17 @@ EHCI::GetPortStatus(uint8 index, usb_port_status *status)
+ 		status->status |= PORT_STATUS_CONNECTION;
+ 	if (portStatus & EHCI_PORTSC_ENABLE)
+ 		status->status |= PORT_STATUS_ENABLE;
+-	if (portStatus & EHCI_PORTSC_ENABLE)
++	if ((fFlags & kIntegratedTT) != 0) {
++		// the integrated transaction translator handles all speeds
++		switch ((portStatus >> EHCI_PORTSC_PSPD_SHIFT) & EHCI_PORTSC_PSPD_MASK) {
++			case EHCI_PORTSC_PSPD_HIGH:
++				status->status |= PORT_STATUS_HIGH_SPEED;
++				break;
++			case EHCI_PORTSC_PSPD_LOW:
++				status->status |= PORT_STATUS_LOW_SPEED;
++				break;
++		}
++	} else if (portStatus & EHCI_PORTSC_ENABLE)
+ 		status->status |= PORT_STATUS_HIGH_SPEED;
+ 	if (portStatus & EHCI_PORTSC_OCACTIVE)
+ 		status->status |= PORT_STATUS_OVER_CURRENT;
+@@ -1575,7 +2369,7 @@ EHCI::GetPortStatus(uint8 index, usb_port_status *status)
+ 		status->status |= PORT_STATUS_POWER;
+ 	if (portStatus & EHCI_PORTSC_SUSPEND)
+ 		status->status |= PORT_STATUS_SUSPEND;
+-	if (portStatus & EHCI_PORTSC_DMINUS)
++	if ((fFlags & kIntegratedTT) == 0 && (portStatus & EHCI_PORTSC_DMINUS))
+ 		status->status |= PORT_STATUS_LOW_SPEED;
+ 
+ 	// build the change
+@@ -1671,7 +2465,7 @@ EHCI::ResetPort(uint8 index)
+ 	uint32 portRegister = EHCI_PORTSC + index * sizeof(uint32);
+ 	uint32 portStatus = ReadOpReg(portRegister) & EHCI_PORTSC_DATAMASK;
+ 
+-	if (portStatus & EHCI_PORTSC_DMINUS) {
++	if ((fFlags & kIntegratedTT) == 0 && (portStatus & EHCI_PORTSC_DMINUS)) {
+ 		TRACE_ALWAYS("lowspeed device connected, giving up port ownership\n");
+ 		// there is a lowspeed device connected.
+ 		// we give the ownership to a companion controller.
+@@ -1701,7 +2495,7 @@ EHCI::ResetPort(uint8 index)
+ 		return B_ERROR;
+ 	}
+ 
+-	if ((portStatus & EHCI_PORTSC_ENABLE) == 0) {
++	if ((fFlags & kIntegratedTT) == 0 && (portStatus & EHCI_PORTSC_ENABLE) == 0) {
+ 		TRACE_ALWAYS("fullspeed device connected, giving up port ownership\n");
+ 		// the port was not enabled, this means that no high speed device is
+ 		// attached to this port. we give up ownership to a companion controler
+@@ -1748,6 +2542,18 @@ EHCI::ControllerReset()
+ 			return B_ERROR;
+ 	}
+ 
++	if ((fFlags & kIntegratedTT) != 0) {
++		// the reset put the dual role controller back into idle mode
++		WriteOpReg(EHCI_USBMODE, (ReadOpReg(EHCI_USBMODE)
++			& ~EHCI_USBMODE_CM_MASK) | EHCI_USBMODE_CM_HOST);
++
++		// The reset also cleared the TX FIFO fill threshold, which Linux'
++		// ehci-tegra.c sets to 10 on Tegra 2
++		WriteOpReg(EHCI_TXFILLTUNING, 10 << EHCI_TXFILLTUNING_THRES_SHIFT);
++		// bursts of 8 words both ways, as the Tegra 2 TRM asks (26.3.6)
++		WriteOpReg(EHCI_BURSTSIZE, (8 << 8) | 8);
++	}
++
+ 	return B_OK;
+ }
+ 
+@@ -1773,6 +2579,7 @@ EHCI::Interrupt()
+ 
+ 	// check if any interrupt was generated
+ 	uint32 status = ReadOpReg(EHCI_USBSTS) & EHCI_USBSTS_INTMASK;
++
+ 	if ((status & fEnabledInterrupts) == 0) {
+ 		if (status != 0) {
+ 			TRACE("discarding not enabled interrupts 0x%08" B_PRIx32 "\n",
+@@ -2633,7 +3440,12 @@ EHCI::InitQueueHead(ehci_qh *queueHead, Pipe *pipe)
+ 			return B_ERROR;
+ 	}
+ 
+-	queueHead->endpoint_chars |= (3 << EHCI_QH_CHARS_RL_SHIFT)
++	// The NAK count reload must be 0 for full and low speed endpoints, which
++	// are reached through split transactions (EHCI 1.0, 3.6). Some
++	// controllers, like the ChipIdea core of the Tegra 2, halt the transfers
++	// right away otherwise.
++	uint32 nakReload = pipe->Speed() == USB_SPEED_HIGHSPEED ? 3 : 0;
++	queueHead->endpoint_chars |= (nakReload << EHCI_QH_CHARS_RL_SHIFT)
+ 		| (pipe->MaxPacketSize() << EHCI_QH_CHARS_MPL_SHIFT)
+ 		| (pipe->EndpointAddress() << EHCI_QH_CHARS_EPT_SHIFT)
+ 		| (pipe->DeviceAddress() << EHCI_QH_CHARS_DEV_SHIFT)
+@@ -2644,8 +3456,16 @@ EHCI::InitQueueHead(ehci_qh *queueHead, Pipe *pipe)
+ 		if ((pipe->Type() & USB_OBJECT_CONTROL_PIPE) != 0)
+ 			queueHead->endpoint_chars |= EHCI_QH_CHARS_CONTROL;
+ 
+-		queueHead->endpoint_caps |= (pipe->HubPort() << EHCI_QH_CAPS_PORT_SHIFT)
+-			| (pipe->HubAddress() << EHCI_QH_CAPS_HUB_SHIFT);
++		// With an integrated transaction translator, a full or low speed
++		// device on a root port is reached through the controller's own TT,
++		// which answers to hub address 0: leave the hub address 0 but keep
++		// the port, as Linux does for TDI controllers.
++		queueHead->endpoint_caps |= pipe->HubPort() << EHCI_QH_CAPS_PORT_SHIFT;
++		if ((fFlags & kIntegratedTT) == 0
++			|| pipe->HubAddress() != fRootHubAddress) {
++			queueHead->endpoint_caps
++				|= pipe->HubAddress() << EHCI_QH_CAPS_HUB_SHIFT;
++		}
+ 	}
+ 
+ 	return B_OK;
+@@ -3579,6 +4399,10 @@ EHCI::UnlockIsochronous()
+ inline void
+ EHCI::WriteOpReg(uint32 reg, uint32 value)
+ {
++#ifdef __ARM__
++	// make the descriptors written before visible to the controller
++	asm volatile ("dsb" : : : "memory");
++#endif
+ 	*(volatile uint32 *)(fOperationalRegisters + reg) = value;
+ }
+ 
+diff --git a/src/add-ons/kernel/busses/usb/ehci.h b/src/add-ons/kernel/busses/usb/ehci.h
+index 3119e78397..285a05ee48 100644
+--- a/src/add-ons/kernel/busses/usb/ehci.h
++++ b/src/add-ons/kernel/busses/usb/ehci.h
+@@ -53,6 +53,11 @@ class EHCI : public BusManager {
+ public:
+ 									EHCI(pci_info *info, pci_device_module_info* pci,
+ 										pci_device* device, Stack *stack, device_node *node);
++									EHCI(phys_addr_t registers,
++										size_t registersSize,
++										size_t capabilityOffset, uint32 irq,
++										uint32 flags, Stack *stack,
++										device_node *node);
+ 									~EHCI();
+ 
+ 		status_t					Start();
+@@ -85,7 +90,22 @@ virtual	status_t					NotifyPipeChange(Pipe *pipe,
+ 
+ virtual	const char *				TypeName() const { return "ehci"; }
+ 
++		// The controller has an integrated transaction translator (e.g.
++		// ChipIdea/TDI cores like NVIDIA Tegra's): no companion controllers,
++		// full and low speed devices stay on the EHCI ports, the port speed is
++		// in PORTSC and the controller must be put in host mode after a reset.
++static	const uint32				kIntegratedTT = 1 << 0;
++
+ private:
++									EHCI(Stack *stack, device_node *node);
++
++		status_t					_MapRegisters(phys_addr_t physicalAddress,
++										size_t mapSize, size_t offset);
++		void						_ReadCapabilities();
++		status_t					_PrepareController();
++		bool						_UsePolling();
++		status_t					_FinishInit();
++
+ 		// Controller resets
+ 		status_t					ControllerReset();
+ 		status_t					LightReset();
+@@ -280,6 +300,8 @@ inline	uint32						ReadCapReg32(uint32 reg);
+ 		uint32						fIRQ;
+ 		bool						fUseMSI;
+ 		spinlock					fInterruptLock;
++
++		uint32						fFlags;
+ };
+ 
+ 
+diff --git a/src/add-ons/kernel/busses/usb/ehci_hardware.h b/src/add-ons/kernel/busses/usb/ehci_hardware.h
+index 2c7284c51a..b576eed3a4 100644
+--- a/src/add-ons/kernel/busses/usb/ehci_hardware.h
++++ b/src/add-ons/kernel/busses/usb/ehci_hardware.h
+@@ -99,6 +99,19 @@
+ 
+ #define EHCI_PORTSC_DATAMASK	0xffffffd5
+ 
++// Controllers with an integrated transaction translator (ChipIdea/TDI)
++#define EHCI_PORTSC_PSPD_SHIFT	26			// Port Speed
++#define EHCI_PORTSC_PSPD_MASK	0x03
++#define EHCI_PORTSC_PSPD_FULL	0
++#define EHCI_PORTSC_PSPD_LOW	1
++#define EHCI_PORTSC_PSPD_HIGH	2
++#define EHCI_BURSTSIZE			0x20		// DMA burst sizes (TDI)
++#define EHCI_TXFILLTUNING		0x24		// TX FIFO fill tuning (TDI)
++#define EHCI_TXFILLTUNING_THRES_SHIFT	16
++#define EHCI_USBMODE			0x68		// USB Mode
++#define EHCI_USBMODE_CM_MASK	0x03		// Controller Mode
++#define EHCI_USBMODE_CM_HOST	0x03
++
+ 
+ // Extended Capabilities
+ #define EHCI_ECP_SHIFT			8			// Extended Capability Pointer
+diff --git a/src/system/kernel/device_manager/device_manager.cpp b/src/system/kernel/device_manager/device_manager.cpp
+index 7c0ac143f4..4fa9325353 100644
+--- a/src/system/kernel/device_manager/device_manager.cpp
++++ b/src/system/kernel/device_manager/device_manager.cpp
+@@ -1736,6 +1736,8 @@ device_node::_GetNextDriverPath(void*& cookie, KPath& _path)
+ 					_AddPath(*stack, "bus_managers/pci");
+ 					_AddPath(*stack, "busses/pci");
+ 					_AddPath(*stack, "busses/mmc");
++					// USB host controllers on a device tree bus
++					_AddPath(*stack, "busses/usb");
+ 				}
+ 				break;
+ 		}
+-- 
+2.39.5
+

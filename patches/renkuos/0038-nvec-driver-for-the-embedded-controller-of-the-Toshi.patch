@@ -1,0 +1,2068 @@
+From 7b3694c8161066cd2b7d38703006e8aabfbdbc90 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 27 Oct 2026 07:20:26 +0100
+Subject: [PATCH 38/63] nvec: driver for the embedded controller of the Toshiba
+ AC100
+
+The NVIDIA embedded controller protocol over the Tegra I2C slave: the
+keyboard, the touchpad, the battery and the power supply, the power
+button, the lid and the backlight keys; it switches the machine off and
+unmutes the speakers at start, as Linux does. It recovers from a lost
+interrupt, a touchpad that reset itself and an EC that stops answering.
+
+/dev/misc/nvec_diag passes requests to the EC for the ac100ec tool.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/add-ons/kernel/busses/i2c/Jamfile       |    1 +
+ src/add-ons/kernel/busses/i2c/nvec/Jamfile  |    8 +
+ src/add-ons/kernel/busses/i2c/nvec/nvec.cpp | 2011 +++++++++++++++++++
+ 3 files changed, 2020 insertions(+)
+ create mode 100644 src/add-ons/kernel/busses/i2c/nvec/Jamfile
+ create mode 100644 src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+
+diff --git a/src/add-ons/kernel/busses/i2c/Jamfile b/src/add-ons/kernel/busses/i2c/Jamfile
+index 7641c18a44..467768e8cc 100644
+--- a/src/add-ons/kernel/busses/i2c/Jamfile
++++ b/src/add-ons/kernel/busses/i2c/Jamfile
+@@ -1,5 +1,6 @@
+ SubDir HAIKU_TOP src add-ons kernel busses i2c ;
+ 
+ SubInclude HAIKU_TOP src add-ons kernel busses i2c ocores ;
++SubInclude HAIKU_TOP src add-ons kernel busses i2c nvec ;
+ SubInclude HAIKU_TOP src add-ons kernel busses i2c pch ;
+ SubInclude HAIKU_TOP src add-ons kernel busses i2c tegra ;
+diff --git a/src/add-ons/kernel/busses/i2c/nvec/Jamfile b/src/add-ons/kernel/busses/i2c/nvec/Jamfile
+new file mode 100644
+index 0000000000..ffc5236d48
+--- /dev/null
++++ b/src/add-ons/kernel/busses/i2c/nvec/Jamfile
+@@ -0,0 +1,8 @@
++SubDir HAIKU_TOP src add-ons kernel busses i2c nvec ;
++
++UsePrivateKernelHeaders ;
++UsePrivateHeaders device drivers input ;
++
++KernelAddon nvec :
++	nvec.cpp
++	;
+diff --git a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+new file mode 100644
+index 0000000000..f1044fdd82
+--- /dev/null
++++ b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+@@ -0,0 +1,2011 @@
++/*
++ * Copyright 2026, Haiku, Inc. All rights reserved.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++/*!	Embedded controller of the Toshiba AC100 ("nvidia,nvec"). It is the I2C
++	bus master and talks to an NVIDIA Tegra 2 I2C controller in slave mode;
++	when we have something to say, we pull a GPIO line to ask it to read from
++	us. It handles the built-in keyboard, the touchpad (a PS/2 mouse behind it),
++	the battery and the power switch.
++
++	Protocol and hardware sequence after Linux' drivers/staging/nvec.
++
++	Messages are a type byte, a length byte and the payload. Events have bit 7
++	of the type set, and may also have a fixed size of 2 or 3 bytes. The
++	keyboard sends PS/2 scan code set 1, the touchpad standard PS/2 packets.
++*/
++
++
++#include <new>
++#include <stdio.h>
++#include <string.h>
++
++#include <ByteOrder.h>
++#include <KernelExport.h>
++#include <device_manager.h>
++#include <bus/FDT.h>
++
++#include <fs/select_sync_pool.h>
++#include <kernel.h>
++#include <lock.h>
++#include <util/AutoLock.h>
++
++#include <ATKeymap.h>
++#include <keyboard_mouse_driver.h>
++#include <power_managment.h>
++
++
++#define TRACE_ALWAYS(x...)	dprintf("nvec: " x)
++//#define TRACE_NVEC
++#ifdef TRACE_NVEC
++#	define TRACE(x...)		TRACE_ALWAYS(x)
++#else
++#	define TRACE(x...)
++#endif
++
++#define NVEC_DRIVER_MODULE_NAME	"busses/i2c/nvec/driver_v1"
++#define NVEC_DEVICE_MODULE_NAME	"busses/i2c/nvec/device_v1"
++
++
++// Tegra 2 I2C controller, slave part
++#define I2C_CNFG					0x00
++#define I2C_CNFG_PACKET_MODE_EN		(1 << 10)
++#define I2C_CNFG_NEW_MASTER_SFM		(1 << 11)
++#define I2C_CNFG_DEBOUNCE_CNT_SHIFT	12
++#define I2C_SL_CNFG					0x20
++#define I2C_SL_NEWSL				(1 << 2)
++#define I2C_SL_RCVD					0x24
++#define I2C_SL_STATUS				0x28
++#define I2C_SL_ADDR1				0x2c
++#define I2C_SL_ADDR2				0x30
++#define I2C_SL_DELAY_COUNT			0x3c
++
++// slave status
++#define I2C_SL_IRQ					(1 << 3)
++#define END_TRANS					(1 << 4)
++#define RCVD						(1 << 2)
++#define RNW							(1 << 1)
++
++// Tegra 2 clock and reset controller, pin multiplexer and GPIO controller
++#define TEGRA20_CAR_BASE			0x60006000
++#define TEGRA_CAR_RST_DEVICES(bank)	(0x04 + (bank) * 4)
++#define TEGRA_CAR_CLK_OUT_ENB(bank)	(0x10 + (bank) * 4)
++#define TEGRA_CAR_CLK_SOURCE_I2C3	0x1b8
++#define TEGRA20_CLK_I2C3			67
++#define TEGRA20_PLLP_KHZ			216000
++#define TEGRA20_APB_MISC_BASE		0x70000000
++#define TEGRA_PINMUX_TRI_DTF		0x20	// tristate register, bit 12
++#define TEGRA_PINMUX_MUX_DTF		0x98	// mux register, bits 30-31
++#define TEGRA20_GPIO_BASE			0x6000d000
++#define TEGRA20_PWM_BASE			0x7000a000	// channel 0: backlight
++#define TEGRA20_CLK_PWM				17
++#define TEGRA_PWM_ENABLE			(1U << 31)
++#define TEGRA_PWM_DUTY_SHIFT		16
++#define TEGRA_PWM_DUTY_MASK			(0x1ffU << 16)	// 0 - 256
++#define BACKLIGHT_LEVELS			16
++#define TEGRA_GPIO_REG(gpio, reg)	(((gpio) / 32) * 0x80 \
++										+ (((gpio) / 8) % 4) * 4 + (reg))
++#define TEGRA_GPIO_CNF				0x00
++#define TEGRA_GPIO_OE				0x10
++#define TEGRA_GPIO_MSK_OUT			0x820
++	// masked write: bit n + 8 selects bit n
++
++// message types
++enum {
++	NVEC_SYS		= 1,
++	NVEC_BAT		= 2,
++	NVEC_SLEEP		= 4,
++	NVEC_KBD		= 5,
++	NVEC_PS2		= 6,
++	NVEC_CNTL		= 7,
++	NVEC_OEM0		= 0x0d,
++	NVEC_KB_EVT		= 0x80,
++	NVEC_PS2_EVT	= 0x81,
++	NVEC_SYSTEM_EVT	= 0x85,
++};
++
++// event sizes, bits 5-6 of the type byte
++enum {
++	NVEC_2BYTES		= 0,
++	NVEC_3BYTES		= 1,
++	NVEC_VAR_SIZE	= 2,
++};
++
++// commands
++#define GLOBAL_EVENTS				0	// NVEC_SLEEP
++#define AP_PWR_DOWN					1
++#define CNF_EVENT_REPORTING			1	// NVEC_SYS
++#define GET_FIRMWARE_VERSION		0x15	// NVEC_CNTL
++#define KBD_CNFG_WAKE				3	// NVEC_KBD
++#define KBD_CNFG_WAKE_KEY_REPORTING	4
++#define KBD_SET_LEDS				0xed
++#define KBD_ENABLE					0xf4
++#define PS2_SEND_COMMAND			1	// NVEC_PS2
++#define PS2_AUTO_RECEIVE_N			3
++#define PS2_CANCEL_AUTO_RECEIVE		4
++#define GET_SYSTEM_STATUS			0	// NVEC_SYS
++#define LID_SWITCH					(1 << 1)
++#define PWR_BUTTON					(1 << 15)
++
++// NVEC_BAT requests
++enum {
++	BAT_SLOT_STATUS,
++	BAT_VOLTAGE,
++	BAT_TIME_REMAINING,
++	BAT_CURRENT,
++	BAT_AVERAGE_CURRENT,
++	BAT_AVERAGING_TIME_INTERVAL,
++	BAT_CAPACITY_REMAINING,
++	BAT_LAST_FULL_CHARGE_CAPACITY,
++	BAT_DESIGN_CAPACITY,
++	BAT_CRITICAL_CAPACITY,
++	BAT_TEMPERATURE,
++	BAT_MANUFACTURER,
++	BAT_MODEL,
++	BAT_TYPE,
++};
++
++#define NVEC_MSG_SIZE				34
++#define NVEC_RX_COUNT				16	// powers of two
++#define NVEC_TX_COUNT				16
++#define NVEC_KEY_COUNT				64
++#define NVEC_MOUSE_COUNT			32
++
++
++struct nvec_msg {
++	uint8	data[NVEC_MSG_SIZE];
++	uint32	size;
++	uint32	pos;
++};
++
++
++struct nvec_device {
++	device_node*		node;
++
++	area_id				registersArea;
++	volatile uint8*		registers;
++	area_id				gpioArea;
++	area_id				pwmArea;
++	volatile uint32*	pwm;			// backlight, if its clock runs
++	int32				backlightLevel;	// 1 - BACKLIGHT_LEVELS
++	bool				lidClosed;		// the backlight is off meanwhile
++	uint32				lidPwm;			// the PWM setting before the lid closed
++	volatile uint8*		gpio;
++	uint32				requestGPIO;
++	bool				requestActiveLow;
++	uint32				slaveAddress;
++	uint64				irq;
++
++	// everything below up to the next comment is used by the interrupt
++	// handler, under the lock
++	spinlock			lock;
++	int32				state;
++	nvec_msg*			rx;
++	nvec_msg			rxMessages[NVEC_RX_COUNT];
++	uint32				rxHead;		// next to fill
++	uint32				rxTail;		// next to dispatch
++	nvec_msg*			tx;
++	nvec_msg			txMessages[NVEC_TX_COUNT];
++	uint32				txHead;		// being sent
++	uint32				txTail;		// next free one
++	nvec_msg			txNoOp;
++	uint32				protocolErrors;
++	uint32				interrupts;
++	uint32				lostInterrupts;
++	int32				timeouts;	// in a row, by tx_thread
++	// check_lost_interrupt(): the interrupt count when it found one pending
++	uint32				pendingInterrupts;
++	int32				pendingChecks;
++	uint32				events;
++
++	sem_id				rxSem;		// a message came in
++	sem_id				txSem;		// a message was queued
++	sem_id				transferSem;	// the EC answered
++	thread_id			rxThread;
++	thread_id			txThread;
++	volatile bool		stopping;
++
++	// diagnostics: one request at a time from the ac100ec tool, and its reply
++	mutex				diagLock;
++	sem_id				diagSem;
++	volatile int32		diagClass;	// -1 when no request is waiting
++	volatile int32		diagSubCommand;
++	nvec_msg			diagReply;
++
++	// keyboard
++	spinlock			keyLock;
++	raw_key_info		keys[NVEC_KEY_COUNT];
++	uint32				keyHead;
++	uint32				keyTail;
++	sem_id				keySem;
++	uint32				repeatKey;
++	bigtime_t			repeatDelay;
++	bigtime_t			repeatRate;
++	bigtime_t			currentRepeatDelay;
++	bool				extendedKey;	// an 0xe0 prefix came
++
++	// power button, watched by the power_daemon
++	mutex				powerButtonLock;
++	uint8				powerButtonPressed;
++	select_sync_pool*	powerButtonSelectPool;
++
++	// touchpad
++	spinlock			mouseLock;
++	mouse_movement		movements[NVEC_MOUSE_COUNT];
++	uint32				movementHead;
++	uint32				movementTail;
++	sem_id				mouseSem;
++	uint8				packet[3];
++	uint32				packetPosition;
++	bool				selfTestByte;	// an 0xaa came instead of a packet
++	uint32				buttons;
++	bigtime_t			lastMouseByte;
++	int32				clicks;
++	bigtime_t			lastClick;
++	bigtime_t			clickSpeed;
++
++	// battery and power supply, polled
++	spinlock			batteryLock;
++	thread_id			pollThread;
++	bool				acOnline;
++	bool				batteryPresent;
++	uint32				batteryState;
++	uint32				batteryPercent;
++	uint32				voltage;		// mV
++	int32				current;		// mA, negative when discharging
++	uint32				remaining;		// mAh
++	uint32				lastFull;		// mAh
++	uint32				design;			// mAh
++	uint32				critical;		// mAh
++	char				manufacturer[BATTERY_MAX_STRING_LENGTH];
++	char				model[BATTERY_MAX_STRING_LENGTH];
++	char				type[BATTERY_MAX_STRING_LENGTH];
++};
++
++
++enum nvec_device_kind {
++	NVEC_KEYBOARD,
++	NVEC_MOUSE,
++	NVEC_BATTERY,
++	NVEC_POWER_BUTTON,
++	NVEC_DIAG,
++};
++
++
++// Diagnostics: /dev/misc/nvec_diag passes requests to the EC and returns its
++// reply (the ac100ec tool uses it)
++#define NVEC_DIAG_PATH				"misc/nvec_diag"
++#define NVEC_DIAG_REQUEST			0x4e563130	// 'NV10'
++
++struct nvec_diag_request {
++	uint8	size;				// of request, starting with the type
++	uint8	request[NVEC_MSG_SIZE - 1];
++	uint8	replySize;			// of reply, the type and count included
++	uint8	reply[NVEC_MSG_SIZE];
++};
++
++
++struct nvec_handle {
++	nvec_device*		device;
++	nvec_device_kind	kind;
++};
++
++
++
++static device_manager_info* gDeviceManager;
++static nvec_device* sPowerOffDevice;
++
++extern "C" void (*gArmPowerOffHook)(void);
++
++
++//	#pragma mark - hardware
++
++
++static inline uint32
++read_reg(nvec_device* device, uint32 offset)
++{
++	return *(volatile uint32*)(device->registers + offset);
++}
++
++
++static inline void
++write_reg(nvec_device* device, uint32 offset, uint32 value)
++{
++	*(volatile uint32*)(device->registers + offset) = value;
++}
++
++
++/*!	Drives the request line: asserted asks the EC to read from us. Masked
++	writes need no lock, the line is set from the interrupt handler, too.
++*/
++static void
++set_request(nvec_device* device, bool asserted)
++{
++	bool level = asserted != device->requestActiveLow;
++	// the EC is asked to read when the line goes low
++	level = !level;
++	uint32 bit = 1 << (device->requestGPIO % 8);
++	*(volatile uint32*)(device->gpio
++			+ TEGRA_GPIO_REG(device->requestGPIO, TEGRA_GPIO_MSK_OUT))
++		= (bit << 8) | (level ? bit : 0);
++}
++
++
++static status_t
++map_registers(const char* name, phys_addr_t physical, area_id* _area,
++	volatile uint8** _address)
++{
++	void* address;
++	area_id area = map_physical_memory(name,
++		physical & ~(phys_addr_t)(B_PAGE_SIZE - 1), B_PAGE_SIZE,
++		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++		&address);
++	if (area < B_OK)
++		return area;
++
++	*_area = area;
++	*_address = (volatile uint8*)address + (physical & (B_PAGE_SIZE - 1));
++	return B_OK;
++}
++
++
++static void
++setup_slave(nvec_device* device)
++{
++	write_reg(device, I2C_CNFG, I2C_CNFG_NEW_MASTER_SFM
++		| I2C_CNFG_PACKET_MODE_EN | (2 << I2C_CNFG_DEBOUNCE_CNT_SHIFT));
++	write_reg(device, I2C_SL_CNFG, I2C_SL_NEWSL);
++	write_reg(device, I2C_SL_DELAY_COUNT, 0x1e);
++	write_reg(device, I2C_SL_ADDR1, device->slaveAddress >> 1);
++	write_reg(device, I2C_SL_ADDR2, 0);
++}
++
++
++/*!	Clocks the controller, routes its pins and sets the request line up. The
++	firmware does not use the EC, so nothing of this can be taken for granted.
++*/
++static status_t
++setup_hardware(nvec_device* device)
++{
++	area_id area;
++	volatile uint8* car;
++	status_t status = map_registers("tegra car", TEGRA20_CAR_BASE, &area,
++		&car);
++	if (status != B_OK)
++		return status;
++
++	uint32 bank = TEGRA20_CLK_I2C3 / 32;
++	uint32 bit = 1U << (TEGRA20_CLK_I2C3 % 32);
++	volatile uint32* reset = (volatile uint32*)(car
++		+ TEGRA_CAR_RST_DEVICES(bank));
++	volatile uint32* enable = (volatile uint32*)(car
++		+ TEGRA_CAR_CLK_OUT_ENB(bank));
++	volatile uint32* source = (volatile uint32*)(car
++		+ TEGRA_CAR_CLK_SOURCE_I2C3);
++
++	// 8 times the bus clock of 80 kHz, from PLLP; integer divider + 1
++	*enable |= bit;
++	uint32 divider = (TEGRA20_PLLP_KHZ + 639) / 640 - 1;
++	*source = (*source & ~((3U << 30) | 0xffff)) | divider;
++	*reset |= bit;
++	spin(2);
++	*reset &= ~bit;
++	delete_area(area);
++
++	volatile uint8* misc;
++	status = map_registers("tegra apb misc", TEGRA20_APB_MISC_BASE, &area,
++		&misc);
++	if (status != B_OK)
++		return status;
++	// function 0 of the "dtf" pin group is I2C3; take it out of tristate
++	volatile uint32* mux = (volatile uint32*)(misc + TEGRA_PINMUX_MUX_DTF);
++	*mux &= ~(3U << 30);
++	volatile uint32* tristate = (volatile uint32*)(misc
++		+ TEGRA_PINMUX_TRI_DTF);
++	*tristate &= ~(1U << 12);
++	delete_area(area);
++
++	status = map_registers("tegra gpio", TEGRA20_GPIO_BASE, &device->gpioArea,
++		&device->gpio);
++	if (status != B_OK)
++		return status;
++	set_request(device, false);
++	uint32 gpioBit = 1U << (device->requestGPIO % 8);
++	*(volatile uint32*)(device->gpio
++		+ TEGRA_GPIO_REG(device->requestGPIO, TEGRA_GPIO_CNF)) |= gpioBit;
++	*(volatile uint32*)(device->gpio
++		+ TEGRA_GPIO_REG(device->requestGPIO, TEGRA_GPIO_OE)) |= gpioBit;
++
++
++	setup_slave(device);
++	return B_OK;
++}
++
++
++/*!	The EC has been seen to stop talking in the middle of a message it sent
++	(state 4, no interrupt pending), keyboard and touchpad included. Starts
++	the controller over, as at boot, so that the EC finds an idle bus again.
++*/
++static void
++restart_controller(nvec_device* device)
++{
++	area_id area;
++	volatile uint8* car;
++	if (map_registers("tegra car", TEGRA20_CAR_BASE, &area, &car) != B_OK)
++		return;
++
++	uint32 bank = TEGRA20_CLK_I2C3 / 32;
++	uint32 bit = 1U << (TEGRA20_CLK_I2C3 % 32);
++	volatile uint32* reset = (volatile uint32*)(car
++		+ TEGRA_CAR_RST_DEVICES(bank));
++
++	InterruptsSpinLocker locker(device->lock);
++	TRACE_ALWAYS("the EC does not answer (state %" B_PRId32 ", status %#"
++		B_PRIx32 "), restarting the controller\n", device->state,
++		read_reg(device, I2C_SL_STATUS));
++	*reset |= bit;
++	spin(2);
++	*reset &= ~bit;
++	setup_slave(device);
++	device->state = 0;
++	device->rx = NULL;
++	locker.Unlock();
++
++	delete_area(area);
++}
++
++
++//	#pragma mark - transport
++
++
++static bool
++is_event(const nvec_msg* message)
++{
++	return (message->data[0] & 0x80) != 0;
++}
++
++
++static uint32
++message_size(const nvec_msg* message)
++{
++	uint32 eventSize = (message->data[0] >> 5) & 3;
++	if (!is_event(message) || eventSize == NVEC_VAR_SIZE)
++		return message->pos >= 2 ? message->data[1] + 2 : 0;
++	if (eventSize == NVEC_2BYTES)
++		return 2;
++	if (eventSize == NVEC_3BYTES)
++		return 3;
++	return 0;
++}
++
++
++//! Called with the lock held.
++static void
++protocol_error(nvec_device* device, uint32 status, bool reset)
++{
++	if (device->protocolErrors++ < 16) {
++		TRACE_ALWAYS("unexpected status %#" B_PRIx32 " in state %" B_PRId32
++			"\n", status, device->state);
++	}
++	if (reset)
++		device->state = 0;
++}
++
++
++//! Called with the lock held: picks the message the EC is about to read.
++static void
++start_tx(nvec_device* device)
++{
++	if (device->txHead == device->txTail) {
++		// the EC wants to read, but we have nothing: send a no-op
++		static const uint8 kNoOp[] = { 2, NVEC_CNTL, 2 };
++		memcpy(device->txNoOp.data, kNoOp, sizeof(kNoOp));
++		device->txNoOp.size = sizeof(kNoOp);
++		device->tx = &device->txNoOp;
++	} else
++		device->tx = &device->txMessages[device->txHead % NVEC_TX_COUNT];
++	device->tx->pos = 0;
++}
++
++
++//! Called with the lock held.
++static void
++rx_completed(nvec_device* device)
++{
++	nvec_msg* message = device->rx;
++	device->state = 0;
++	device->rx = NULL;
++
++	if (message->pos != message_size(message)) {
++		if (device->protocolErrors++ < 16) {
++			TRACE_ALWAYS("incomplete message %#x: %" B_PRIu32 " of %" B_PRIu32
++				" bytes\n", message->data[0], message->pos,
++				message_size(message));
++		}
++		// the battery answers are often incomplete, still count them
++		if (message->data[0] == NVEC_BAT)
++			release_sem_etc(device->transferSem, 1, B_DO_NOT_RESCHEDULE);
++		return;
++	}
++
++	message->size = message->pos;
++	device->rxHead++;
++	if (is_event(message))
++		device->events++;
++	if (!is_event(message))
++		release_sem_etc(device->transferSem, 1, B_DO_NOT_RESCHEDULE);
++	release_sem_etc(device->rxSem, 1, B_DO_NOT_RESCHEDULE);
++}
++
++
++static int32
++nvec_interrupt(void* data)
++{
++	nvec_device* device = (nvec_device*)data;
++	InterruptsSpinLocker locker(device->lock);
++
++	uint32 status = read_reg(device, I2C_SL_STATUS);
++	device->interrupts++;
++	const uint32 irqMask = I2C_SL_IRQ | END_TRANS | RCVD | RNW;
++	if ((status & irqMask) == 0 && (status & ~irqMask) != 0) {
++		protocol_error(device, status, false);
++		return B_HANDLED_INTERRUPT;
++	}
++	if ((status & I2C_SL_IRQ) == 0)
++		return B_UNHANDLED_INTERRUPT;
++
++	// the EC did not ask to read, so it sent us something
++	uint32 received = 0;
++	if ((status & RNW) == 0) {
++		received = read_reg(device, I2C_SL_RCVD);
++		if ((status & RCVD) != 0)
++			write_reg(device, I2C_SL_RCVD, 0);
++	}
++
++	if (status == (I2C_SL_IRQ | RCVD))
++		device->state = 0;
++
++	uint8 toSend = 0xff;
++	switch (device->state) {
++		case 0:
++			// the start of a transfer, checked below
++			if (status != (I2C_SL_IRQ | RCVD))
++				protocol_error(device, status, false);
++			break;
++
++		case 1:
++			// command byte
++			if (status != I2C_SL_IRQ) {
++				protocol_error(device, status, true);
++			} else if (device->rxHead - device->rxTail >= NVEC_RX_COUNT) {
++				// nobody reads the messages anymore
++				device->state = 0;
++			} else {
++				device->rx
++					= &device->rxMessages[device->rxHead % NVEC_RX_COUNT];
++				device->rx->data[0] = received;
++				device->rx->pos = 1;
++				device->state = 2;
++			}
++			break;
++
++		case 2:
++			// first byte after the command
++			if (status == (I2C_SL_IRQ | RNW | RCVD)) {
++				spin(33);
++				if (device->rx->data[0] != 0x01) {
++					protocol_error(device, status, true);
++					device->rx = NULL;
++					break;
++				}
++				// the EC reads our message
++				device->rx = NULL;
++				device->state = 3;
++				start_tx(device);
++				toSend = device->tx->data[0];
++				device->tx->pos = 1;
++			} else if (status == I2C_SL_IRQ) {
++				device->rx->data[1] = received;
++				device->rx->pos = 2;
++				device->state = 4;
++			} else
++				protocol_error(device, status, true);
++			break;
++
++		case 3:
++			// the EC reads a message from us
++			if ((status & END_TRANS) != 0) {
++				if (device->tx->pos != device->tx->size) {
++					// stopped early: send it again
++					device->tx->pos = 0;
++					set_request(device, true);
++				} else
++					device->state = 0;
++			} else if ((status & RNW) == 0 || (status & RCVD) != 0) {
++				protocol_error(device, status, true);
++			} else if (device->tx->pos < device->tx->size) {
++				toSend = device->tx->data[device->tx->pos++];
++			} else {
++				protocol_error(device, status, true);
++			}
++			break;
++
++		case 4:
++			// the EC sends us a message
++			if ((status & (END_TRANS | RNW)) == END_TRANS)
++				rx_completed(device);
++			else if ((status & (RNW | RCVD)) != 0)
++				protocol_error(device, status, true);
++			else if (device->rx->pos < NVEC_MSG_SIZE)
++				device->rx->data[device->rx->pos++] = received;
++			break;
++
++		default:
++			device->state = 0;
++			break;
++	}
++
++	// a new transfer to us begins with our address
++	if ((status & (RCVD | RNW)) == RCVD) {
++		if (received != device->slaveAddress)
++			protocol_error(device, received, false);
++		device->state = 1;
++	}
++
++	// send a byte if one is asked for, but not at the end of the transfer
++	if ((status & (RNW | END_TRANS)) == RNW)
++		write_reg(device, I2C_SL_RCVD, toSend);
++
++	// the first byte is out, the request has been seen
++	if (status == (I2C_SL_IRQ | RNW | RCVD))
++		set_request(device, false);
++
++	// the controller needs some time between accesses (Linux does the same)
++	spin(100);
++
++	return B_HANDLED_INTERRUPT;
++}
++
++
++/*!	Queues a message for the EC; \a data starts with the message type. */
++static status_t
++nvec_write(nvec_device* device, const uint8* data, uint32 size)
++{
++	if (size + 1 > NVEC_MSG_SIZE)
++		return B_BAD_VALUE;
++
++	InterruptsSpinLocker locker(device->lock);
++	if (device->txTail - device->txHead >= NVEC_TX_COUNT)
++		return B_WOULD_BLOCK;
++
++	nvec_msg* message = &device->txMessages[device->txTail % NVEC_TX_COUNT];
++	message->data[0] = size;
++	memcpy(message->data + 1, data, size);
++	message->size = size + 1;
++	message->pos = 0;
++	device->txTail++;
++	locker.Unlock();
++
++	release_sem(device->txSem);
++	return B_OK;
++}
++
++
++/*!	Sends the queued messages one after the other: asks the EC to read, and
++	waits for its answer before going on.
++*/
++static status_t
++tx_thread(void* data)
++{
++	nvec_device* device = (nvec_device*)data;
++
++	while (!device->stopping) {
++		if (acquire_sem(device->txSem) != B_OK)
++			break;
++
++		int32 tries = 0;
++		while (!device->stopping) {
++			set_request(device, true);
++			status_t status = acquire_sem_etc(device->transferSem, 1,
++				B_RELATIVE_TIMEOUT, 5000000);
++
++			if (status == B_OK)
++				device->timeouts = 0;
++			else if (++device->timeouts >= 2) {
++				restart_controller(device);
++				device->timeouts = 0;
++			}
++
++			InterruptsSpinLocker locker(device->lock);
++			if (status == B_OK || ++tries >= 3) {
++				if (status != B_OK) {
++					TRACE_ALWAYS("no answer to message %#x, dropping it\n",
++						device->txMessages[device->txHead % NVEC_TX_COUNT]
++							.data[1]);
++				}
++				device->txHead++;
++				break;
++			}
++			TRACE_ALWAYS("timeout waiting for the EC, trying again\n");
++			device->txMessages[device->txHead % NVEC_TX_COUNT].pos = 0;
++			locker.Unlock();
++			set_request(device, false);
++		}
++	}
++	return B_OK;
++}
++
++
++//	#pragma mark - keyboard and touchpad
++
++
++static void
++put_key(nvec_device* device, uint32 keycode, bool down)
++{
++	InterruptsSpinLocker locker(device->keyLock);
++	if (device->keyHead - device->keyTail >= NVEC_KEY_COUNT)
++		return;
++
++	raw_key_info& info = device->keys[device->keyHead % NVEC_KEY_COUNT];
++	info.timestamp = system_time();
++	info.keycode = keycode;
++	info.is_keydown = down;
++	device->keyHead++;
++	locker.Unlock();
++
++	release_sem_etc(device->keySem, 1, B_DO_NOT_RESCHEDULE);
++}
++
++
++/*!	The backlight keys (Fn + F4 and F5) change the duty cycle of the PWM
++	driving the backlight, if the firmware left it running. The display
++	driver sets it too (the brightness of the Screen preferences, and the
++	backlight off while the screen sleeps), so the keys start from what the
++	PWM holds, not from the level they last set.
++*/
++static void
++change_backlight(nvec_device* device, int32 delta)
++{
++	if (device->pwm == NULL || device->lidClosed)
++		return;
++
++	uint32 pwm = *device->pwm;
++	uint32 duty = (pwm & TEGRA_PWM_DUTY_MASK) >> TEGRA_PWM_DUTY_SHIFT;
++	if ((pwm & TEGRA_PWM_ENABLE) != 0 && duty != 0)
++		device->backlightLevel = (duty * BACKLIGHT_LEVELS + 128) / 256;
++
++	int32 level = device->backlightLevel + delta;
++	if (level < 1)
++		level = 1;
++	if (level > BACKLIGHT_LEVELS)
++		level = BACKLIGHT_LEVELS;
++	device->backlightLevel = level;
++
++	duty = level * 256 / BACKLIGHT_LEVELS;
++	*device->pwm = (*device->pwm & ~TEGRA_PWM_DUTY_MASK) | TEGRA_PWM_ENABLE
++		| (duty << TEGRA_PWM_DUTY_SHIFT);
++	TRACE_ALWAYS("backlight level %" B_PRId32 ", PWM %#" B_PRIx32 "\n", level,
++		*device->pwm);
++}
++
++
++/*!	Switches the backlight off while the lid is closed. */
++static void
++set_lid_closed(nvec_device* device, bool closed)
++{
++	if (closed == device->lidClosed)
++		return;
++	device->lidClosed = closed;
++	TRACE_ALWAYS("lid %s\n", closed ? "closed" : "open");
++
++	if (device->pwm == NULL)
++		return;
++	// Leave the backlight as the lid found it, whoever set it
++	if (closed) {
++		device->lidPwm = *device->pwm;
++		*device->pwm &= ~(TEGRA_PWM_DUTY_MASK | TEGRA_PWM_ENABLE);
++	} else
++		*device->pwm = device->lidPwm;
++}
++
++
++static void
++setup_backlight(nvec_device* device)
++{
++	area_id area;
++	volatile uint8* car;
++	if (map_registers("tegra car", TEGRA20_CAR_BASE, &area, &car) != B_OK)
++		return;
++	uint32 bit = 1U << (TEGRA20_CLK_PWM % 32);
++	uint32 bank = TEGRA20_CLK_PWM / 32;
++	bool clocked = (*(volatile uint32*)(car + TEGRA_CAR_CLK_OUT_ENB(bank))
++		& bit) != 0;
++	bool inReset = (*(volatile uint32*)(car + TEGRA_CAR_RST_DEVICES(bank))
++		& bit) != 0;
++	delete_area(area);
++
++	// a register access to a device without clock can hang the bus
++	if (!clocked || inReset) {
++		TRACE_ALWAYS("backlight PWM not running (clock %d, reset %d)\n",
++			clocked, inReset);
++		return;
++	}
++
++	volatile uint8* pwm;
++	if (map_registers("tegra pwm", TEGRA20_PWM_BASE, &device->pwmArea, &pwm)
++			!= B_OK) {
++		return;
++	}
++	device->pwm = (volatile uint32*)pwm;
++	uint32 duty = (*device->pwm & TEGRA_PWM_DUTY_MASK) >> TEGRA_PWM_DUTY_SHIFT;
++	device->backlightLevel = (duty * BACKLIGHT_LEVELS + 128) / 256;
++	if (device->backlightLevel < 1)
++		device->backlightLevel = BACKLIGHT_LEVELS;
++	TRACE_ALWAYS("backlight PWM %#" B_PRIx32 ", level %" B_PRId32 "\n",
++		*device->pwm, device->backlightLevel);
++}
++
++
++static void
++power_button_pressed(nvec_device* device)
++{
++	MutexLocker locker(device->powerButtonLock);
++	device->powerButtonPressed = 1;
++	if (device->powerButtonSelectPool != NULL) {
++		notify_select_event_pool(device->powerButtonSelectPool,
++			B_SELECT_READ);
++	}
++}
++
++
++/*!	Handles one byte of PS/2 scan code set 1; extended codes come with an
++	0xe0 prefix.
++*/
++static void
++handle_scan_code(nvec_device* device, uint8 code)
++{
++	if (code == 0xe0) {
++		device->extendedKey = true;
++		return;
++	}
++
++	bool extended = device->extendedKey;
++	device->extendedKey = false;
++	bool down = (code & 0x80) == 0;
++	uint32 scancode = (code & 0x7f) | (extended ? 0x80 : 0);
++
++	// the backlight keys (Fn + the sun keys) come as F7 and F6 on the AC100
++	// (e0 39 and e0 3a on other NVEC keyboards)
++	if (scancode == 0x41 || scancode == 0x40 || scancode == 0xb9
++		|| scancode == 0xba) {
++		if (down) {
++			change_backlight(device,
++				scancode == 0x41 || scancode == 0xb9 ? 1 : -1);
++		}
++		return;
++	}
++
++	if (scancode == 0 || scancode > B_COUNT_OF(kATKeycodeMap)) {
++		TRACE_ALWAYS("unknown key %s%#x\n", extended ? "0xe0 " : "", code);
++		return;
++	}
++
++	put_key(device, kATKeycodeMap[scancode - 1], down);
++}
++
++
++static void
++handle_key_event(nvec_device* device, const nvec_msg* message)
++{
++	uint32 eventSize = (message->data[0] >> 5) & 3;
++	if (eventSize == NVEC_VAR_SIZE) {
++		// only the power button comes like this (e0 5e e0 de); it is no
++		// key: the power_daemon asks to shut down
++		if (message->size >= 4 && message->data[1] >= 2
++			&& message->data[2] == 0xe0 && message->data[3] == 0x5e) {
++			power_button_pressed(device);
++		}
++		return;
++	}
++
++	for (uint32 i = 1; i < (eventSize == NVEC_3BYTES ? 3u : 2u); i++)
++		handle_scan_code(device, message->data[i]);
++}
++
++
++// the touchpad's default (3 byte packet) mode, and enabling its reports
++static const uint8 kMouseDefaults[] = { NVEC_PS2, PS2_SEND_COMMAND, 0xf6, 1 };
++static const uint8 kMouseEnable[] = { NVEC_PS2, PS2_SEND_COMMAND, 0xf4, 1 };
++
++
++static void
++handle_mouse_byte(nvec_device* device, uint8 byte)
++{
++	// "aa 00" instead of a packet: the touchpad reset itself (or the EC did)
++	// and passed its self test; it sends nothing until it is enabled again
++	// (as in Linux' psmouse)
++	bool reset = device->packetPosition == 0 && device->selfTestByte
++		&& byte == 0x00;
++	device->selfTestByte = device->packetPosition == 0 && byte == 0xaa;
++	if (reset) {
++		device->packetPosition = 0;
++		TRACE_ALWAYS("the touchpad was reset, enabling it again\n");
++		nvec_write(device, kMouseDefaults, sizeof(kMouseDefaults));
++		nvec_write(device, kMouseEnable, sizeof(kMouseEnable));
++		return;
++	}
++
++	// The bytes of a packet come close together: after a pause a new packet
++	// starts, as Linux' psmouse resyncs
++	bigtime_t now = system_time();
++	if (device->packetPosition != 0 && now - device->lastMouseByte > 100000)
++		device->packetPosition = 0;
++	device->lastMouseByte = now;
++
++	// the first byte of a packet always has bit 3 set: this resyncs on the
++	// self test result (0xaa 0x00) that follows a reset. A fast movement
++	// may set the overflow bits; the packet still has the buttons.
++	if (device->packetPosition == 0 && (byte & 0x08) == 0) {
++		return;
++	}
++	device->packet[device->packetPosition++] = byte;
++	if (device->packetPosition < 3)
++		return;
++	device->packetPosition = 0;
++
++	const uint8* packet = device->packet;
++	uint32 buttons = packet[0] & 7;
++	int32 xdelta = ((packet[0] & 0x10) ? ~0xff : 0) | packet[1];
++	int32 ydelta = ((packet[0] & 0x20) ? ~0xff : 0) | packet[2];
++	if ((packet[0] & 0x40) != 0)
++		xdelta = (packet[0] & 0x10) ? -255 : 255;
++	if ((packet[0] & 0x80) != 0)
++		ydelta = (packet[0] & 0x20) ? -255 : 255;
++	if (buttons != 0 && device->buttons == 0) {
++		if (device->lastClick + device->clickSpeed > now)
++			device->clicks++;
++		else
++			device->clicks = 1;
++		device->lastClick = now;
++	}
++	device->buttons = buttons;
++
++	bool full = false;
++	InterruptsSpinLocker locker(device->mouseLock);
++	if (device->movementHead - device->movementTail >= NVEC_MOUSE_COUNT) {
++		// Full: a button change must not get lost. The movement goes into
++		// the newest entry if the buttons stay, else the oldest entry makes
++		// room.
++		mouse_movement& newest = device->movements[
++			(device->movementHead - 1) % NVEC_MOUSE_COUNT];
++		if (newest.buttons == buttons) {
++			newest.xdelta += xdelta;
++			newest.ydelta += ydelta;
++			newest.timestamp = now;
++			return;
++		}
++		device->movementTail++;
++		full = true;
++	}
++
++	mouse_movement& movement
++		= device->movements[device->movementHead % NVEC_MOUSE_COUNT];
++	memset(&movement, 0, sizeof(movement));
++	movement.buttons = buttons;
++	movement.xdelta = xdelta;
++	movement.ydelta = ydelta;
++	movement.clicks = device->clicks;
++	movement.timestamp = now;
++	device->movementHead++;
++	locker.Unlock();
++
++	// a full queue keeps its count: the oldest entry made room
++	if (!full)
++		release_sem_etc(device->mouseSem, 1, B_DO_NOT_RESCHEDULE);
++}
++
++
++static uint16
++message_uint16(const nvec_msg* message)
++{
++	return message->data[4] | (message->data[5] << 8);
++}
++
++
++static void
++message_string(const nvec_msg* message, char* string)
++{
++	uint32 length = min_c(message->size > 4 ? message->size - 4 : 0,
++		(uint32)BATTERY_MAX_STRING_LENGTH - 1);
++	memcpy(string, message->data + 4, length);
++	string[length] = '\0';
++}
++
++
++static void
++request_battery_details(nvec_device* device)
++{
++	static const uint8 kDetails[] = { BAT_LAST_FULL_CHARGE_CAPACITY,
++		BAT_DESIGN_CAPACITY, BAT_CRITICAL_CAPACITY, BAT_MANUFACTURER,
++		BAT_MODEL, BAT_TYPE };
++	for (size_t i = 0; i < B_COUNT_OF(kDetails); i++) {
++		uint8 request[] = { NVEC_BAT, kDetails[i] };
++		nvec_write(device, request, sizeof(request));
++	}
++}
++
++
++/*!	Answers to the requests of the poll thread: the type byte, the length,
++	the request, a status, then the payload (16 bit values little endian).
++*/
++static void
++handle_battery_message(nvec_device* device, const nvec_msg* message)
++{
++	if (message->size < 6 && message->data[2] != BAT_SLOT_STATUS)
++		return;
++
++	bool requestDetails = false;
++	InterruptsSpinLocker locker(device->batteryLock);
++	switch (message->data[2]) {
++		case BAT_SLOT_STATUS:
++		{
++			if (message->size < 6)
++				return;
++			uint8 status = message->data[4];
++			bool present = (status & 1) != 0;
++			requestDetails = present && !device->batteryPresent;
++			device->batteryPresent = present;
++			switch ((status >> 1) & 3) {
++				case 0:
++					device->batteryState = BATTERY_NOT_CHARGING;
++					break;
++				case 1:
++					device->batteryState = BATTERY_CHARGING;
++					break;
++				case 2:
++					device->batteryState = BATTERY_DISCHARGING;
++					break;
++				default:
++					device->batteryState = 0;
++					break;
++			}
++			device->batteryPercent = message->data[5];
++			break;
++		}
++		case BAT_VOLTAGE:
++			device->voltage = message_uint16(message);
++			break;
++		case BAT_CURRENT:
++			device->current = (int16)message_uint16(message);
++			break;
++		case BAT_CAPACITY_REMAINING:
++			device->remaining = message_uint16(message);
++			break;
++		case BAT_LAST_FULL_CHARGE_CAPACITY:
++			device->lastFull = message_uint16(message);
++			break;
++		case BAT_DESIGN_CAPACITY:
++			device->design = message_uint16(message);
++			break;
++		case BAT_CRITICAL_CAPACITY:
++			device->critical = message_uint16(message);
++			break;
++		case BAT_MANUFACTURER:
++			message_string(message, device->manufacturer);
++			break;
++		case BAT_MODEL:
++			message_string(message, device->model);
++			break;
++		case BAT_TYPE:
++			message_string(message, device->type);
++			break;
++	}
++	locker.Unlock();
++
++	if (requestDetails)
++		request_battery_details(device);
++}
++
++
++/*!	Seen once on the AC100: right after a spurious interrupt of the GIC the
++	slave controller kept an interrupt pending (status 0x8) that never reached
++	nvec_interrupt(), and the EC waited for us for good, keyboard and touchpad
++	included. An interrupt that stays pending while the counter does not move
++	for two checks (100 ms apart) is handled from here instead.
++*/
++static void
++check_lost_interrupt(nvec_device* device)
++{
++	if ((read_reg(device, I2C_SL_STATUS) & I2C_SL_IRQ) == 0) {
++		device->pendingChecks = 0;
++		return;
++	}
++	if (device->pendingChecks == 0
++		|| device->interrupts != device->pendingInterrupts) {
++		device->pendingChecks = 1;
++		device->pendingInterrupts = device->interrupts;
++		return;
++	}
++	if (++device->pendingChecks < 3)
++		return;
++
++	device->pendingChecks = 0;
++	if (device->lostInterrupts++ < 16) {
++		TRACE_ALWAYS("interrupt pending without being handled (state %"
++			B_PRId32 "), handling it here\n", device->state);
++	}
++	nvec_interrupt(device);
++}
++
++
++/*!	The EC sometimes stops sending keyboard and touchpad events, while it
++	still answers requests (seen on the AC100, after a minute or after
++	hours). Enabling the events, the keyboard and the touchpad again, as at
++	start, brings them back. These requests change nothing when the input
++	already works, so they are simply sent after a while without events.
++*/
++static void
++enable_input_again(nvec_device* device)
++{
++	static const uint8 kGlobalEvents[] = { NVEC_SLEEP, GLOBAL_EVENTS, 1 };
++	static const uint8 kKeyboardEnable[] = { NVEC_KBD, KBD_ENABLE };
++
++	nvec_write(device, kGlobalEvents, sizeof(kGlobalEvents));
++	snooze(50000);
++	nvec_write(device, kKeyboardEnable, sizeof(kKeyboardEnable));
++	snooze(50000);
++	nvec_write(device, kMouseEnable, sizeof(kMouseEnable));
++}
++
++
++/*!	Asks for the power supply and one battery value every 5 seconds, in turn:
++	all at once seems to overload the EC (as in Linux).
++*/
++static status_t
++poll_thread(void* data)
++{
++	nvec_device* device = (nvec_device*)data;
++	static const uint8 kBatteryValues[] = { BAT_SLOT_STATUS, BAT_VOLTAGE,
++		BAT_CURRENT, BAT_CAPACITY_REMAINING };
++	uint32 next = 0;
++	uint32 lastEvents = 0;
++	int32 quietRounds = 0;
++	int32 reenabled = 0;
++
++	while (!device->stopping) {
++		// About 30 seconds without any event: wake the input up again
++		if (device->events != lastEvents) {
++			lastEvents = device->events;
++			quietRounds = 0;
++		} else if (++quietRounds >= 6) {
++			quietRounds = 0;
++			if (reenabled++ < 20)
++				TRACE_ALWAYS("no events for 30 s, enabling the input again\n");
++			enable_input_again(device);
++		}
++
++		static const uint8 kSystemStatus[] = { NVEC_SYS, GET_SYSTEM_STATUS };
++		nvec_write(device, kSystemStatus, sizeof(kSystemStatus));
++		snooze(100000);
++
++		uint8 request[] = { NVEC_BAT,
++			kBatteryValues[next++ % B_COUNT_OF(kBatteryValues)] };
++		nvec_write(device, request, sizeof(request));
++
++		for (int32 i = 0; i < 50 && !device->stopping; i++) {
++			snooze(100000);
++			check_lost_interrupt(device);
++		}
++	}
++	return B_OK;
++}
++
++
++static status_t
++rx_thread(void* data)
++{
++	nvec_device* device = (nvec_device*)data;
++
++	while (!device->stopping) {
++		if (acquire_sem(device->rxSem) != B_OK)
++			break;
++
++		nvec_msg message;
++		{
++			InterruptsSpinLocker locker(device->lock);
++			if (device->rxTail == device->rxHead)
++				continue;
++			message = device->rxMessages[device->rxTail % NVEC_RX_COUNT];
++			device->rxTail++;
++		}
++
++		if (!is_event(&message) && device->diagClass >= 0
++			&& (message.data[0] & 0x8f) == device->diagClass
++			&& message.size >= 3
++			&& message.data[2] == device->diagSubCommand) {
++			device->diagReply = message;
++			device->diagClass = -1;
++			release_sem(device->diagSem);
++		}
++
++		switch (message.data[0] & 0x8f) {
++			case NVEC_KB_EVT:
++				handle_key_event(device, &message);
++				break;
++
++			case NVEC_PS2_EVT:
++				for (uint32 i = 0; i < message.data[1]
++						&& i + 2 < message.size; i++) {
++					handle_mouse_byte(device, message.data[2 + i]);
++				}
++				break;
++
++			case NVEC_BAT:
++				handle_battery_message(device, &message);
++				break;
++
++			case NVEC_SYSTEM_EVT:
++				// the system status changed: c5 04 00 00 02 00 has the
++				// lid closed
++				if (message.size >= 6)
++					set_lid_closed(device, (message.data[4] & LID_SWITCH) != 0);
++				break;
++
++			case NVEC_SYS:
++				if (message.size >= 6 && message.data[2] == GET_SYSTEM_STATUS) {
++					device->acOnline = message_uint16(&message) != 0;
++					break;
++				}
++				break;
++
++			case NVEC_CNTL:
++				if (message.size >= 8 && message.data[2] == GET_FIRMWARE_VERSION) {
++					TRACE_ALWAYS("EC firmware version %02x.%02x.%02x / %02x\n",
++						message.data[4], message.data[5], message.data[6],
++						message.data[7]);
++					break;
++				}
++				// fall through
++
++			default:
++				break;
++		}
++	}
++	return B_OK;
++}
++
++
++static void
++start_ec(nvec_device* device)
++{
++	static const uint8 kGlobalEvents[] = { NVEC_SLEEP, GLOBAL_EVENTS, 1 };
++	static const uint8 kFirmwareVersion[] = { NVEC_CNTL,
++		GET_FIRMWARE_VERSION };
++	// the EC holds the speaker amplifier in shutdown (EC_MUTE#) until it is
++	// told otherwise; Linux sends the same OEM request ("unmute speakers?")
++	static const uint8 kUnmuteSpeakers[] = { NVEC_OEM0, 0x10, 0x59, 0x95 };
++	static const uint8 kKeyboardEnable[] = { NVEC_KBD, KBD_ENABLE };
++	static const uint8 kKeyboardWake[] = { NVEC_KBD, KBD_CNFG_WAKE, 1, 1 };
++	static const uint8 kKeyboardWakeKeys[] = { NVEC_KBD,
++		KBD_CNFG_WAKE_KEY_REPORTING, 1 };
++	static const uint8 kKeyboardLEDs[] = { NVEC_KBD, KBD_SET_LEDS, 0 };
++	// touchpad: the EC keeps its state while the machine is off. Stop it
++	// streaming, reset it (answers fa aa 00), set the default (3 byte packet)
++	// mode and enable it, then have the EC stream its bytes to us: streaming
++	// first left it silent after a warm boot.
++	static const uint8 kMouseStopStream[] = { NVEC_PS2,
++		PS2_CANCEL_AUTO_RECEIVE };
++	static const uint8 kMouseStream[] = { NVEC_PS2, PS2_AUTO_RECEIVE_N, 6 };
++	static const uint8 kMouseReset[] = { NVEC_PS2, PS2_SEND_COMMAND, 0xff,
++		3 };
++
++	nvec_write(device, kGlobalEvents, sizeof(kGlobalEvents));
++	nvec_write(device, kFirmwareVersion, sizeof(kFirmwareVersion));
++	nvec_write(device, kUnmuteSpeakers, sizeof(kUnmuteSpeakers));
++
++	// lid switch and power button events; the mask bytes are system state
++	// 23-16, 31-24, 7-0, 15-8
++	uint32 mask = LID_SWITCH | PWR_BUTTON;
++	uint8 events[] = { NVEC_SYS, CNF_EVENT_REPORTING, 1,
++		(uint8)(mask >> 16), (uint8)(mask >> 24), (uint8)mask,
++		(uint8)(mask >> 8) };
++	nvec_write(device, events, sizeof(events));
++
++	nvec_write(device, kKeyboardEnable, sizeof(kKeyboardEnable));
++	nvec_write(device, kKeyboardWake, sizeof(kKeyboardWake));
++	nvec_write(device, kKeyboardWakeKeys, sizeof(kKeyboardWakeKeys));
++	nvec_write(device, kKeyboardLEDs, sizeof(kKeyboardLEDs));
++
++	nvec_write(device, kMouseStopStream, sizeof(kMouseStopStream));
++	nvec_write(device, kMouseReset, sizeof(kMouseReset));
++	nvec_write(device, kMouseDefaults, sizeof(kMouseDefaults));
++	nvec_write(device, kMouseEnable, sizeof(kMouseEnable));
++	nvec_write(device, kMouseStream, sizeof(kMouseStream));
++}
++
++
++/*!	Called by the kernel to switch the machine off. */
++static void
++nvec_power_off()
++{
++	nvec_device* device = sPowerOffDevice;
++	if (device == NULL)
++		return;
++
++	static const uint8 kNoEvents[] = { NVEC_SLEEP, GLOBAL_EVENTS, 0 };
++	static const uint8 kPowerDown[] = { NVEC_SLEEP, AP_PWR_DOWN };
++	// as Linux does: the EC keeps the touchpad's state while the machine is
++	// off
++	static const uint8 kMouseDisable[] = { NVEC_PS2, PS2_SEND_COMMAND, 0xf5,
++		1 };
++	static const uint8 kMouseStopStream[] = { NVEC_PS2,
++		PS2_CANCEL_AUTO_RECEIVE };
++	nvec_write(device, kMouseDisable, sizeof(kMouseDisable));
++	nvec_write(device, kMouseStopStream, sizeof(kMouseStopStream));
++	nvec_write(device, kNoEvents, sizeof(kNoEvents));
++	nvec_write(device, kPowerDown, sizeof(kPowerDown));
++
++	// the EC cuts the power some seconds after it has read the message
++	TRACE_ALWAYS("power off requested, waiting for the EC\n");
++}
++
++
++//	#pragma mark - device module API
++
++
++static status_t
++nvec_init_device(void* driverCookie, void** _cookie)
++{
++	*_cookie = driverCookie;
++	return B_OK;
++}
++
++
++static void
++nvec_uninit_device(void* cookie)
++{
++}
++
++
++static status_t
++nvec_open(void* cookie, const char* path, int openMode, void** _cookie)
++{
++	nvec_handle* handle = new(std::nothrow) nvec_handle;
++	if (handle == NULL)
++		return B_NO_MEMORY;
++
++	handle->device = (nvec_device*)cookie;
++	if (strstr(path, "keyboard") != NULL)
++		handle->kind = NVEC_KEYBOARD;
++	else if (strstr(path, "mouse") != NULL)
++		handle->kind = NVEC_MOUSE;
++	else if (strstr(path, "button") != NULL)
++		handle->kind = NVEC_POWER_BUTTON;
++	else if (strcmp(path, NVEC_DIAG_PATH) == 0)
++		handle->kind = NVEC_DIAG;
++	else
++		handle->kind = NVEC_BATTERY;
++	*_cookie = handle;
++	return B_OK;
++}
++
++
++static status_t
++nvec_close(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++nvec_free(void* cookie)
++{
++	delete (nvec_handle*)cookie;
++	return B_OK;
++}
++
++
++static status_t
++nvec_read(void* cookie, off_t position, void* buffer, size_t* _length)
++{
++	nvec_handle* handle = (nvec_handle*)cookie;
++	if (handle->kind != NVEC_POWER_BUTTON || *_length < 1) {
++		*_length = 0;
++		return B_NOT_ALLOWED;
++	}
++
++	// 1 if the button was pressed since the last read
++	nvec_device* device = handle->device;
++	MutexLocker locker(device->powerButtonLock);
++	uint8 pressed = device->powerButtonPressed;
++	device->powerButtonPressed = 0;
++	locker.Unlock();
++
++	if (!IS_USER_ADDRESS(buffer)
++		|| user_memcpy(buffer, &pressed, sizeof(pressed)) != B_OK) {
++		return B_BAD_ADDRESS;
++	}
++	*_length = 1;
++	return B_OK;
++}
++
++
++static status_t
++nvec_select(void* cookie, uint8 event, selectsync* sync)
++{
++	nvec_handle* handle = (nvec_handle*)cookie;
++	if (handle->kind != NVEC_POWER_BUTTON || event != B_SELECT_READ)
++		return B_BAD_VALUE;
++
++	nvec_device* device = handle->device;
++	MutexLocker locker(device->powerButtonLock);
++	status_t status = add_select_sync_pool_entry(
++		&device->powerButtonSelectPool, sync, event);
++	if (status == B_OK && device->powerButtonPressed != 0)
++		notify_select_event(sync, event);
++	return status;
++}
++
++
++static status_t
++nvec_deselect(void* cookie, uint8 event, selectsync* sync)
++{
++	nvec_handle* handle = (nvec_handle*)cookie;
++	if (handle->kind != NVEC_POWER_BUTTON || event != B_SELECT_READ)
++		return B_BAD_VALUE;
++
++	nvec_device* device = handle->device;
++	MutexLocker locker(device->powerButtonLock);
++	return remove_select_sync_pool_entry(&device->powerButtonSelectPool, sync,
++		event);
++}
++
++
++static status_t
++nvec_write_hook(void* cookie, off_t position, const void* buffer,
++	size_t* _length)
++{
++	*_length = 0;
++	return B_NOT_ALLOWED;
++}
++
++
++static status_t
++read_key(nvec_device* device, void* buffer)
++{
++	while (true) {
++		status_t status = acquire_sem_etc(device->keySem, 1,
++			B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT,
++			device->repeatKey != 0 ? device->currentRepeatDelay
++				: B_INFINITE_TIMEOUT);
++
++		raw_key_info info;
++		if (status == B_TIMED_OUT) {
++			// the EC does not repeat keys itself
++			if (device->repeatKey == 0)
++				continue;
++			info.timestamp = system_time();
++			info.keycode = device->repeatKey;
++			info.is_keydown = true;
++			device->currentRepeatDelay = device->repeatRate;
++		} else if (status != B_OK) {
++			return status;
++		} else {
++			InterruptsSpinLocker locker(device->keyLock);
++			if (device->keyTail == device->keyHead)
++				continue;
++			info = device->keys[device->keyTail % NVEC_KEY_COUNT];
++			device->keyTail++;
++			locker.Unlock();
++
++			if (info.is_keydown) {
++				device->repeatKey = info.keycode;
++				device->currentRepeatDelay = device->repeatDelay;
++			} else if (info.keycode == device->repeatKey)
++				device->repeatKey = 0;
++		}
++
++		if (!IS_USER_ADDRESS(buffer))
++			return B_BAD_ADDRESS;
++		return user_memcpy(buffer, &info, sizeof(info));
++	}
++}
++
++
++static status_t
++read_movement(nvec_device* device, void* buffer)
++{
++	while (true) {
++		status_t status = acquire_sem_etc(device->mouseSem, 1, B_CAN_INTERRUPT,
++			0);
++		if (status != B_OK)
++			return status;
++
++		InterruptsSpinLocker locker(device->mouseLock);
++		if (device->movementTail == device->movementHead)
++			continue;
++		mouse_movement movement
++			= device->movements[device->movementTail % NVEC_MOUSE_COUNT];
++		device->movementTail++;
++		locker.Unlock();
++
++		if (!IS_USER_ADDRESS(buffer))
++			return B_BAD_ADDRESS;
++		return user_memcpy(buffer, &movement, sizeof(movement));
++	}
++}
++
++
++/*!	Looks like an ACPI battery to PowerStatus. */
++/*!	Sends one request to the EC and waits for the reply with the same type
++	and sub-command.
++*/
++static status_t
++diag_request(nvec_device* device, void* buffer, size_t length)
++{
++	nvec_diag_request request;
++	if (length < sizeof(request) || !IS_USER_ADDRESS(buffer)
++		|| user_memcpy(&request, buffer, sizeof(request)) != B_OK) {
++		return B_BAD_ADDRESS;
++	}
++	if (request.size < 2 || request.size > sizeof(request.request))
++		return B_BAD_VALUE;
++
++	MutexLocker locker(device->diagLock);
++	while (acquire_sem_etc(device->diagSem, 1, B_RELATIVE_TIMEOUT, 0) == B_OK)
++		;
++	device->diagSubCommand = request.request[1];
++	device->diagClass = request.request[0];
++
++	status_t status = nvec_write(device, request.request, request.size);
++	if (status == B_OK) {
++		status = acquire_sem_etc(device->diagSem, 1, B_RELATIVE_TIMEOUT,
++			1000000);
++	}
++	device->diagClass = -1;
++	if (status != B_OK)
++		return status;
++
++	request.replySize = min_c(device->diagReply.size, sizeof(request.reply));
++	memcpy(request.reply, device->diagReply.data, request.replySize);
++	return user_memcpy(buffer, &request, sizeof(request));
++}
++
++
++static status_t
++battery_control(nvec_device* device, uint32 op, void* buffer)
++{
++	if (!IS_USER_ADDRESS(buffer))
++		return B_BAD_ADDRESS;
++
++	switch (op) {
++		case IDENTIFY_DEVICE:
++		{
++			uint32 magic = kMagicACPIBatteryID;
++			return user_memcpy(buffer, &magic, sizeof(magic));
++		}
++
++		case GET_BATTERY_INFO:
++		{
++			acpi_battery_info info = {};
++			InterruptsSpinLocker locker(device->batteryLock);
++			if (device->batteryPresent) {
++				info.state = device->batteryState;
++				if (device->critical != 0
++					&& device->remaining <= device->critical) {
++					info.state |= BATTERY_CRITICAL_STATE;
++				}
++				info.current_rate = device->current < 0 ? -device->current
++					: device->current;
++				// the EC reports the charge in percent more reliably
++				info.capacity = device->lastFull != 0
++					? device->lastFull * device->batteryPercent / 100
++					: device->remaining;
++				info.voltage = device->voltage;
++			}
++			locker.Unlock();
++			return user_memcpy(buffer, &info, sizeof(info));
++		}
++
++		case GET_EXTENDED_BATTERY_INFO:
++		{
++			acpi_extended_battery_info info = {};
++			InterruptsSpinLocker locker(device->batteryLock);
++			info.power_unit = ACPI_BATTERY_UNIT_MA;
++			info.design_capacity = device->design;
++			info.last_full_charge = device->lastFull != 0 ? device->lastFull
++				: device->design;
++			info.technology = 1;	// rechargeable
++			info.design_voltage = device->voltage;
++			info.design_capacity_warning = info.last_full_charge / 10;
++			info.design_capacity_low = device->critical;
++			info.capacity_granularity_1 = 1;
++			info.capacity_granularity_2 = 1;
++			strlcpy(info.model_number, device->model,
++				sizeof(info.model_number));
++			strlcpy(info.type, device->type, sizeof(info.type));
++			strlcpy(info.oem_info, device->manufacturer,
++				sizeof(info.oem_info));
++			info.revision = ACPI_BATTERY_REVISION_BIF;
++			locker.Unlock();
++			return user_memcpy(buffer, &info, sizeof(info));
++		}
++	}
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++static status_t
++nvec_control(void* cookie, uint32 op, void* buffer, size_t length)
++{
++	nvec_handle* handle = (nvec_handle*)cookie;
++	nvec_device* device = handle->device;
++
++	if (handle->kind == NVEC_BATTERY)
++		return battery_control(device, op, buffer);
++
++	if (handle->kind == NVEC_DIAG) {
++		if (op != NVEC_DIAG_REQUEST)
++			return B_DEV_INVALID_IOCTL;
++		return diag_request(device, buffer, length);
++	}
++
++	if (handle->kind == NVEC_KEYBOARD) {
++		switch (op) {
++			case KB_READ:
++				return read_key(device, buffer);
++
++			case KB_GET_KEYBOARD_ID:
++			{
++				uint16 id = 0xab83;
++				if (!IS_USER_ADDRESS(buffer))
++					return B_BAD_ADDRESS;
++				return user_memcpy(buffer, &id, sizeof(id));
++			}
++
++			case KB_SET_LEDS:
++			{
++				uint8 leds[3];
++				if (!IS_USER_ADDRESS(buffer)
++					|| user_memcpy(leds, buffer, sizeof(leds)) != B_OK) {
++					return B_BAD_ADDRESS;
++				}
++				// all three bits are needed for the caps lock LED to light
++				// up (as in Linux, a firmware bug?)
++				uint8 message[] = { NVEC_KBD, KBD_SET_LEDS,
++					(uint8)(leds[1] ? 7 : 0) };
++				return nvec_write(device, message, sizeof(message));
++			}
++
++			case KB_SET_KEY_REPEAT_RATE:
++			{
++				int32 rate;
++				if (!IS_USER_ADDRESS(buffer)
++					|| user_memcpy(&rate, buffer, sizeof(rate)) != B_OK) {
++					return B_BAD_ADDRESS;
++				}
++				if (rate <= 0 || rate > 1000000)
++					return B_BAD_VALUE;
++				device->repeatRate = 10000000 / rate;
++				return B_OK;
++			}
++
++			case KB_GET_KEY_REPEAT_RATE:
++			{
++				int32 rate = 10000000 / device->repeatRate;
++				if (!IS_USER_ADDRESS(buffer))
++					return B_BAD_ADDRESS;
++				return user_memcpy(buffer, &rate, sizeof(rate));
++			}
++
++			case KB_SET_KEY_REPEAT_DELAY:
++				if (!IS_USER_ADDRESS(buffer))
++					return B_BAD_ADDRESS;
++				return user_memcpy(&device->repeatDelay, buffer,
++					sizeof(bigtime_t));
++
++			case KB_GET_KEY_REPEAT_DELAY:
++				if (!IS_USER_ADDRESS(buffer))
++					return B_BAD_ADDRESS;
++				return user_memcpy(buffer, &device->repeatDelay,
++					sizeof(bigtime_t));
++
++			case KB_SET_CONTROL_ALT_DEL_TIMEOUT:
++			case KB_CANCEL_CONTROL_ALT_DEL:
++			case KB_DELAY_CONTROL_ALT_DEL:
++				return B_OK;
++		}
++		return B_DEV_INVALID_IOCTL;
++	}
++
++	switch (op) {
++		case MS_READ:
++			return read_movement(device, buffer);
++
++		case MS_NUM_EVENTS:
++		{
++			int32 count;
++			get_sem_count(device->mouseSem, &count);
++			return count;
++		}
++
++		case MS_SET_CLICKSPEED:
++			if (!IS_USER_ADDRESS(buffer))
++				return B_BAD_ADDRESS;
++			return user_memcpy(&device->clickSpeed, buffer,
++				sizeof(bigtime_t));
++	}
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++//	#pragma mark - driver module API
++
++
++static float
++nvec_supports_device(device_node* parent)
++{
++	const char* compatible;
++	if (gDeviceManager->get_attr_string(parent, "fdt/compatible", &compatible,
++			false) != B_OK || strcmp(compatible, "nvidia,nvec") != 0) {
++		return -1.0f;
++	}
++
++	return 0.8f;
++}
++
++
++static status_t
++nvec_register_device(device_node* parent)
++{
++	device_attr attrs[] = {
++		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
++			{ .string = "NVIDIA embedded controller" }},
++		{}
++	};
++
++	return gDeviceManager->register_node(parent, NVEC_DRIVER_MODULE_NAME,
++		attrs, NULL, NULL);
++}
++
++
++static uint32
++fdt_get_uint32(fdt_device_module_info* module, fdt_device* dev,
++	const char* name, uint32 index, uint32 defaultValue)
++{
++	int length;
++	const uint32* cells = (const uint32*)module->get_prop(dev, name, &length);
++	if (cells == NULL || length < (int)((index + 1) * sizeof(uint32)))
++		return defaultValue;
++	return B_BENDIAN_TO_HOST_INT32(cells[index]);
++}
++
++
++static status_t
++nvec_init_driver(device_node* node, void** _cookie)
++{
++	nvec_device* device = new(std::nothrow) nvec_device;
++	if (device == NULL)
++		return B_NO_MEMORY;
++	memset((void*)device, 0, sizeof(*device));
++	device->node = node;
++	device->lock = B_SPINLOCK_INITIALIZER;
++	device->keyLock = B_SPINLOCK_INITIALIZER;
++	device->mouseLock = B_SPINLOCK_INITIALIZER;
++	device->batteryLock = B_SPINLOCK_INITIALIZER;
++	mutex_init(&device->powerButtonLock, "nvec power button");
++	mutex_init(&device->diagLock, "nvec diag");
++	device->diagSem = -1;
++	device->diagClass = -1;
++	device->registersArea = device->gpioArea = device->pwmArea = -1;
++	device->rxSem = device->txSem = device->transferSem = device->keySem
++		= device->mouseSem = -1;
++	device->repeatDelay = 300000;
++	device->repeatRate = 35000;
++	device->clickSpeed = 500000;
++
++	status_t status;
++	{
++		device_node* parent = gDeviceManager->get_parent_node(node);
++		fdt_device_module_info* fdt;
++		fdt_device* fdtDevice;
++		status = gDeviceManager->get_driver(parent,
++			(driver_module_info**)&fdt, (void**)&fdtDevice);
++		gDeviceManager->put_node(parent);
++		if (status != B_OK)
++			goto err;
++
++		uint64 registers, length;
++		if (!fdt->get_reg(fdtDevice, 0, &registers, &length)
++			|| !fdt->get_interrupt(fdtDevice, 0, NULL, &device->irq)) {
++			status = B_BAD_DATA;
++			goto err;
++		}
++		// <phandle gpio flags>
++		device->requestGPIO = fdt_get_uint32(fdt, fdtDevice, "request-gpios",
++			1, 0xaa);
++		device->requestActiveLow = (fdt_get_uint32(fdt, fdtDevice,
++			"request-gpios", 2, 0) & 1) != 0;
++		device->slaveAddress = fdt_get_uint32(fdt, fdtDevice, "slave-addr", 0,
++			0x8a);
++
++		status = map_registers("nvec", registers, &device->registersArea,
++			&device->registers);
++		if (status != B_OK)
++			goto err;
++		TRACE_ALWAYS("controller at %#" B_PRIx64 ", IRQ %" B_PRIu64
++			", request GPIO %" B_PRIu32 ", address %#" B_PRIx32 "\n",
++			registers, device->irq, device->requestGPIO,
++			device->slaveAddress);
++	}
++
++	device->rxSem = create_sem(0, "nvec rx");
++	device->txSem = create_sem(0, "nvec tx");
++	device->transferSem = create_sem(0, "nvec transfer");
++	device->keySem = create_sem(0, "nvec keys");
++	device->mouseSem = create_sem(0, "nvec movements");
++	device->diagSem = create_sem(0, "nvec diag");
++	if (device->rxSem < B_OK || device->txSem < B_OK
++		|| device->transferSem < B_OK || device->keySem < B_OK
++		|| device->mouseSem < B_OK) {
++		status = B_NO_MORE_SEMS;
++		goto err;
++	}
++
++	status = setup_hardware(device);
++	if (status != B_OK)
++		goto err;
++	setup_backlight(device);
++
++	status = install_io_interrupt_handler(device->irq, nvec_interrupt, device,
++		0);
++	if (status != B_OK)
++		goto err;
++
++	device->rxThread = spawn_kernel_thread(rx_thread, "nvec rx",
++		B_URGENT_DISPLAY_PRIORITY, device);
++	device->txThread = spawn_kernel_thread(tx_thread, "nvec tx",
++		B_URGENT_DISPLAY_PRIORITY, device);
++	resume_thread(device->rxThread);
++	resume_thread(device->txThread);
++
++	start_ec(device);
++
++	device->pollThread = spawn_kernel_thread(poll_thread, "nvec poll",
++		B_LOW_PRIORITY, device);
++	resume_thread(device->pollThread);
++
++	sPowerOffDevice = device;
++	gArmPowerOffHook = &nvec_power_off;
++
++	*_cookie = device;
++	return B_OK;
++
++err:
++	TRACE_ALWAYS("init failed: %s\n", strerror(status));
++	mutex_destroy(&device->powerButtonLock);
++	mutex_destroy(&device->diagLock);
++	delete_sem(device->diagSem);
++	delete_sem(device->rxSem);
++	delete_sem(device->txSem);
++	delete_sem(device->transferSem);
++	delete_sem(device->keySem);
++	delete_sem(device->mouseSem);
++	delete_area(device->registersArea);
++	delete_area(device->gpioArea);
++	delete_area(device->pwmArea);
++	delete device;
++	return status;
++}
++
++
++static void
++nvec_uninit_driver(void* cookie)
++{
++	nvec_device* device = (nvec_device*)cookie;
++
++	gArmPowerOffHook = NULL;
++	sPowerOffDevice = NULL;
++
++	device->stopping = true;
++	remove_io_interrupt_handler(device->irq, nvec_interrupt, device);
++	mutex_destroy(&device->powerButtonLock);
++	delete_sem(device->rxSem);
++	delete_sem(device->txSem);
++	delete_sem(device->transferSem);
++	delete_sem(device->keySem);
++	delete_sem(device->mouseSem);
++	status_t result;
++	wait_for_thread(device->rxThread, &result);
++	wait_for_thread(device->txThread, &result);
++	wait_for_thread(device->pollThread, &result);
++	delete_area(device->registersArea);
++	delete_area(device->gpioArea);
++	delete_area(device->pwmArea);
++	delete device;
++}
++
++
++static status_t
++nvec_register_child_devices(void* cookie)
++{
++	nvec_device* device = (nvec_device*)cookie;
++
++	status_t status = gDeviceManager->publish_device(device->node,
++		"input/keyboard/nvec/0", NVEC_DEVICE_MODULE_NAME);
++	if (status == B_OK) {
++		status = gDeviceManager->publish_device(device->node,
++			"input/mouse/nvec/0", NVEC_DEVICE_MODULE_NAME);
++	}
++	if (status == B_OK) {
++		status = gDeviceManager->publish_device(device->node,
++			"power/nvec_battery/0", NVEC_DEVICE_MODULE_NAME);
++	}
++	if (status == B_OK) {
++		status = gDeviceManager->publish_device(device->node,
++			"power/button/power_nvec", NVEC_DEVICE_MODULE_NAME);
++	}
++	if (status == B_OK) {
++		gDeviceManager->publish_device(device->node, NVEC_DIAG_PATH,
++			NVEC_DEVICE_MODULE_NAME);
++	}
++	return status;
++}
++
++
++//	#pragma mark -
++
++
++module_dependency module_dependencies[] = {
++	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&gDeviceManager },
++	{}
++};
++
++
++static struct device_module_info sNvecDevice = {
++	{
++		NVEC_DEVICE_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	nvec_init_device,
++	nvec_uninit_device,
++	NULL,	// device_removed
++
++	nvec_open,
++	nvec_close,
++	nvec_free,
++	nvec_read,
++	nvec_write_hook,
++	NULL,	// io
++	nvec_control,
++	nvec_select,
++	nvec_deselect,
++};
++
++
++static struct driver_module_info sNvecDriver = {
++	{
++		NVEC_DRIVER_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	nvec_supports_device,
++	nvec_register_device,
++	nvec_init_driver,
++	nvec_uninit_driver,
++	nvec_register_child_devices,
++	NULL,	// rescan
++	NULL,	// device_removed
++};
++
++
++module_info* modules[] = {
++	(module_info*)&sNvecDriver,
++	(module_info*)&sNvecDevice,
++	NULL
++};
+-- 
+2.39.5
+

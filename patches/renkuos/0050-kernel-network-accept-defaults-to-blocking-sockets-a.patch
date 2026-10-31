@@ -1,0 +1,89 @@
+From 30058b58a6bdf1303c50c94a5544a3769ce8c958 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 27 Oct 2026 07:20:30 +0100
+Subject: [PATCH 50/63] kernel/network: accept() defaults to blocking sockets,
+ accept4() honors SOCK_NONBLOCK
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/system/kernel/fs/socket.cpp  | 14 +++++---------
+ src/system/libnetwork/socket.cpp | 25 ++++++++++++++++---------
+ 2 files changed, 21 insertions(+), 18 deletions(-)
+
+diff --git a/src/system/kernel/fs/socket.cpp b/src/system/kernel/fs/socket.cpp
+index 7f88705e52..14b1fa1c8d 100644
+--- a/src/system/kernel/fs/socket.cpp
++++ b/src/system/kernel/fs/socket.cpp
+@@ -386,21 +386,17 @@ get_socket_descriptor(int fd, bool kernel, file_descriptor*& descriptor)
+ static int
+ create_socket_fd(net_socket* socket, int flags, bool kernel)
+ {
+-	// Get the socket's non-blocking flag, so we can set the respective
+-	// open mode flag.
+-	int32 nonBlock;
+-	socklen_t nonBlockLen = sizeof(int32);
+-	status_t error = sStackInterface->getsockopt(socket, SOL_SOCKET,
+-		SO_NONBLOCK, &nonBlock, &nonBlockLen);
+-	if (error != B_OK)
+-		return error;
+ 	int oflags = 0;
++	int32 nonBlock = 0;
+ 	if ((flags & SOCK_CLOEXEC) != 0)
+ 		oflags |= O_CLOEXEC;
+ 	if ((flags & SOCK_CLOFORK) != 0)
+ 		oflags |= O_CLOFORK;
+-	if ((flags & SOCK_NONBLOCK) != 0 || nonBlock)
++	if ((flags & SOCK_NONBLOCK) != 0) {
+ 		oflags |= O_NONBLOCK;
++		nonBlock = 1;
++	}
++	sStackInterface->setsockopt(socket, SOL_SOCKET, SO_NONBLOCK, &nonBlock, sizeof(nonBlock));
+ 
+ 	// allocate a file descriptor
+ 	file_descriptor* descriptor = alloc_fd();
+diff --git a/src/system/libnetwork/socket.cpp b/src/system/libnetwork/socket.cpp
+index dfc8184346..44d33a042e 100644
+--- a/src/system/libnetwork/socket.cpp
++++ b/src/system/libnetwork/socket.cpp
+@@ -189,15 +189,8 @@ listen(int socket, int backlog)
+ }
+ 
+ 
+-extern "C" int
+-accept(int socket, struct sockaddr *_address, socklen_t *_addressLength)
+-{
+-	return accept4(socket, _address, _addressLength, 0);
+-}
+-
+-
+-extern "C" int
+-accept4(int socket, struct sockaddr *_address, socklen_t *_addressLength, int flags)
++static int
++_accept(int socket, struct sockaddr *_address, socklen_t *_addressLength, int flags)
+ {
+ 	bool r5compatible = check_r5_compatibility();
+ 	struct sockaddr haikuAddr;
+@@ -233,6 +226,20 @@ accept4(int socket, struct sockaddr *_address, socklen_t *_addressLength, int fl
+ }
+ 
+ 
++extern "C" int
++accept(int socket, struct sockaddr *_address, socklen_t *_addressLength)
++{
++	return _accept(socket, _address, _addressLength, 0);
++}
++
++
++extern "C" int
++accept4(int socket, struct sockaddr *_address, socklen_t *_addressLength, int flags)
++{
++	return _accept(socket, _address, _addressLength, flags);
++}
++
++
+ extern "C" ssize_t
+ recv(int socket, void *data, size_t length, int flags)
+ {
+-- 
+2.39.5
+

@@ -1,0 +1,35 @@
+From 27388b1f5b6ae0e77cf80a6714783ee13b971287 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sat, 31 Oct 2026 00:08:48 +0100
+Subject: [PATCH 2/2] paz00: add a boot menu
+
+Booting the SD card first and then the eMMC, booting one of them, or
+showing one of them as a USB disk, with the internal keyboard.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ board/compal/paz00/paz00.env | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+ create mode 100644 board/compal/paz00/paz00.env
+
+diff --git a/board/compal/paz00/paz00.env b/board/compal/paz00/paz00.env
+new file mode 100644
+index 00000000..69a19324
+--- /dev/null
++++ b/board/compal/paz00/paz00.env
+@@ -0,0 +1,12 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Boot menu of the Toshiba AC100, shown instead of the boot delay
++ * (AUTOBOOT_MENU_SHOW); the first entry runs when nobody chooses.
++ */
++
++bootmenu_0=Boot (SD card if present, then internal eMMC)=run bootcmd
++bootmenu_1=Boot from SD card=mmc dev 1 && setenv boot_targets mmc1 && bootflow scan
++bootmenu_2=Boot from internal eMMC=mmc dev 0; setenv boot_targets mmc0; bootflow scan
++bootmenu_3=Internal eMMC as USB disk (any key to stop)=ums 0 mmc 0
++bootmenu_4=SD card as USB disk (any key to stop)=ums 0 mmc 1
++bootmenu_5=Reboot=reset
+-- 
+2.39.5
+

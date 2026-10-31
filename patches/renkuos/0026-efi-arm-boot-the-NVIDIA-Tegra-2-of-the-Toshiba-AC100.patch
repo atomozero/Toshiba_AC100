@@ -1,0 +1,1354 @@
+From de16088cd3fd133deb915d3e1e9f454362928cca Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 27 Oct 2026 07:20:22 +0100
+Subject: [PATCH 26/63] efi/arm: boot the NVIDIA Tegra 2 of the Toshiba AC100
+
+- translate device tree addresses through all parent buses
+- keep the frame buffer out of the kernel's free memory
+- let a Cortex-A9 MPCore take part in coherency
+- stop the Tegra20 USB controllers the firmware left running
+- switch the radios of rfkill-gpio nodes on, and the AC100 wireless
+  module, which has no rfkill node
+- pass the Tegra PMC, RTC, DVC I2C, PL310 and private timer to the kernel
+- start the other CPUs through PSCI, or through the flow controller of
+  the Tegra 2, and hand them over to the kernel
+- find the boot partitions of a disk with only the backup GPT
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../kernel/arch/arm/arch_kernel_args.h        |  11 +
+ .../kernel/boot/platform/efi/arch_smp.h       |   8 +-
+ headers/private/kernel/boot/timer.h           |   2 +
+ .../partitioning_systems/gpt/Header.cpp       |  39 ++-
+ .../kernel/partitioning_systems/gpt/Header.h  |   5 +
+ .../boot/platform/efi/arch/arm/arch_dtb.cpp   | 274 +++++++++++++++++-
+ .../platform/efi/arch/arm/arch_enter_kernel.h |  19 ++
+ .../boot/platform/efi/arch/arm/arch_mmu.cpp   |  24 +-
+ .../boot/platform/efi/arch/arm/arch_smp.cpp   | 242 +++++++++++++++-
+ .../boot/platform/efi/arch/arm/arch_start.cpp |  11 +-
+ src/system/boot/platform/efi/arch/arm/entry.S | 146 +++++++++-
+ src/system/boot/platform/efi/devices.cpp      |  17 +-
+ src/system/boot/platform/efi/dtb.cpp          | 101 ++++---
+ 13 files changed, 821 insertions(+), 78 deletions(-)
+ create mode 100644 src/system/boot/platform/efi/arch/arm/arch_enter_kernel.h
+
+diff --git a/headers/private/kernel/arch/arm/arch_kernel_args.h b/headers/private/kernel/arch/arm/arch_kernel_args.h
+index 32297eb54d..b956dc5a53 100644
+--- a/headers/private/kernel/arch/arm/arch_kernel_args.h
++++ b/headers/private/kernel/arch/arm/arch_kernel_args.h
+@@ -40,6 +40,17 @@ typedef struct {
+ 	uart_info			uart;
+ 	intc_info			interrupt_controller;
+ 	boot_timer_info		timer;
++	uint32				timerFrequency;	// in Hz, if the timer needs it
++	uint32				reserved[8];	// unused, keeps the layout
++	addr_range			pmc;	// NVIDIA Tegra power management controller
++	addr_range			rtc;	// NVIDIA Tegra real time clock
++	addr_range			pmicI2C;	// NVIDIA Tegra DVC I2C controller (PMIC)
++	addr_range			twd;	// Cortex-A9 private timer, when another one is
++								// chosen (per CPU events of a multiprocessor)
++	uint32				twdInterrupt;
++	addr_range			l2Cache;	// PL310 outer cache controller
++	uint32				l2TagLatency;	// as in its latency registers, 0 if
++	uint32				l2DataLatency;	// the device tree does not say
+ } _PACKED arch_kernel_args;
+ 
+ #endif	/* KERNEL_ARCH_ARM_KERNEL_ARGS_H */
+diff --git a/headers/private/kernel/boot/platform/efi/arch_smp.h b/headers/private/kernel/boot/platform/efi/arch_smp.h
+index 4045570e39..deb3957805 100644
+--- a/headers/private/kernel/boot/platform/efi/arch_smp.h
++++ b/headers/private/kernel/boot/platform/efi/arch_smp.h
+@@ -21,10 +21,16 @@ void arch_smp_register_cpu(platform_cpu_info** cpu);
+ platform_cpu_info* arch_smp_find_cpu(uint32 phandle);
+ #elif defined(__ARM__)
+ struct platform_cpu_info {
+-	uint32 id;
++	uint32 id;		// MPIDR affinity, from the device tree
++	bool psci;		// enable-method = "psci"
+ };
+ 
+ void arch_smp_register_cpu(platform_cpu_info** cpu);
++void arch_smp_set_psci_method(const char* method);
++void arch_smp_set_tegra20(addr_t flowController);
++uint32 arch_smp_start_other_cpus(void* trampolinePage, uint32 ttbr,
++	addr_t kernelEntry, addr_t virtKernelArgs);
++void arch_smp_release_other_cpus(void* trampolinePage);
+ #elif defined(__aarch64__)
+ struct platform_cpu_info {
+ 	uint32 id;
+diff --git a/headers/private/kernel/boot/timer.h b/headers/private/kernel/boot/timer.h
+index b98d36d6f2..97893c7d88 100644
+--- a/headers/private/kernel/boot/timer.h
++++ b/headers/private/kernel/boot/timer.h
+@@ -13,6 +13,8 @@
+ #define		TIMER_KIND_ARMV7	"armv7"
+ #define		TIMER_KIND_OMAP3	"omap3"
+ #define		TIMER_KIND_PXA		"pxa"
++#define		TIMER_KIND_TEGRA	"tegra20"
++#define		TIMER_KIND_A9_TWD	"a9twd"
+ 
+ 
+ typedef struct {
+diff --git a/src/add-ons/kernel/partitioning_systems/gpt/Header.cpp b/src/add-ons/kernel/partitioning_systems/gpt/Header.cpp
+index cd0c2e6c3a..c9a05da5df 100644
+--- a/src/add-ons/kernel/partitioning_systems/gpt/Header.cpp
++++ b/src/add-ons/kernel/partitioning_systems/gpt/Header.cpp
+@@ -52,7 +52,8 @@ Header::Header(int fd, uint64 lastBlock, uint32 blockSize)
+ 	fBlockSize(blockSize),
+ 	fStatus(B_NO_INIT),
+ 	fEntries(NULL),
+-	fDirty(false)
++	fDirty(false),
++	fBackupOnly(false)
+ {
+ 	// TODO: check the correctness of the protective MBR and warn if invalid
+ 
+@@ -84,12 +85,18 @@ Header::Header(int fd, uint64 lastBlock, uint32 blockSize)
+ 		return;
+ 
+ 	if (fStatus != B_OK) {
+-		// Recreate primary header from the backup
++		// Use the backup table, and keep it the only one: on some machines
++		// the start of the disk belongs to something else (on NVIDIA Tegra
++		// systems, what the chip boots from), and a GPT is only kept at the
++		// end of the disk. So the primary header is never written back.
+ 		fHeader = fBackupHeader;
+ 		fHeader.SetAbsoluteBlock(EFI_HEADER_LOCATION);
+ 		fHeader.SetEntriesBlock(EFI_PARTITION_ENTRIES_BLOCK);
+ 		fHeader.SetAlternateBlock(lastBlock);
+ 		fDirty = true;
++		fBackupOnly = true;
++		dprintf("gpt: only the backup table at block %" B_PRIu64 " is valid, "
++			"the start of the disk will not be written\n", lastBlock);
+ 	} else if (status != B_OK) {
+ 		// Recreate backup header from primary
+ 		_SetBackupHeaderFromPrimary(lastBlock);
+@@ -138,7 +145,8 @@ Header::Header(uint64 lastBlock, uint32 blockSize)
+ 	fBlockSize(blockSize),
+ 	fStatus(B_NO_INIT),
+ 	fEntries(NULL),
+-	fDirty(true)
++	fDirty(true),
++	fBackupOnly(false)
+ {
+ 	TRACE(("EFI::Header: Initialize GPT, block size %" B_PRIu32 "\n",
+ 		blockSize));
+@@ -210,11 +218,13 @@ Header::WriteEntry(int fd, uint32 entryIndex)
+ {
+ 	off_t entryOffset = entryIndex * fHeader.EntrySize();
+ 
+-	status_t status = _Write(fd,
+-		fHeader.EntriesBlock() * fBlockSize + entryOffset,
+-		fEntries + entryOffset, fHeader.EntrySize());
+-	if (status != B_OK)
+-		return status;
++	status_t status = B_OK;
++	if (!fBackupOnly) {
++		status = _Write(fd, fHeader.EntriesBlock() * fBlockSize + entryOffset,
++			fEntries + entryOffset, fHeader.EntrySize());
++		if (status != B_OK)
++			return status;
++	}
+ 
+ 	// Update header, too -- the entries CRC changed
+ 	status = _WriteHeader(fd);
+@@ -233,6 +243,9 @@ Header::WriteEntry(int fd, uint32 entryIndex)
+ status_t
+ Header::Write(int fd)
+ {
++	if (fBackupOnly)
++		return B_NOT_ALLOWED;
++
+ 	// Try to write the protective MBR
+ 	PartitionMap partitionMap;
+ 	PrimaryPartition *partition = NULL;
+@@ -277,10 +290,12 @@ Header::_WriteHeader(int fd)
+ {
+ 	_UpdateCRC();
+ 
+-	status_t status = _Write(fd, fHeader.AbsoluteBlock() * fBlockSize,
+-		&fHeader, sizeof(gpt_table_header));
+-	if (status != B_OK)
+-		return status;
++	if (!fBackupOnly) {
++		status_t status = _Write(fd, fHeader.AbsoluteBlock() * fBlockSize,
++			&fHeader, sizeof(gpt_table_header));
++		if (status != B_OK)
++			return status;
++	}
+ 
+ 	return _Write(fd, fBackupHeader.AbsoluteBlock() * fBlockSize,
+ 		&fBackupHeader, sizeof(gpt_table_header));
+diff --git a/src/add-ons/kernel/partitioning_systems/gpt/Header.h b/src/add-ons/kernel/partitioning_systems/gpt/Header.h
+index eee0c153e5..4e5d9937be 100644
+--- a/src/add-ons/kernel/partitioning_systems/gpt/Header.h
++++ b/src/add-ons/kernel/partitioning_systems/gpt/Header.h
+@@ -26,6 +26,8 @@ public:
+ 
+ 			status_t			InitCheck() const;
+ 			bool				IsDirty() const;
++			bool				IsBackupOnly() const
++									{ return fBackupOnly; }
+ 
+ 			uint64				FirstUsableBlock() const
+ 									{ return fHeader.FirstUsableBlock(); }
+@@ -76,6 +78,9 @@ private:
+ 			gpt_table_header	fBackupHeader;
+ 			uint8*				fEntries;
+ 			bool				fDirty;
++			bool				fBackupOnly;
++				// only the backup table is valid: the start of the disk
++				// holds something else and is never written
+ };
+ 
+ 
+diff --git a/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp b/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp
+index e1f076fad5..b8a7f57082 100644
+--- a/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp
++++ b/src/system/boot/platform/efi/arch/arm/arch_dtb.cpp
+@@ -17,6 +17,7 @@ extern "C" {
+ }
+ 
+ #include "dtb.h"
++#include "efi_platform.h"
+ 
+ 
+ const struct supported_interrupt_controllers {
+@@ -39,9 +40,57 @@ const struct supported_timers {
+ 	{ "arm,armv7-timer",	TIMER_KIND_ARMV7 },
+ 	{ "ti,omap3430-timer",	TIMER_KIND_OMAP3 },
+ 	{ "marvell,pxa-timers",	TIMER_KIND_PXA },
++	{ "nvidia,tegra20-timer",	TIMER_KIND_TEGRA },
+ };
+ 
+ 
++// The Cortex-A9 private timer (TWD) exists on every Cortex-A9 MPCore, but is
++// only used when the device tree offers no better (SoC specific) timer.
++static addr_range sTWDRegs;
++static uint32 sTWDInterrupt;
++static bool sHasTWD = false;
++
++// the outer cache controller, if any
++static addr_range sL2Regs;
++
++// Tegra20 USB controllers and the clock and reset controller, to stop any
++// controller the firmware left running before the kernel takes over memory
++static addr_range sTegraUSBRegs[3];
++static uint32 sTegraUSBCount;
++static addr_range sTegraCARRegs;
++static addr_range sTegraGPIORegs;
++// GPIOs to drive active to switch a radio on (Tegra GPIO number, active low)
++static struct {
++	uint32 pin;
++	bool activeLow;
++} sRadioGPIOs[4];
++static uint32 sRadioGPIOCount;
++static bool sIsAC100;
++
++
++/*!	The TWD runs at PERIPHCLK, whose rate the device tree usually doesn't
++	describe, so measure it against the firmware's Stall().
++*/
++static uint32
++calibrate_twd(addr_t base)
++{
++	enum { kLoad = 0, kCounter = 1, kControl = 2, kInterruptStatus = 3 };
++	volatile uint32* twd = (volatile uint32*)base;
++	const uint32 kCalibrationTime = 10000; // µs
++
++	twd[kControl] = 0;
++	twd[kLoad] = 0xffffffff;
++	twd[kControl] = 1; // enabled, single shot, no interrupt, prescaler 0
++	uint32 start = twd[kCounter];
++	kBootServices->Stall(kCalibrationTime);
++	uint32 end = twd[kCounter];
++	twd[kControl] = 0;
++	twd[kInterruptStatus] = 1;
++
++	return (uint32)((uint64)(start - end) * 1000000 / kCalibrationTime);
++}
++
++
+ void
+ arch_handle_fdt(const void* fdt, int node)
+ {
+@@ -56,8 +105,13 @@ arch_handle_fdt(const void* fdt, int node)
+ 				return;
+ 			info->id = fdt32_to_cpu(*(uint32*)fdt_getprop(fdt, node,
+ 				"reg", NULL));
++			const char* enableMethod = (const char*)fdt_getprop(fdt, node,
++				"enable-method", NULL);
++			info->psci = enableMethod != NULL
++				&& strcmp(enableMethod, "psci") == 0;
+ 			dprintf("cpu\n");
+-			dprintf("  id: %" B_PRIu32 "\n", info->id);
++			dprintf("  id: %" B_PRIu32 "%s\n", info->id,
++				info->psci ? ", PSCI" : "");
+ 
+ 		}
+ 	}
+@@ -69,6 +123,15 @@ arch_handle_fdt(const void* fdt, int node)
+ 	if (compatible == NULL)
+ 		return;
+ 
++	if (dtb_has_fdt_string(compatible, compatibleLen, "arm,psci")
++		|| dtb_has_fdt_string(compatible, compatibleLen, "arm,psci-0.2")
++		|| dtb_has_fdt_string(compatible, compatibleLen, "arm,psci-1.0")) {
++		const char* method = (const char*)fdt_getprop(fdt, node, "method",
++			NULL);
++		if (method != NULL)
++			arch_smp_set_psci_method(method);
++	}
++
+ 	intc_info &interrupt_controller = gKernelArgs.arch_args.interrupt_controller;
+ 	if (interrupt_controller.kind[0] == 0) {
+ 		for (uint32 i = 0; i < B_COUNT_OF(kSupportedInterruptControllers); i++) {
+@@ -84,6 +147,99 @@ arch_handle_fdt(const void* fdt, int node)
+ 		}
+ 	}
+ 
++	if (!sHasTWD && dtb_has_fdt_string(compatible, compatibleLen,
++			"arm,cortex-a9-twd-timer")) {
++		dtb_get_reg(fdt, node, 0, sTWDRegs);
++		sTWDInterrupt = dtb_get_interrupt(fdt, node);
++		sHasTWD = true;
++	}
++
++	if (sTegraUSBCount < B_COUNT_OF(sTegraUSBRegs)
++		&& dtb_has_fdt_string(compatible, compatibleLen, "nvidia,tegra20-ehci")) {
++		dtb_get_reg(fdt, node, 0, sTegraUSBRegs[sTegraUSBCount++]);
++	}
++	if (sTegraCARRegs.start == 0
++		&& dtb_has_fdt_string(compatible, compatibleLen, "nvidia,tegra20-car")) {
++		dtb_get_reg(fdt, node, 0, sTegraCARRegs);
++	}
++	// the second CPU of a Tegra 2 is started through it and the clock and
++	// reset controller
++	if (dtb_has_fdt_string(compatible, compatibleLen, "nvidia,tegra20-flowctrl")) {
++		addr_range flow;
++		dtb_get_reg(fdt, node, 0, flow);
++		arch_smp_set_tegra20((addr_t)flow.start);
++	}
++	if (sTegraGPIORegs.start == 0
++		&& dtb_has_fdt_string(compatible, compatibleLen, "nvidia,tegra20-gpio")) {
++		dtb_get_reg(fdt, node, 0, sTegraGPIORegs);
++	}
++	// U-Boot's own device tree of the Toshiba AC100 has no rfkill node: use
++	// the GPIOs of Linux' one (reset PD1, shutdown PK5, both active high)
++	if (dtb_has_fdt_string(compatible, compatibleLen, "compal,paz00"))
++		sIsAC100 = true;
++
++	// the wireless module stays in reset and powered down until its reset
++	// and shutdown GPIOs are driven active (cells: controller, pin, flags)
++	if (dtb_has_fdt_string(compatible, compatibleLen, "rfkill-gpio")) {
++		static const char* const kProperties[] = { "reset-gpios",
++			"shutdown-gpios" };
++		for (uint32 i = 0; i < B_COUNT_OF(kProperties); i++) {
++			int length;
++			const uint32* cells = (const uint32*)fdt_getprop(fdt, node,
++				kProperties[i], &length);
++			if (cells == NULL || length < 12
++				|| sRadioGPIOCount >= B_COUNT_OF(sRadioGPIOs)) {
++				continue;
++			}
++			sRadioGPIOs[sRadioGPIOCount].pin = fdt32_to_cpu(cells[1]);
++			sRadioGPIOs[sRadioGPIOCount].activeLow
++				= (fdt32_to_cpu(cells[2]) & 1) != 0;
++			sRadioGPIOCount++;
++		}
++	}
++
++	// the kernel resets the machine through it
++	if (gKernelArgs.arch_args.pmc.start == 0
++		&& dtb_has_fdt_string(compatible, compatibleLen, "nvidia,tegra20-pmc")) {
++		dtb_get_reg(fdt, node, 0, gKernelArgs.arch_args.pmc);
++	}
++	if (gKernelArgs.arch_args.rtc.start == 0
++		&& dtb_has_fdt_string(compatible, compatibleLen, "nvidia,tegra20-rtc")) {
++		dtb_get_reg(fdt, node, 0, gKernelArgs.arch_args.rtc);
++	}
++	// the power management IC behind it has the battery backed clock
++	if (gKernelArgs.arch_args.pmicI2C.start == 0
++		&& dtb_has_fdt_string(compatible, compatibleLen,
++			"nvidia,tegra20-i2c-dvc")) {
++		dtb_get_reg(fdt, node, 0, gKernelArgs.arch_args.pmicI2C);
++	}
++
++	if (sL2Regs.start == 0 && dtb_has_fdt_string(compatible, compatibleLen,
++			"arm,pl310-cache")) {
++		dtb_get_reg(fdt, node, 0, sL2Regs);
++		gKernelArgs.arch_args.l2Cache = sL2Regs;
++
++		// <read write setup> cycles, as the latency registers want them
++		static const char* const kLatencies[] = { "arm,tag-latency",
++			"arm,data-latency" };
++		uint32* registers[] = { &gKernelArgs.arch_args.l2TagLatency,
++			&gKernelArgs.arch_args.l2DataLatency };
++		for (uint32 i = 0; i < 2; i++) {
++			int length;
++			const uint32* cells = (const uint32*)fdt_getprop(fdt, node,
++				kLatencies[i], &length);
++			if (cells == NULL || length < 12)
++				continue;
++			uint32 read = fdt32_to_cpu(cells[0]);
++			uint32 write = fdt32_to_cpu(cells[1]);
++			uint32 setup = fdt32_to_cpu(cells[2]);
++			if (read == 0 || write == 0 || setup == 0)
++				continue;
++			*registers[i] = ((setup - 1) & 7) | (((read - 1) & 7) << 4)
++				| (((write - 1) & 7) << 8);
++		}
++	}
++
+ 	boot_timer_info &timer = gKernelArgs.arch_args.timer;
+ 	if (timer.kind[0] == 0) {
+ 		for (uint32 i = 0; i < B_COUNT_OF(kSupportedTimers); i++) {
+@@ -101,9 +257,106 @@ arch_handle_fdt(const void* fdt, int node)
+ }
+ 
+ 
++/*!	Stops the Tegra20 USB controllers the firmware left running: an active
++	controller keeps writing transfer descriptors into memory the kernel will
++	reuse. Must be called while the boot services are still available.
++*/
++void
++arch_quiesce_usb(void)
++{
++	// clock enable bit / reset bit per controller (USBD, USB2, USB3)
++	static const struct {
++		uint32 base;
++		uint32 enableRegister;
++		uint32 resetRegister;
++		uint32 bit;
++	} kClocks[] = {
++		{ 0xc5000000, 0x10, 0x04, 22 },
++		{ 0xc5004000, 0x14, 0x08, 26 },
++		{ 0xc5008000, 0x14, 0x08, 27 },
++	};
++
++	if (sTegraCARRegs.start == 0)
++		return;
++
++	for (uint32 i = 0; i < sTegraUSBCount; i++) {
++		addr_t base = (addr_t)sTegraUSBRegs[i].start;
++		uint32 slot = 3;
++		for (uint32 j = 0; j < B_COUNT_OF(kClocks); j++) {
++			if (kClocks[j].base == base)
++				slot = j;
++		}
++		if (slot == 3)
++			continue;
++
++		addr_t car = (addr_t)sTegraCARRegs.start;
++		uint32 enabled = *(volatile uint32*)(car + kClocks[slot].enableRegister);
++		uint32 reset = *(volatile uint32*)(car + kClocks[slot].resetRegister);
++		uint32 mask = 1U << kClocks[slot].bit;
++		if ((enabled & mask) == 0 || (reset & mask) != 0) {
++			dprintf("USB %#lx: clock off or in reset\n", base);
++			continue;
++		}
++
++		addr_t capabilities = base + 0x100;
++		addr_t operational = capabilities
++			+ (*(volatile uint32*)capabilities & 0xff);
++		volatile uint32* command = (volatile uint32*)operational;
++		volatile uint32* status = (volatile uint32*)(operational + 4);
++		uint32 mode = *(volatile uint32*)(operational + 0x68) & 3;
++		dprintf("USB %#lx: USBCMD %#" B_PRIx32 ", USBSTS %#" B_PRIx32
++			", mode %" B_PRIu32 "\n", base, *command, *status, mode);
++
++		// stop the schedules, then the controller
++		*command &= ~0x30U;
++		for (int k = 0; k < 100 && (*status & 0xc000) != 0; k++)
++			kBootServices->Stall(20);
++		*command &= ~1U;
++		for (int k = 0; k < 100 && (*status & 0x1000) == 0; k++)
++			kBootServices->Stall(20);
++		dprintf("USB %#lx: stopped, USBSTS %#" B_PRIx32 "\n", base, *status);
++	}
++}
++
++
++/*!	Switches the radios of rfkill-gpio nodes on, as Linux does when they are
++	not blocked: drives their GPIOs active, as outputs in GPIO mode.
++*/
++static void
++enable_radio_gpios(void)
++{
++	if (sTegraGPIORegs.start == 0)
++		return;
++
++	if (sRadioGPIOCount == 0 && sIsAC100) {
++		sRadioGPIOs[0].pin = 25;
++		sRadioGPIOs[0].activeLow = false;
++		sRadioGPIOs[1].pin = 85;
++		sRadioGPIOs[1].activeLow = false;
++		sRadioGPIOCount = 2;
++	}
++
++	for (uint32 i = 0; i < sRadioGPIOCount; i++) {
++		uint32 pin = sRadioGPIOs[i].pin;
++		// 32 GPIOs per bank, 8 per port; the masked registers at 0x800 take
++		// the bits to change in their upper byte
++		addr_t port = (addr_t)sTegraGPIORegs.start + (pin / 32) * 0x80
++			+ ((pin % 32) / 8) * 4;
++		uint32 bit = 1U << (pin % 8);
++		uint32 value = sRadioGPIOs[i].activeLow ? 0 : bit;
++		*(volatile uint32*)(port + 0x820) = (bit << 8) | value;	// output
++		*(volatile uint32*)(port + 0x810) = (bit << 8) | bit;	// enable
++		*(volatile uint32*)(port + 0x800) = (bit << 8) | bit;	// GPIO mode
++		dprintf("radio: GPIO %" B_PRIu32 " set %s\n", pin,
++			value != 0 ? "high" : "low");
++	}
++}
++
++
+ void
+ arch_dtb_set_kernel_args(void)
+ {
++	enable_radio_gpios();
+ 	intc_info &interrupt_controller = gKernelArgs.arch_args.interrupt_controller;
+ 	dprintf("Chosen interrupt controller:\n");
+ 	if (interrupt_controller.kind[0] == 0) {
+@@ -119,6 +372,21 @@ arch_dtb_set_kernel_args(void)
+ 	}
+ 
+ 	boot_timer_info &timer = gKernelArgs.arch_args.timer;
++	if (timer.kind[0] == 0 && sHasTWD) {
++		strlcpy(timer.kind, TIMER_KIND_A9_TWD, sizeof(timer.kind));
++		timer.regs = sTWDRegs;
++		timer.interrupt = sTWDInterrupt;
++		gKernelArgs.arch_args.timerFrequency = calibrate_twd(sTWDRegs.start);
++	} else if (sHasTWD) {
++		// the private timers give each CPU of a multiprocessor its own events
++		gKernelArgs.arch_args.twd = sTWDRegs;
++		gKernelArgs.arch_args.twdInterrupt = sTWDInterrupt;
++		gKernelArgs.arch_args.timerFrequency = calibrate_twd(sTWDRegs.start);
++		dprintf("Private timers: %#" B_PRIx64 ", IRQ %" B_PRIu32 ", %" B_PRIu32
++			" Hz\n", sTWDRegs.start, sTWDInterrupt,
++			gKernelArgs.arch_args.timerFrequency);
++	}
++
+ 	dprintf("Chosen timer:\n");
+ 	if (timer.kind[0] == 0) {
+ 		dprintf("kind: None!\n");
+@@ -128,5 +396,9 @@ arch_dtb_set_kernel_args(void)
+ 			timer.regs.start,
+ 			timer.regs.size);
+ 		dprintf("  irq: %" B_PRIu32 "\n", timer.interrupt);
++		if (gKernelArgs.arch_args.timerFrequency != 0) {
++			dprintf("  frequency: %" B_PRIu32 " Hz\n",
++				gKernelArgs.arch_args.timerFrequency);
++		}
+ 	}
+ }
+diff --git a/src/system/boot/platform/efi/arch/arm/arch_enter_kernel.h b/src/system/boot/platform/efi/arch/arm/arch_enter_kernel.h
+new file mode 100644
+index 0000000000..4878106196
+--- /dev/null
++++ b/src/system/boot/platform/efi/arch/arm/arch_enter_kernel.h
+@@ -0,0 +1,19 @@
++/*
++ * Copyright 2026, Haiku, Inc.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef ARCH_ENTER_KERNEL_H
++#define ARCH_ENTER_KERNEL_H
++
++
++// layout of arch_enter_kernel_parameters in entry.S
++#define ENTER_KERNEL_TTBR		0
++#define ENTER_KERNEL_ARGS		4
++#define ENTER_KERNEL_ENTRY		8
++#define ENTER_KERNEL_GO			12
++#define ENTER_KERNEL_STACKS		16	// 4 words
++#define ENTER_KERNEL_STARTED	64	// 4 words, own cache line
++#define ENTER_KERNEL_MAX_CPUS	4
++
++
++#endif	// ARCH_ENTER_KERNEL_H
+diff --git a/src/system/boot/platform/efi/arch/arm/arch_mmu.cpp b/src/system/boot/platform/efi/arch/arm/arch_mmu.cpp
+index 1acd293c02..90a4fcd66d 100644
+--- a/src/system/boot/platform/efi/arch/arm/arch_mmu.cpp
++++ b/src/system/boot/platform/efi/arch/arm/arch_mmu.cpp
+@@ -8,7 +8,6 @@
+ 
+ #include <arm_mmu.h>
+ #include <kernel.h>
+-#include <arch/generic/debug_uart.h>
+ #include <arch_kernel.h>
+ #include <boot/platform.h>
+ #include <boot/stage2.h>
+@@ -32,8 +31,6 @@
+ static constexpr bool kTraceMemoryMap = false;
+ static constexpr bool kTracePageDirectory = false;
+ 
+-extern DebugUART* gUART;
+-
+ 
+ // Ignore memory above 512GB
+ #define PHYSICAL_MEMORY_LOW		0x00000000
+@@ -179,6 +176,23 @@ arch_mmu_post_efi_setup(size_t memoryMapSize,
+ 	build_physical_allocated_list(memoryMapSize, memoryMap,
+ 		descriptorSize, descriptorVersion);
+ 
++	// The firmware's frame buffer may live in ordinary RAM, e.g. inside an
++	// EfiBootServicesCode region (U-Boot on NVIDIA Tegra), which the kernel
++	// would otherwise reuse while the screen is still being drawn to.
++	if (gKernelArgs.frame_buffer.enabled) {
++		phys_addr_t start = ROUNDDOWN(
++			gKernelArgs.frame_buffer.physical_buffer.start, B_PAGE_SIZE);
++		phys_addr_t end = ROUNDUP(gKernelArgs.frame_buffer.physical_buffer.start
++			+ gKernelArgs.frame_buffer.physical_buffer.size, B_PAGE_SIZE);
++		for (uint32 i = 0; i < gKernelArgs.num_physical_memory_ranges; i++) {
++			const addr_range& range = gKernelArgs.physical_memory_range[i];
++			if (start < range.start + range.size && end > range.start) {
++				insert_physical_allocated_range(start, end - start);
++				break;
++			}
++		}
++	}
++
+ 	// Switch EFI to virtual mode, using the kernel pmap.
+ 	kRuntimeServices->SetVirtualAddressMap(memoryMapSize, descriptorSize,
+ 		descriptorVersion, memoryMap);
+@@ -283,9 +297,11 @@ arch_mmu_generate_post_efi_page_tables(size_t memoryMapSize,
+ 			ARM_MMU_L2_FLAG_B | ARM_MMU_L2_FLAG_C | ARM_MMU_L2_FLAG_HAIKU_KERNEL_RW);
+ 	}
+ 
++	// Only the kernel gets the new virtual UART address: the boot loader keeps
++	// running on the firmware's identity mapping until arch_enter_kernel()
++	// switches the page tables, and still prints until then.
+ 	map_range_to_new_area(gKernelArgs.arch_args.uart.regs,
+ 		ARM_MMU_L2_FLAG_B | ARM_MMU_L2_FLAG_HAIKU_KERNEL_RW | ARM_MMU_L2_FLAG_XN);
+-	gUART->SetBase(gKernelArgs.arch_args.uart.regs.start);
+ 
+ 	sort_address_ranges(gKernelArgs.virtual_allocated_range,
+ 		gKernelArgs.num_virtual_allocated_ranges);
+diff --git a/src/system/boot/platform/efi/arch/arm/arch_smp.cpp b/src/system/boot/platform/efi/arch/arm/arch_smp.cpp
+index f1711e9329..25a1768b0b 100644
+--- a/src/system/boot/platform/efi/arch/arm/arch_smp.cpp
++++ b/src/system/boot/platform/efi/arch/arm/arch_smp.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2019-2022, Haiku, Inc. All rights reserved.
++ * Copyright 2019-2026, Haiku, Inc. All rights reserved.
+  * Released under the terms of the MIT License.
+ */
+ 
+@@ -16,6 +16,9 @@
+ #include <boot/stage2.h>
+ #include <boot/menu.h>
+ 
++#include "arch_enter_kernel.h"
++#include "mmu.h"
++
+ 
+ //#define TRACE_SMP
+ #ifdef TRACE_SMP
+@@ -25,9 +28,44 @@
+ #endif
+ 
+ 
++#define PSCI_CPU_ON_32		0x84000003
++
++// NVIDIA Tegra 2: the second CPU waits in reset, with its clock stopped
++// (see arch/arm/mach-tegra/platsmp.c in Linux)
++#define TEGRA20_CAR_BASE				0x60006000
++#define TEGRA_CLK_CPU_CMPLX				0x4c
++#define TEGRA_CPU_CLOCK(cpu)			(1U << (8 + (cpu)))
++#define TEGRA_RST_CPU_CMPLX_SET			0x340
++#define TEGRA_RST_CPU_CMPLX_CLR			0x344
++#define TEGRA_CPU_RESET(cpu)			(0x1111U << (cpu))
++#define TEGRA20_EVP_CPU_RESET_VECTOR	0x6000f100
++#define TEGRA_FLOW_HALT_CPU1_EVENTS		0x14
++#define TEGRA_FLOW_CPU1_CSR				0x18
++
++// Cortex-A9 snoop control unit, at the base of the private peripherals
++#define SCU_CTRL						0x00
++#define SCU_ENABLE						(1U << 0)
++
++
++extern "C" void arch_enter_kernel(uint32_t ttbr, addr_t kernelArgs,
++	addr_t kernelEntry, addr_t kernelStackTop);
++extern "C" void arch_enter_kernel_secondary(void);
++extern "C" void arch_enter_kernel_parameters(void);
++
++extern "C" void clean_dcache_all(void);
++
++
+ static platform_cpu_info sCpus[SMP_MAX_CPUS];
+ uint32 sCpuCount = 0;
+ 
++enum psci_method {
++	PSCI_NONE,
++	PSCI_HVC,
++	PSCI_SMC
++};
++static psci_method sPsciMethod = PSCI_NONE;
++static addr_t sTegra20FlowController;
++
+ 
+ void
+ arch_smp_register_cpu(platform_cpu_info** cpu)
+@@ -39,31 +77,222 @@ arch_smp_register_cpu(platform_cpu_info** cpu)
+ 		return;
+ 	}
+ 	*cpu = &sCpus[sCpuCount];
++	memset(*cpu, 0, sizeof(platform_cpu_info));
+ 	sCpuCount = newCount;
+ }
+ 
+ 
++void
++arch_smp_set_psci_method(const char* method)
++{
++	if (strcmp(method, "hvc") == 0)
++		sPsciMethod = PSCI_HVC;
++	else if (strcmp(method, "smc") == 0)
++		sPsciMethod = PSCI_SMC;
++}
++
++
++void
++arch_smp_set_tegra20(addr_t flowController)
++{
++	sTegra20FlowController = flowController;
++}
++
++
+ int
+ arch_smp_get_current_cpu(void)
+ {
+-	// One cpu for now.
+ 	return 0;
+ }
+ 
+ 
++static bool
++can_start(const platform_cpu_info& cpu)
++{
++	if (cpu.psci)
++		return sPsciMethod != PSCI_NONE;
++	return sTegra20FlowController != 0 && cpu.id == 1;
++}
++
++
+ void
+ arch_smp_init_other_cpus(void)
+ {
+-	// One cpu for now.
+-	gKernelArgs.num_cpus = 1;
+-	return;
++	// only CPUs with a known way to start them, numbered 0, 1, ... by
++	// MPIDR, as the trampoline takes its CPU number from it
++	uint32 count = 1;
++	while (count < sCpuCount && count < ENTER_KERNEL_MAX_CPUS
++		&& sCpus[count].id == count && can_start(sCpus[count])) {
++		count++;
++	}
++	gKernelArgs.num_cpus = count;
++
++	if (get_safemode_boolean(B_SAFEMODE_DISABLE_SMP, false)) {
++		TRACE(("smp disabled per safemode setting\n"));
++		gKernelArgs.num_cpus = 1;
++	}
++	dprintf("smp: %" B_PRIu32 " of %" B_PRIu32 " CPUs usable\n",
++		gKernelArgs.num_cpus, sCpuCount);
++
++	for (uint32 i = 1; i < gKernelArgs.num_cpus; i++) {
++		void* stack = NULL;
++		const size_t size = KERNEL_STACK_SIZE
++			+ KERNEL_STACK_GUARD_PAGES * B_PAGE_SIZE;
++		if (platform_allocate_region(&stack, size, 0) != B_OK)
++			panic("Unable to allocate AP stack");
++		memset(stack, 0, size);
++		gKernelArgs.cpu_kstack[i].start = fix_address((addr_t)stack);
++		gKernelArgs.cpu_kstack[i].size = size;
++	}
++}
++
++
++static int32
++psci_call(uint32 function, uint32 arg0, uint32 arg1, uint32 arg2)
++{
++	register uint32 r0 asm("r0") = function;
++	register uint32 r1 asm("r1") = arg0;
++	register uint32 r2 asm("r2") = arg1;
++	register uint32 r3 asm("r3") = arg2;
++	if (sPsciMethod == PSCI_HVC) {
++		asm volatile(".arch_extension virt\n\thvc #0"
++			: "+r" (r0) : "r" (r1), "r" (r2), "r" (r3) : "memory");
++	} else {
++		asm volatile(".arch_extension sec\n\tsmc #0"
++			: "+r" (r0) : "r" (r1), "r" (r2), "r" (r3) : "memory");
++	}
++	return (int32)r0;
++}
++
++
++/*!	The caches of the CPUs are only kept coherent by the snoop control unit,
++	which a firmware running on one CPU may have left off.
++*/
++static void
++enable_scu()
++{
++	addr_t peripherals;
++	asm volatile("mrc p15, 4, %0, c15, c0, 0" : "=r" (peripherals));	// CBAR
++	volatile uint32* scu = (volatile uint32*)(peripherals & ~0x1fffUL);
++	if ((scu[SCU_CTRL / 4] & SCU_ENABLE) != 0)
++		return;
++
++	scu[SCU_CTRL / 4] |= SCU_ENABLE;
++	asm volatile("dsb" : : : "memory");
++	clean_dcache_all();
++	dprintf("smp: SCU at %#lx enabled\n", (addr_t)scu);
++}
++
++
++static status_t
++tegra20_start_cpu(uint32 cpu, addr_t entry)
++{
++	volatile uint32* car = (volatile uint32*)TEGRA20_CAR_BASE;
++	volatile uint32* flow = (volatile uint32*)sTegra20FlowController;
++
++	enable_scu();
++
++	*(volatile uint32*)TEGRA20_EVP_CPU_RESET_VECTOR = entry;
++	asm volatile("dsb" : : : "memory");
++
++	// hold it in reset while the flow controller lets it go, then clock it
++	// and release the reset
++	car[TEGRA_RST_CPU_CMPLX_SET / 4] = TEGRA_CPU_RESET(cpu);
++	flow[TEGRA_FLOW_HALT_CPU1_EVENTS / 4] = 0;
++	car[TEGRA_CLK_CPU_CMPLX / 4] &= ~TEGRA_CPU_CLOCK(cpu);
++	flow[TEGRA_FLOW_CPU1_CSR / 4] = 0;
++	asm volatile("dsb" : : : "memory");
++	car[TEGRA_RST_CPU_CMPLX_CLR / 4] = TEGRA_CPU_RESET(cpu);
++	asm volatile("dsb" : : : "memory");
++	return B_OK;
++}
++
++
++static inline uint32*
++parameters(void* trampolinePage)
++{
++	return (uint32*)((addr_t)trampolinePage
++		+ ((addr_t)arch_enter_kernel_parameters - (addr_t)arch_enter_kernel));
++}
++
++
++/*!	Starts the other CPUs on the trampoline: they invalidate their caches and
++	wait for arch_smp_release_other_cpus(). Returns the number of CPUs that
++	are up, the boot CPU included; the kernel arguments must say so.
++*/
++uint32
++arch_smp_start_other_cpus(void* trampolinePage, uint32 ttbr,
++	addr_t kernelEntry, addr_t virtKernelArgs)
++{
++	if (gKernelArgs.num_cpus < 2)
++		return 1;
++
++	uint32* params = parameters(trampolinePage);
++	params[ENTER_KERNEL_TTBR / 4] = ttbr;
++	params[ENTER_KERNEL_ARGS / 4] = virtKernelArgs;
++	params[ENTER_KERNEL_ENTRY / 4] = kernelEntry;
++	params[ENTER_KERNEL_GO / 4] = 0;
++	for (uint32 i = 0; i < ENTER_KERNEL_MAX_CPUS; i++) {
++		params[ENTER_KERNEL_STACKS / 4 + i] = i < gKernelArgs.num_cpus
++			? gKernelArgs.cpu_kstack[i].start + gKernelArgs.cpu_kstack[i].size
++			: 0;
++		params[ENTER_KERNEL_STARTED / 4 + i] = 0;
++	}
++	// the other CPUs start with their caches off
++	clean_dcache_all();
++
++	addr_t entry = (addr_t)trampolinePage
++		+ ((addr_t)arch_enter_kernel_secondary - (addr_t)arch_enter_kernel);
++	volatile uint32* started = &params[ENTER_KERNEL_STARTED / 4];
++
++	uint32 count = 1;
++	for (; count < gKernelArgs.num_cpus; count++) {
++		if (sCpus[count].psci) {
++			int32 result = psci_call(PSCI_CPU_ON_32, sCpus[count].id, entry,
++				0);
++			if (result != 0) {
++				dprintf("smp: CPU %" B_PRIu32 " did not start: PSCI error %"
++					B_PRId32 "\n", count, result);
++				break;
++			}
++		} else
++			tegra20_start_cpu(count, entry);
++
++		// it writes with its caches off: drop our copy of the line
++		bool up = false;
++		for (int32 i = 0; i < 20000000 && !up; i++) {
++			asm volatile("mcr p15, 0, %0, c7, c6, 1" : : "r" (started)
++				: "memory");	// DCIMVAC
++			asm volatile("dsb" : : : "memory");
++			up = started[count] != 0;
++		}
++		if (!up) {
++			dprintf("smp: CPU %" B_PRIu32 " did not come up\n", count);
++			break;
++		}
++	}
++	dprintf("smp: %" B_PRIu32 " CPUs up\n", count);
++	return count;
++}
++
++
++/*!	Lets the other CPUs enter the kernel, once the kernel arguments are in
++	place.
++*/
++void
++arch_smp_release_other_cpus(void* trampolinePage)
++{
++	uint32* params = parameters(trampolinePage);
++	params[ENTER_KERNEL_GO / 4] = 1;
++	clean_dcache_all();
++	asm volatile("dsb\n\tsev" : : : "memory");
+ }
+ 
+ 
+ void
+ arch_smp_boot_other_cpus(addr_t pml4, uint64 kernelEntry, addr_t virtKernelArgs)
+ {
+-	// One cpu for now.
++	// see arch_smp_start_other_cpus()
+ }
+ 
+ 
+@@ -86,5 +315,4 @@ arch_smp_add_safemode_menus(Menu *menu)
+ void
+ arch_smp_init(void)
+ {
+-	// One cpu for now.
+ }
+diff --git a/src/system/boot/platform/efi/arch/arm/arch_start.cpp b/src/system/boot/platform/efi/arch/arm/arch_start.cpp
+index 165d1562b9..411e562671 100644
+--- a/src/system/boot/platform/efi/arch/arm/arch_start.cpp
++++ b/src/system/boot/platform/efi/arch/arm/arch_start.cpp
+@@ -15,6 +15,7 @@
+ #include "mmu.h"
+ #include "serial.h"
+ #include "smp.h"
++#include "arch_smp.h"
+ 
+ //#define TRACE_ARCH_START
+ #ifdef TRACE_ARCH_START
+@@ -28,6 +29,7 @@
+ 
+ 
+ extern "C" void clean_dcache_all(void);
++extern void arch_quiesce_usb(void);
+ extern "C" void invalidate_icache_all(void);
+ 
+ extern "C" typedef void (*arch_enter_kernel_t)(uint32_t, addr_t, addr_t, addr_t);
+@@ -176,6 +178,7 @@ arch_start_kernel(addr_t kernelEntry)
+ 	// they only needed to know about the maximum address, not any specific
+ 	// entry.
+ 
++	arch_quiesce_usb();
+ 	dprintf("Calling ExitBootServices. So long, EFI!\n");
+ 	serial_disable();
+ 
+@@ -202,12 +205,18 @@ arch_start_kernel(addr_t kernelEntry)
+ 	serial_init();
+ 	serial_enable();
+ 
++	// The other CPUs wait on the trampoline until the kernel arguments are in
++	// place; only those that came up are counted.
++	gKernelArgs.num_cpus = arch_smp_start_other_cpus(trampolinePage,
++		final_ttbr0, kernelEntry, virtKernelArgs);
++
+ 	// Copy final kernel args
+ 	// This should be the last step before jumping to the kernel
+ 	// as there are some fixups happening to kernel_args even in the last minute
+ 	memcpy((void *)kernelArgs, &gKernelArgs, sizeof(struct kernel_args));
+ 
+-	//smp_boot_other_cpus(final_ttbr0, kernelEntry, (addr_t)&gKernelArgs);
++	clean_dcache_all();
++	arch_smp_release_other_cpus(trampolinePage);
+ 
+ 	TRACE("CPSR = 0x%08" B_PRIx32 "\n", cpu_read_CPSR());
+ 	TRACE("SCTLR = 0x%08" B_PRIx32 "\n", mmu_read_SCTLR());
+diff --git a/src/system/boot/platform/efi/arch/arm/entry.S b/src/system/boot/platform/efi/arch/arm/entry.S
+index f81f3b3466..3e7d72679b 100644
+--- a/src/system/boot/platform/efi/arch/arm/entry.S
++++ b/src/system/boot/platform/efi/arch/arm/entry.S
+@@ -5,6 +5,8 @@
+ 
+ #include <asm_defs.h>
+ 
++#include "arch_enter_kernel.h"
++
+ 
+ 	.arch_extension virt
+ 	.text
+@@ -18,6 +20,10 @@
+ 	r3	- kernelStackTop
+ */
+ FUNCTION(arch_enter_kernel):
++	mov		r6, #0	// the boot CPU
++
++_enter_kernel_common:
++	// r0-r3 as above, r6 the CPU number
+ 
+ 	// check whether we are running in HYP mode
+ 	mrs		r9, cpsr
+@@ -47,7 +53,7 @@ _pl1_entry:
+ 
+ 	// set up kernel _start args
+ 	mov		r0,r1	// kernelArgs
+-	mov		r1,#0	// currentCPU=0
++	mov		r1,r6	// currentCPU
+ 
+ 	// enable full access for coprocessors P10, P11
+ 	// by setting the required flags in Access Control Register
+@@ -64,7 +70,30 @@ _pl1_entry:
+ 	FMXR FPEXC, r9
+ 
+ 	// flush TLB
+-	MCR p15, 0, r1, c8, c7, 0
++	mov		r9, #0
++	MCR p15, 0, r9, c8, c7, 0
++
++	// On a Cortex-A9 MPCore the table walks and the cache and TLB maintenance
++	// operations are only coherent once the CPU takes part in SMP
++	// (ACTLR.SMP and ACTLR.FW). The bits may be read-only, so only write them
++	// when they are not set yet.
++	mrc		p15, 0, r9, c0, c0, 0	// MIDR
++	movw	r10, #0xfff0			// no literal pool: this code is copied
++	movt	r10, #0xff0f			// to a trampoline page
++	and		r9, r9, r10
++	movw	r10, #0xc090
++	movt	r10, #0x410f			// ARM Cortex-A9
++	cmp		r9, r10
++	bne		1f
++	mrc		p15, 0, r9, c0, c0, 5	// MPIDR
++	tst		r9, #0x40000000			// U bit: uniprocessor
++	bne		1f
++	mrc		p15, 0, r9, c1, c0, 1	// ACTLR
++	tst		r9, #0x40				// SMP
++	orreq	r9, r9, #0x41			// SMP | FW
++	mcreq	p15, 0, r9, c1, c0, 1
++	isb
++1:
+ 
+ 	// set TTBR0
+ 	// cacheability attributes for the page tables are:
+@@ -73,14 +102,17 @@ _pl1_entry:
+ 	// Note that this relies on ARMv7 multiprocessing extensions
+ 	// on uniprocessors we need only the flag 0x01 i.e. Inner Cacheable
+ 
+-	orr		r5, r5, #0x59
++	// and Shareable (0x02): the walks of all CPUs see the same tables
++	orr		r5, r5, #0x5b
+ 	mcr		p15, 0, r5, c2, c0, 0
+ 
+-	// initialize TTBCR to zero (no LPAE, use only TTBR0)
+-	MCR p15, 0, r1, c2, c0, 2
++	// initialize TTBCR to zero (no LPAE, use only TTBR0); r1 is the CPU
++	// number by now
++	mov		r9, #0
++	MCR p15, 0, r9, c2, c0, 2
+ 
+ 	// flush TLB (again)
+-	MCR p15, 0, r1, c8, c7, 0
++	MCR p15, 0, r9, c8, c7, 0
+ 
+ 	// write DACR
+ 	mov		r9, #0x00000001
+@@ -92,18 +124,22 @@ _pl1_entry:
+ 	// - memory type 0 is Strongly Ordered
+ 	// - memory type 1 is Shareable Device
+ 	// - all others are normal memory
+-	// - NS/DS bits are configured as 'pass-through'
++	// - all Normal and Device memory is Shareable, whatever the S bit of its
++	//   descriptor (NS0/NS1, DS0/DS1), so that the caches of all CPUs of
++	//   a multiprocessor are coherent for it
+ 	// - all Shareable Normal memory regions are Outer Shareable
+ 	mov		r9, #0x0000aaa4
+-	orr		r9, #0x000a0000
++	orr		r9, #0x000f0000
+ 	mcr		p15, 0, r9, c10, c2, 0
+ 
+ 	// set NMRR as follows:
+ 	// - memory type 2 is Inner/Outer Write-Through
+-	// - memory type 3 is Inner/Outer Write-Back, no Write-Allocate
++	// - memory type 3 (all normal memory) is Inner/Outer Write-Back,
++	//   Write-Allocate, as Linux uses it on Cortex-A9: without, every store
++	//   that misses the cache goes to memory
+ 	// - don't care about the rest
+-	mov		r9, #0x000000e0
+-	orr		r9, #0x00e00000
++	mov		r9, #0x00000060
++	orr		r9, #0x00600000
+ 	mcr		p15, 0, r9, c10, c2, 1
+ 
+ 	// ensure the PRRR and NMRR registers are updated before enabling MMU
+@@ -131,3 +167,91 @@ _pl1_entry:
+ 
+ FUNCTION_END(arch_enter_kernel)
+ 
++
++/*	Entry point of the other CPUs, started with the MMU and the caches off.
++	Runs from the trampoline page, like arch_enter_kernel(): invalidates the
++	L1 data cache (its content is random after a reset on a Cortex-A9), tells
++	the boot CPU it is up, waits until the kernel arguments are ready, then
++	enters the kernel with the parameters of arch_enter_kernel_parameters.
++*/
++FUNCTION(arch_enter_kernel_secondary):
++	cpsid	aif
++
++	// invalidate the L1 data cache by set/way
++	mov		r0, #0
++	mcr		p15, 2, r0, c0, c0, 0	// CSSELR: level 1 data cache
++	isb
++	mrc		p15, 1, r0, c0, c0, 0	// CCSIDR
++	movw	r1, #0x7fff
++	and		r2, r1, r0, lsr #13		// number of sets - 1
++	movw	r1, #0x3ff
++	and		r3, r1, r0, lsr #3		// associativity - 1
++	add		r2, r2, #1				// number of sets
++	and		r0, r0, #0x7
++	add		r0, r0, #4				// log2 of the line size
++	clz		r1, r3					// shift of the way
++	add		r4, r3, #1				// number of ways
++1:	sub		r2, r2, #1
++	mov		r3, r4
++2:	subs	r3, r3, #1
++	mov		r5, r3, lsl r1
++	mov		r6, r2, lsl r0
++	orr		r5, r5, r6
++	mcr		p15, 0, r5, c7, c6, 2	// DCISW
++	bgt		2b
++	cmp		r2, #0
++	bgt		1b
++	dsb
++
++	mov		r0, #0
++	mcr		p15, 0, r0, c7, c5, 0	// ICIALLU
++	mcr		p15, 0, r0, c7, c5, 6	// BPIALL
++	mcr		p15, 0, r0, c8, c7, 0	// TLBIALL
++	dsb
++	isb
++
++	// our CPU number, from MPIDR.Aff0
++	mrc		p15, 0, r6, c0, c0, 5
++	and		r6, r6, #0xff
++
++	// we are up; the boot CPU reads this with its caches on, it invalidates
++	// the line first
++	adr		r9, arch_enter_kernel_parameters
++	mov		r0, #1
++	add		r1, r9, #(ENTER_KERNEL_STARTED)
++	str		r0, [r1, r6, lsl #2]
++	dsb
++
++	// wait for the go: the kernel arguments are in place
++3:	ldr		r0, [r9, #(ENTER_KERNEL_GO)]
++	cmp		r0, #0
++	bne		4f
++	wfe
++	b		3b
++
++4:	ldr		r0, [r9, #(ENTER_KERNEL_TTBR)]
++	ldr		r1, [r9, #(ENTER_KERNEL_ARGS)]
++	ldr		r2, [r9, #(ENTER_KERNEL_ENTRY)]
++	add		r3, r9, #(ENTER_KERNEL_STACKS)
++	ldr		r3, [r3, r6, lsl #2]
++	b		_enter_kernel_common
++FUNCTION_END(arch_enter_kernel_secondary)
++
++
++// filled in by arch_smp_boot_other_cpus() in the trampoline page
++.balign 64
++FUNCTION(arch_enter_kernel_parameters):
++	.word	0		// TTBR
++	.word	0		// kernel args
++	.word	0		// kernel entry
++	.word	0		// go
++	.rept	4
++	.word	0		// stack tops
++	.endr
++	.balign	64		// the started flags get their own cache line
++	.rept	4
++	.word	0
++	.endr
++	.balign	64
++FUNCTION_END(arch_enter_kernel_parameters)
++
+diff --git a/src/system/boot/platform/efi/devices.cpp b/src/system/boot/platform/efi/devices.cpp
+index ad59142afd..11ea72e79b 100644
+--- a/src/system/boot/platform/efi/devices.cpp
++++ b/src/system/boot/platform/efi/devices.cpp
+@@ -127,12 +127,23 @@ device_contains_partition(EfiDevice *device, boot::Partition *partition)
+ 		uint32 blockSize = device->BlockSize();
+ 		gpt_table_header *deviceHeader =
+ 			(gpt_table_header*)malloc(blockSize);
+-		ssize_t bytesRead = device->ReadAt(NULL, blockSize, deviceHeader,
+-			blockSize);
++		// With only the backup table (the start of the disk belongs to
++		// something else, as on NVIDIA Tegra systems), compare with that
++		// one: the header in memory was rebuilt from it.
++		const gpt_table_header& tableHeader = header->TableHeader();
++		uint64 headerBlock = header->IsBackupOnly()
++			? tableHeader.alternate_block : 1;
++		ssize_t bytesRead = device->ReadAt(NULL, headerBlock * blockSize,
++			deviceHeader, blockSize);
+ 		if (bytesRead != (ssize_t)blockSize)
+ 			return false;
+ 
+-		if (memcmp(deviceHeader, &header->TableHeader(),
++		if (header->IsBackupOnly()) {
++			if (memcmp(&deviceHeader->disk_guid, &tableHeader.disk_guid,
++					sizeof(guid_t)) != 0
++				|| deviceHeader->entries_crc != tableHeader.entries_crc)
++				return false;
++		} else if (memcmp(deviceHeader, &tableHeader,
+ 				sizeof(gpt_table_header)) != 0)
+ 			return false;
+ 
+diff --git a/src/system/boot/platform/efi/dtb.cpp b/src/system/boot/platform/efi/dtb.cpp
+index ad90255290..25fec216f9 100644
+--- a/src/system/boot/platform/efi/dtb.cpp
++++ b/src/system/boot/platform/efi/dtb.cpp
+@@ -80,6 +80,7 @@ const struct supported_uarts {
+ #elif defined(__ARM__)
+ 	{ "arm,pl011", UART_KIND_PL011, &get_uart<ArchUARTPL011> },
+ 	{ "brcm,bcm2835-aux-uart", UART_KIND_8250, &get_uart<DebugUART8250> },
++	{ "nvidia,tegra20-uart", UART_KIND_8250, &get_uart<DebugUART8250> },
+ #elif defined(__aarch64__)
+ 	{ "arm,pl011", UART_KIND_PL011, &get_uart<ArchUARTPL011> },
+ 	{ "fsl,s32-linflexuart", UART_KIND_LINFLEX, &get_uart<ArchUARTlinflex> },
+@@ -375,6 +376,25 @@ dtb_get_size_cells(const void* fdt, int node)
+ }
+ 
+ 
++/*!	Reads a number of up to three cells; for three cells (PCI addresses) the
++	leading cell with the address space flags is skipped.
++*/
++static uint64
++read_cells(const uint32* cells, uint32 count)
++{
++	switch (count) {
++		case 1:
++			return fdt32_to_cpu(cells[0]);
++		case 2:
++			return ((uint64)fdt32_to_cpu(cells[0]) << 32) | fdt32_to_cpu(cells[1]);
++		case 3:
++			return ((uint64)fdt32_to_cpu(cells[1]) << 32) | fdt32_to_cpu(cells[2]);
++		default:
++			return 0;
++	}
++}
++
++
+ bool
+ dtb_get_reg(const void* fdt, int node, size_t idx, addr_range& range)
+ {
+@@ -403,48 +423,50 @@ dtb_get_reg(const void* fdt, int node, size_t idx, addr_range& range)
+ 		default: panic("unsupported sizeCells");
+ 	}
+ 
+-	int parent = fdt_parent_offset(fdt, node);
+-	if (parent >= 0) {
+-		uint32 parentAddressCells = dtb_get_address_cells(fdt, parent);
+-
+-		uint32 rangesSize = 0;
+-		uint32 *ranges = (uint32 *)fdt_getprop(fdt, parent, "ranges", (int *)&rangesSize);
+-		if (ranges == NULL)
+-			return true;
+-
+-		uint32 rangesPos = 0;
+-		while (rangesSize >= (rangesPos + parentAddressCells + addressCells + sizeCells)) {
+-			addr_t childAddress;
+-			addr_t parentAddress;
+-			size_t rangeSize;
++	// Translate the address through the "ranges" of every parent bus up to
++	// the root, as devices can sit behind several levels of buses.
++	int child = node;
++	while (true) {
++		int parent = fdt_parent_offset(fdt, child);
++		if (parent < 0 || fdt_parent_offset(fdt, parent) < 0) {
++			// the root node does not translate
++			break;
++		}
+ 
+-			if (addressCells == 1) {
+-				childAddress = fdt32_to_cpu(*(uint32*)(ranges+rangesPos));
+-			} else {
+-				childAddress = fdt64_to_cpu(*(uint64*)(ranges+rangesPos));
+-			}
+-			rangesPos += addressCells;
++		int rangesLength;
++		const uint32* ranges = (const uint32*)fdt_getprop(fdt, parent, "ranges",
++			&rangesLength);
++		if (ranges == NULL) {
++			// not translatable, keep what we have
++			break;
++		}
+ 
+-			if (parentAddressCells == 1) {
+-				parentAddress = fdt32_to_cpu(*(uint32*)(ranges+rangesPos));
+-			} else {
+-				parentAddress = fdt64_to_cpu(*(uint64*)(ranges+rangesPos));
++		uint32 childCells = dtb_get_address_cells(fdt, child);
++		uint32 parentCells = dtb_get_address_cells(fdt, parent);
++		uint32 rangeSizeCells = dtb_get_size_cells(fdt, child);
++		uint32 entryCells = childCells + parentCells + rangeSizeCells;
++
++		// an empty "ranges" means an identity mapping
++		bool translated = rangesLength == 0;
++		for (int i = 0; !translated
++				&& (i + 1) * entryCells * 4 <= (uint32)rangesLength; i++) {
++			const uint32* entry = ranges + i * entryCells;
++			uint64 childAddress = read_cells(entry, childCells);
++			uint64 parentAddress = read_cells(entry + childCells, parentCells);
++			uint64 rangeSize = read_cells(entry + childCells + parentCells,
++				rangeSizeCells);
++
++			if (range.start >= childAddress
++				&& range.start - childAddress < rangeSize) {
++				range.start = range.start - childAddress + parentAddress;
++				translated = true;
+ 			}
+-			rangesPos += parentAddressCells;
++		}
+ 
+-			if (sizeCells == 1) {
+-				rangeSize = fdt32_to_cpu(*(uint32*)(ranges+rangesPos));
+-			} else {
+-				rangeSize = fdt64_to_cpu(*(uint64*)(ranges+rangesPos));
+-			}
+-			rangesPos += sizeCells;
++		if (!translated)
++			break;
+ 
+-			if ((range.start >= childAddress) && (range.start <= childAddress + rangeSize)) {
+-				range.start -= childAddress;
+-				range.start += parentAddress;
+-				break;
+-			}
+-		}
++		child = parent;
+ 	}
+ 
+ 	return true;
+@@ -569,7 +591,10 @@ dtb_handle_fdt(const void* fdt, int node)
+ 
+ 				gUART = kSupportedUarts[i].uart_driver_init(uart.regs.start,
+ 					uart.clock);
+-				gUARTSkipInit = fdt_getprop(fdt, node, "skip-init", NULL) != NULL;
++				// Without a known input clock we cannot compute a baud
++				// divisor, so keep what the firmware has set up
++				gUARTSkipInit = fdt_getprop(fdt, node, "skip-init", NULL) != NULL
++					|| uart.clock <= 0;
+ 			}
+ 		}
+ 	}
+-- 
+2.39.5
+

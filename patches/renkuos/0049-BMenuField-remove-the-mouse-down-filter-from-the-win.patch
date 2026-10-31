@@ -1,0 +1,32 @@
+From e8f8bb68561c0e20f5d3028f41b13b2708d12043 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 27 Oct 2026 07:20:30 +0100
+Subject: [PATCH 49/63] BMenuField: remove the mouse down filter from the
+ window when detached
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/kits/interface/MenuField.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/kits/interface/MenuField.cpp b/src/kits/interface/MenuField.cpp
+index 1bddb26e30..d656a54954 100644
+--- a/src/kits/interface/MenuField.cpp
++++ b/src/kits/interface/MenuField.cpp
+@@ -554,6 +554,13 @@ BMenuField::MouseUp(BPoint where)
+ void
+ BMenuField::DetachedFromWindow()
+ {
++	// MouseDown() adds the filter to the window and MouseUp() removes it,
++	// but the mouse up does not always reach us (the menu may take it).
++	// Left there, the window would delete it once more after our
++	// destructor did.
++	if (fMouseDownFilter->Looper() != NULL)
++		Window()->RemoveCommonFilter(fMouseDownFilter);
++
+ 	BView::DetachedFromWindow();
+ }
+ 
+-- 
+2.39.5
+
