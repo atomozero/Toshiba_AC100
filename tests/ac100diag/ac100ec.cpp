@@ -6,6 +6,8 @@
  *   ac100ec info        read-only: product, firmware, capabilities, status
  *   ac100ec gpio        read-only: the level of the GPIOs the AP may use
  *   ac100ec raw BYTE... sends any request (asks before anything but reads)
+ *   ac100ec mouse       the last bytes of the touchpad, as the driver saw them
+ *   ac100ec mouse watch the same, live: shows every button change
  *
  * info and gpio also write /boot/home/ac100ec-report.txt.
  */
@@ -22,6 +24,8 @@
 
 
 #define NVEC_DIAG_REQUEST	0x4e563130	// 'NV10'
+#define NVEC_DIAG_MOUSE_LOG	0x4e563131	// 'NV11'
+#define NVEC_MOUSE_LOG_COUNT	256
 #define NVEC_MSG_SIZE		34
 
 struct nvec_diag_request {
@@ -29,6 +33,32 @@ struct nvec_diag_request {
 	uint8	request[NVEC_MSG_SIZE - 1];
 	uint8	replySize;
 	uint8	reply[NVEC_MSG_SIZE];
+};
+
+enum {
+	NVEC_MOUSE_LOG_STORED		= 0x01,
+	NVEC_MOUSE_LOG_SKIPPED		= 0x02,
+	NVEC_MOUSE_LOG_RESET		= 0x04,
+	NVEC_MOUSE_LOG_RESYNC		= 0x08,
+	NVEC_MOUSE_LOG_PACKET		= 0x10,
+	NVEC_MOUSE_LOG_QUEUE_FULL	= 0x20,
+	NVEC_MOUSE_LOG_REENABLED	= 0x40,
+	NVEC_MOUSE_LOG_KEY_RELEASE	= 0x80,
+};
+
+struct nvec_mouse_log_entry {
+	bigtime_t	time;
+	uint8		byte;
+	uint8		flags;
+	uint8		position;
+	uint8		buttons;
+	uint32		reserved;
+};
+
+struct nvec_mouse_log {
+	uint32		count;
+	uint32		reserved;
+	nvec_mouse_log_entry entries[NVEC_MOUSE_LOG_COUNT];
 };
 
 static const char* kDevice = "/dev/misc/nvec_diag";
@@ -219,11 +249,113 @@ is_read_only(const uint8* bytes, int size)
 }
 
 
+static const char*
+buttons_name(uint8 buttons)
+{
+	static char name[32];
+	if (buttons == 0)
+		return "nessuno";
+	snprintf(name, sizeof(name), "%s%s%s", (buttons & 1) ? "sinistro " : "",
+		(buttons & 2) ? "destro " : "", (buttons & 4) ? "centrale " : "");
+	name[strlen(name) - 1] = '\0';
+	return name;
+}
+
+
+/*!	Prints the entries from \a first on; returns the count of the log. */
+static uint32
+print_mouse_log(uint32 first, bigtime_t* start, uint8* lastButtons)
+{
+	static nvec_mouse_log log;
+	if (ioctl(sDevice, NVEC_DIAG_MOUSE_LOG, &log, sizeof(log)) != 0) {
+		fprintf(stderr, "il driver nvec non ha il registro del touchpad: %s\n",
+			strerror(errno));
+		exit(1);
+	}
+
+	uint32 kept = log.count < NVEC_MOUSE_LOG_COUNT
+		? log.count : NVEC_MOUSE_LOG_COUNT;
+	uint32 oldest = log.count - kept;
+	if (first < oldest) {
+		if (first != 0)
+			printf("... %u byte persi (troppo veloci da leggere)\n",
+				oldest - first);
+		first = oldest;
+	}
+
+	static uint8 packet[3];
+	for (uint32 n = first; n < log.count; n++) {
+		const nvec_mouse_log_entry& e = log.entries[n - oldest];
+		if (*start == 0)
+			*start = e.time;
+		double ms = (e.time - *start) / 1000.0;
+
+		if (e.flags & NVEC_MOUSE_LOG_KEY_RELEASE) {
+			printf("%10.1f ms  -- tasto della tastiera: sinistro agganciato "
+				"rilasciato   <<< RILASCIATO sinistro\n", ms);
+			*lastButtons = e.buttons;
+			continue;
+		}
+		if (e.flags & NVEC_MOUSE_LOG_REENABLED) {
+			printf("%10.1f ms  -- input riattivato dopo 30 s senza eventi\n",
+				ms);
+			continue;
+		}
+		printf("%10.1f ms  %02x pos %u", ms, e.byte, e.position);
+		if (e.flags & NVEC_MOUSE_LOG_RESYNC)
+			printf("  [pausa: pacchetto precedente scartato]");
+		if (e.flags & NVEC_MOUSE_LOG_SKIPPED)
+			printf("  [scartato: non e' l'inizio di un pacchetto]");
+		if (e.flags & NVEC_MOUSE_LOG_RESET)
+			printf("  [RESET del touchpad]");
+		if (e.flags & NVEC_MOUSE_LOG_QUEUE_FULL)
+			printf("  [coda piena]");
+		if (e.flags & NVEC_MOUSE_LOG_STORED)
+			packet[e.position] = e.byte;
+		if (e.flags & NVEC_MOUSE_LOG_PACKET) {
+			int x = (packet[0] & 0x10) ? (int)packet[1] - 256 : packet[1];
+			int y = (packet[0] & 0x20) ? (int)packet[2] - 256 : packet[2];
+			printf("  => tasti: %s, x %d y %d", buttons_name(packet[0] & 7),
+				x, y);
+			if ((e.buttons & 7) != (*lastButtons & 7)) {
+				uint8 pressed = e.buttons & ~*lastButtons;
+				uint8 released = *lastButtons & ~e.buttons;
+				if (pressed)
+					printf("   <<< PREMUTO %s", buttons_name(pressed));
+				if (released)
+					printf("   <<< RILASCIATO %s", buttons_name(released));
+			}
+			*lastButtons = e.buttons;
+		}
+		printf("\n");
+	}
+	fflush(stdout);
+	return log.count;
+}
+
+
+static void
+mouse(bool watch)
+{
+	bigtime_t start = 0;
+	uint8 lastButtons = 0;
+	uint32 next = print_mouse_log(0, &start, &lastButtons);
+	if (!watch)
+		return;
+	printf("-- in ascolto: premi i tasti del touchpad (Ctrl+C per uscire)\n");
+	fflush(stdout);
+	while (true) {
+		snooze(100000);
+		next = print_mouse_log(next, &start, &lastButtons);
+	}
+}
+
+
 int
 main(int argc, char** argv)
 {
 	if (argc < 2) {
-		printf("usage: ac100ec info | gpio | raw BYTE...\n");
+		printf("usage: ac100ec info | gpio | raw BYTE... | mouse [watch]\n");
 		return 1;
 	}
 
@@ -243,6 +375,8 @@ main(int argc, char** argv)
 			fclose(sReport);
 			printf("\nRapporto in %s\n", kReport);
 		}
+	} else if (strcmp(argv[1], "mouse") == 0) {
+		mouse(argc >= 3 && strcmp(argv[2], "watch") == 0);
 	} else if (strcmp(argv[1], "raw") == 0 && argc >= 4) {
 		uint8 bytes[NVEC_MSG_SIZE - 1];
 		int size = 0;
@@ -261,7 +395,7 @@ main(int argc, char** argv)
 		uint8 payload[NVEC_MSG_SIZE];
 		request(bytes, size, payload);
 	} else {
-		printf("usage: ac100ec info | gpio | raw BYTE...\n");
+		printf("usage: ac100ec info | gpio | raw BYTE... | mouse [watch]\n");
 		return 1;
 	}
 
