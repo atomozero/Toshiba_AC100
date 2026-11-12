@@ -11,7 +11,7 @@ FPU and no NEON, 512 MB of RAM, 16 GB eMMC.
 A ready-to-use microSD image is published on the
 [releases page](https://github.com/atomozero/Toshiba_AC100/releases). Write it to a
 microSD card of 8 GB or more and start the AC100 from it with U-Boot: the steps are in
-[INSTALL.md](INSTALL.md). Nothing is written to the internal eMMC unless you choose to.
+[INSTALL.md](INSTALL.md); how to use it day by day in [USING.md](USING.md). Nothing is written to the internal eMMC unless you choose to.
 
 ## Cosa funziona
 
