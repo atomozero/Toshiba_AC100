@@ -1,0 +1,198 @@
+From ff35771f78edfdfd0f1189abab6323a80df8f58a Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 8 Nov 2026 22:32:31 +0100
+Subject: [PATCH 09/42] WIP tegra_audio: the jack and HDMI lines wake the jack
+ thread up
+
+With the Tegra GPIO module, both lines get an any-change interrupt that
+releases a semaphore; the thread waits on it (50 ms for the contacts to
+settle, a check every 10 s all the same) instead of reading the lines
+every 250 ms. The codec is set through I2C, so it stays in the thread.
+Without the module or its interrupts the lines are polled as before.
+---
+ .../kernel/drivers/audio/tegra/Jamfile        |  2 +-
+ .../drivers/audio/tegra/tegra_audio.cpp       | 94 ++++++++++++++++++-
+ 2 files changed, 94 insertions(+), 2 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/audio/tegra/Jamfile b/src/add-ons/kernel/drivers/audio/tegra/Jamfile
+index 6a8e61b370..38f7ccfd1d 100644
+--- a/src/add-ons/kernel/drivers/audio/tegra/Jamfile
++++ b/src/add-ons/kernel/drivers/audio/tegra/Jamfile
+@@ -1,7 +1,7 @@
+ SubDir HAIKU_TOP src add-ons kernel drivers audio tegra ;
+ 
+ UsePrivateKernelHeaders ;
+-UsePrivateHeaders audio i2c ;
++UsePrivateHeaders audio gpio i2c ;
+ 
+ KernelAddon tegra_audio :
+ 	tegra_audio.cpp
+diff --git a/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp b/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
+index 415c5dc286..e2488c0af9 100644
+--- a/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
++++ b/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
+@@ -38,6 +38,7 @@
+ #include <kernel.h>
+ #include <lock.h>
+ #include <util/AutoLock.h>
++#include <gpio/tegra.h>
+ #include <vm/vm.h>
+ 
+ // after the kernel headers: its <Debug.h> keeps their ASSERT
+@@ -197,6 +198,13 @@ struct tegra_audio_diag {
+ #define GPIO_PORT_N					13
+ #define HDMI_DETECT_BIT				(1U << 7)
+ #define HP_POLL_INTERVAL			250000
++	// without the GPIO interrupts
++#define HP_CHECK_INTERVAL			10000000
++	// with them, a check now and then all the same
++#define HP_SETTLE_TIME				50000
++	// for the contacts of the jack to settle after a change
++#define HP_DETECT_PIN				(22 * 8 + 2)	// W2
++#define HDMI_DETECT_PIN				(13 * 8 + 7)	// N7
+ 
+ // Realtek ALC5632
+ #define ALC5632_RESET				0x00
+@@ -277,6 +285,9 @@ struct tegra_audio {
+ 	volatile uint8*			hdmiPort;	// and of port N
+ 	thread_id				jackThread;
+ 	volatile bool			quitJackThread;
++	sem_id					jackSem;		// released on a jack change
++	tegra_gpio_interface*	gpio;			// for the jack interrupts
++	bool					jackInterrupts;
+ 	int32					headphones;	// -1 not known yet
+ 	int32					hdmi;		// -1 not known yet
+ 	bool					hdmiMutesSpeaker;
+@@ -530,11 +541,37 @@ set_outputs(tegra_audio* audio)
+ }
+ 
+ 
++/*!	A change on the headphone or HDMI line: wakes the jack thread up. Runs
++	in interrupt context.
++*/
++static void
++jack_interrupt(uint32 pin, void* data)
++{
++	tegra_audio* audio = (tegra_audio*)data;
++	release_sem_etc(audio->jackSem, 1, B_DO_NOT_RESCHEDULE);
++}
++
++
+ static status_t
+ jack_thread(void* data)
+ {
+ 	tegra_audio* audio = (tegra_audio*)data;
+ 	while (!audio->quitJackThread) {
++		if (audio->jackInterrupts) {
++			// a change, or a check now and then; the codec is set through
++			// I2C, which may sleep, so not from the interrupt
++			if (acquire_sem_etc(audio->jackSem, 1, B_RELATIVE_TIMEOUT,
++					HP_CHECK_INTERVAL) == B_OK) {
++				snooze(HP_SETTLE_TIME);
++				// the bounces of the contacts are one change
++				int32 count;
++				if (get_sem_count(audio->jackSem, &count) == B_OK && count > 0)
++					acquire_sem_etc(audio->jackSem, count, 0, 0);
++			}
++			if (audio->quitJackThread)
++				break;
++		}
++
+ 		int32 plugged = (read32(audio->gpioPort, GPIO_IN) & HP_DETECT_BIT) != 0;
+ 		int32 hdmi = (read32(audio->hdmiPort, GPIO_IN) & HDMI_DETECT_BIT) != 0;
+ 		if (plugged != audio->headphones || hdmi != audio->hdmi) {
+@@ -543,12 +580,58 @@ jack_thread(void* data)
+ 			audio->hdmi = hdmi;
+ 			set_outputs(audio);
+ 		}
+-		snooze(HP_POLL_INTERVAL);
++		if (!audio->jackInterrupts)
++			snooze(HP_POLL_INTERVAL);
+ 	}
+ 	return B_OK;
+ }
+ 
+ 
++static void stop_jack_interrupts(tegra_audio* audio);
++
++
++/*!	Interrupts on both lines, through the Tegra GPIO module; without them
++	the lines are polled.
++*/
++static void
++start_jack_interrupts(tegra_audio* audio)
++{
++	audio->jackSem = create_sem(0, "tegra audio jack");
++	if (audio->jackSem < B_OK)
++		return;
++	if (get_module(TEGRA_GPIO_MODULE_NAME, (module_info**)&audio->gpio)
++			!= B_OK) {
++		audio->gpio = NULL;
++		return;
++	}
++	// the HDMI line belongs to the display driver, which only reads it
++	if (audio->gpio->acquire(HP_DETECT_PIN, "tegra_audio") != B_OK
++		|| audio->gpio->acquire(HDMI_DETECT_PIN, "tegra_audio") != B_OK
++		|| audio->gpio->set_interrupt(HP_DETECT_PIN,
++			TEGRA_GPIO_INTERRUPT_ANY_CHANGE, jack_interrupt, audio) != B_OK
++		|| audio->gpio->set_interrupt(HDMI_DETECT_PIN,
++			TEGRA_GPIO_INTERRUPT_ANY_CHANGE, jack_interrupt, audio) != B_OK) {
++		TRACE_ALWAYS("no jack interrupts, polling the lines\n");
++		stop_jack_interrupts(audio);
++		return;
++	}
++	audio->jackInterrupts = true;
++}
++
++
++static void
++stop_jack_interrupts(tegra_audio* audio)
++{
++	audio->jackInterrupts = false;
++	if (audio->gpio != NULL) {
++		audio->gpio->release(HP_DETECT_PIN, "tegra_audio");
++		audio->gpio->release(HDMI_DETECT_PIN, "tegra_audio");
++		put_module(TEGRA_GPIO_MODULE_NAME);
++		audio->gpio = NULL;
++	}
++}
++
++
+ static void
+ start_jack_detection(tegra_audio* audio)
+ {
+@@ -566,6 +649,7 @@ start_jack_detection(tegra_audio* audio)
+ 
+ 	audio->headphones = -1;
+ 	audio->hdmi = -1;
++	start_jack_interrupts(audio);
+ 	audio->jackThread = spawn_kernel_thread(jack_thread, "tegra audio jack",
+ 		B_LOW_PRIORITY, audio);
+ 	if (audio->jackThread >= B_OK)
+@@ -1974,8 +2058,13 @@ tegra_audio_free_resources(tegra_audio* audio)
+ {
+ 	if (audio->jackThread >= B_OK) {
+ 		audio->quitJackThread = true;
++		if (audio->jackSem >= B_OK)
++			release_sem(audio->jackSem);
+ 		wait_for_thread(audio->jackThread, NULL);
+ 	}
++	stop_jack_interrupts(audio);
++	if (audio->jackSem >= B_OK)
++		delete_sem(audio->jackSem);
+ 	if (audio->gpioArea >= B_OK)
+ 		delete_area(audio->gpioArea);
+ 	if (audio->interruptInstalled) {
+@@ -2019,6 +2108,9 @@ tegra_audio_init_driver(device_node* node, void** _cookie)
+ 	audio->bufferArea = -1;
+ 	audio->gpioArea = -1;
+ 	audio->jackThread = -1;
++	audio->jackSem = -1;
++	audio->gpio = NULL;
++	audio->jackInterrupts = false;
+ 	audio->bufferReadySem = -1;
+ 	mutex_init(&audio->lock, "tegra audio");
+ 	B_INITIALIZE_SPINLOCK(&audio->interruptLock);
+-- 
+2.39.5
+

@@ -1,0 +1,827 @@
+From ba2bf4eef0e86807f377d12b593f1404f6e458d3 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 10 Nov 2026 07:52:56 +0100
+Subject: [PATCH 29/42] tests: the bond store and the device cache of
+ bluetooth_server
+
+24 tests, run with UnitTester: bonds kept across a reload and per
+adapter, no key in the file of the bonds, the keys file only for its
+owner, debug keys and pairings without a bond for the connection only,
+changed combination keys, the rules on forgetting a key for each status
+and side, the security of each kind of key, the listener, broken and
+half-written files, bonds without a key, fields of a later version, and
+the pruning of the device cache.
+
+All pass on ARM (AC100). Built for x86_64, not run there yet; the store
+itself also compiles with gcc2 and -Werror.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/tests/servers/Jamfile                     |   1 +
+ .../bluetooth/BluetoothServerTestAddon.cpp    |  14 +
+ src/tests/servers/bluetooth/BondStoreTest.cpp | 534 ++++++++++++++++++
+ .../servers/bluetooth/DeviceCacheTest.cpp     | 190 +++++++
+ src/tests/servers/bluetooth/Jamfile           |  20 +
+ 5 files changed, 759 insertions(+)
+ create mode 100644 src/tests/servers/bluetooth/BluetoothServerTestAddon.cpp
+ create mode 100644 src/tests/servers/bluetooth/BondStoreTest.cpp
+ create mode 100644 src/tests/servers/bluetooth/DeviceCacheTest.cpp
+ create mode 100644 src/tests/servers/bluetooth/Jamfile
+
+diff --git a/src/tests/servers/Jamfile b/src/tests/servers/Jamfile
+index 49dd4704ff..527e82411a 100644
+--- a/src/tests/servers/Jamfile
++++ b/src/tests/servers/Jamfile
+@@ -1,6 +1,7 @@
+ SubDir HAIKU_TOP src tests servers ;
+ 
+ SubInclude HAIKU_TOP src tests servers app ;
++SubInclude HAIKU_TOP src tests servers bluetooth ;
+ SubInclude HAIKU_TOP src tests servers debug ;
+ SubInclude HAIKU_TOP src tests servers input ;
+ SubInclude HAIKU_TOP src tests servers launch ;
+diff --git a/src/tests/servers/bluetooth/BluetoothServerTestAddon.cpp b/src/tests/servers/bluetooth/BluetoothServerTestAddon.cpp
+new file mode 100644
+index 0000000000..6db8615d63
+--- /dev/null
++++ b/src/tests/servers/bluetooth/BluetoothServerTestAddon.cpp
+@@ -0,0 +1,14 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include <TestSuiteAddon.h>
++
++
++const char*
++getTestSuiteName()
++{
++	return "BluetoothServer";
++}
+diff --git a/src/tests/servers/bluetooth/BondStoreTest.cpp b/src/tests/servers/bluetooth/BondStoreTest.cpp
+new file mode 100644
+index 0000000000..b3cc1edf8e
+--- /dev/null
++++ b/src/tests/servers/bluetooth/BondStoreTest.cpp
+@@ -0,0 +1,534 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++
++#include <Entry.h>
++#include <File.h>
++#include <FindDirectory.h>
++#include <Message.h>
++#include <Path.h>
++#include <String.h>
++
++#include <TestSuiteAddon.h>
++#include <cppunit/TestFixture.h>
++#include <cppunit/extensions/HelperMacros.h>
++
++#include <bluetooth/bdaddrUtils.h>
++#include <bluetooth/bluetooth_error.h>
++#include <bluetooth/HCI/btHCI_event.h>
++
++#include "BondStore.h"
++#include "KeyVault.h"
++#include "SettingsFile.h"
++
++
++static const bdaddr_t kAdapter = {{ 0xfd, 0x2c, 0x18, 0x6d, 0x62, 0x6c }};
++static const bdaddr_t kOtherAdapter = {{ 1, 2, 3, 4, 5, 6 }};
++static const bdaddr_t kSpeakers = {{ 0x70, 0x56, 0x14, 0x20, 0x8d, 0x3c }};
++static const bdaddr_t kPhone = {{ 0x6a, 0x81, 0xb2, 0xb0, 0x7d, 0x0c }};
++
++
++static linkkey_t
++make_key(uint8 seed)
++{
++	linkkey_t key;
++	for (int i = 0; i < 16; i++)
++		key.l[i] = (uint8)(seed + i * 7);
++	return key;
++}
++
++
++static bool
++same_key(const linkkey_t& a, const linkkey_t& b)
++{
++	return memcmp(&a, &b, sizeof(linkkey_t)) == 0;
++}
++
++
++static PairingContext
++simple_pairing(uint8 local, uint8 remote)
++{
++	PairingContext context;
++	context.simplePairing = true;
++	context.localAuthentication = local;
++	context.remoteAuthentication = remote;
++	return context;
++}
++
++
++static PairingContext
++bonding_pairing()
++{
++	return simple_pairing(HCI_AUTH_REQ_NO_MITM_GENERAL_BOND,
++		HCI_AUTH_REQ_NO_MITM_GENERAL_BOND);
++}
++
++
++class ChangeCounter : public BondStore::Listener {
++public:
++	ChangeCounter()
++	{
++		added = changed = removed = 0;
++	}
++
++	virtual void BondChanged(const bdaddr_t& adapter, const bdaddr_t& remote,
++		int32 change)
++	{
++		switch (change) {
++			case BondStore::kBondAdded:
++				added++;
++				break;
++			case BondStore::kBondChanged:
++				changed++;
++				break;
++			case BondStore::kBondRemoved:
++				removed++;
++				break;
++		}
++	}
++
++	int32 added;
++	int32 changed;
++	int32 removed;
++};
++
++
++class BondStoreTest : public CppUnit::TestFixture {
++	CPPUNIT_TEST_SUITE(BondStoreTest);
++	CPPUNIT_TEST(TestBondKeptAfterLoad);
++	CPPUNIT_TEST(TestBondsFileHasNoKey);
++	CPPUNIT_TEST(TestKeysFileOnlyForOwner);
++	CPPUNIT_TEST(TestDebugKeyServesConnectionOnly);
++	CPPUNIT_TEST(TestNoBondingServesConnectionOnly);
++	CPPUNIT_TEST(TestLegacyPairingKept);
++	CPPUNIT_TEST(TestChangedKeyKeepsKind);
++	CPPUNIT_TEST(TestChangedKeyWithoutBond);
++	CPPUNIT_TEST(TestPairingWithoutBondDropsOldBond);
++	CPPUNIT_TEST(TestForgetRules);
++	CPPUNIT_TEST(TestRemove);
++	CPPUNIT_TEST(TestSecurity);
++	CPPUNIT_TEST(TestListener);
++	CPPUNIT_TEST(TestBrokenBondsFile);
++	CPPUNIT_TEST(TestLeftoverTemporaryFile);
++	CPPUNIT_TEST(TestBondWithoutKeyDropped);
++	CPPUNIT_TEST(TestUnknownFieldsKept);
++	CPPUNIT_TEST(TestAdaptersApart);
++	CPPUNIT_TEST(TestImport);
++	CPPUNIT_TEST_SUITE_END();
++
++public:
++	void setUp()
++	{
++		BPath temporary;
++		find_directory(B_SYSTEM_TEMP_DIRECTORY, &temporary);
++		temporary.Append("bondstore_test_XXXXXX");
++		char path[B_PATH_NAME_LENGTH];
++		strlcpy(path, temporary.Path(), sizeof(path));
++		CPPUNIT_ASSERT(mkdtemp(path) != NULL);
++		fDirectory.SetTo(path);
++		fVault = new FileKeyVault(fDirectory);
++		fStore = NULL;
++	}
++
++	void tearDown()
++	{
++		delete fStore;
++		delete fVault;
++		BString command("rm -rf ");
++		command << "'" << fDirectory.Path() << "'";
++		system(command.String());
++	}
++
++	BondStore* NewStore(const bdaddr_t& adapter = kAdapter)
++	{
++		delete fStore;
++		delete fVault;
++		fVault = new FileKeyVault(fDirectory);
++		fStore = new BondStore(fDirectory, adapter, fVault);
++		CPPUNIT_ASSERT_EQUAL(B_OK, fStore->Load());
++		return fStore;
++	}
++
++	BPath FileOf(const char* name, const bdaddr_t& adapter = kAdapter)
++	{
++		BPath directory;
++		SettingsFile::AdapterDirectory(fDirectory, adapter, directory);
++		BPath path(directory.Path(), name);
++		return path;
++	}
++
++	void TestBondKeptAfterLoad()
++	{
++		BondStore* store = NewStore();
++		linkkey_t key = make_key(1);
++		CPPUNIT_ASSERT_EQUAL(BondStore::kBonded, store->PairingFinished(
++			kSpeakers, key, kLinkKeyUnauthenticatedP192, bonding_pairing()));
++
++		store = NewStore();
++		CPPUNIT_ASSERT(store->IsBonded(kSpeakers));
++		linkkey_t loaded;
++		CPPUNIT_ASSERT_EQUAL(B_OK, store->KeyForRequest(kSpeakers, loaded));
++		CPPUNIT_ASSERT(same_key(key, loaded));
++		BondRecord bond;
++		CPPUNIT_ASSERT(store->GetBond(kSpeakers, bond));
++		CPPUNIT_ASSERT_EQUAL((uint8)kLinkKeyUnauthenticatedP192,
++			bond.keyType);
++	}
++
++	void TestBondsFileHasNoKey()
++	{
++		BondStore* store = NewStore();
++		linkkey_t key = make_key(42);
++		store->PairingFinished(kSpeakers, key, kLinkKeyAuthenticatedP256,
++			bonding_pairing());
++
++		BFile file(FileOf("bonds").Path(), B_READ_ONLY);
++		CPPUNIT_ASSERT_EQUAL(B_OK, file.InitCheck());
++		off_t size;
++		file.GetSize(&size);
++		char* data = (char*)malloc(size);
++		CPPUNIT_ASSERT_EQUAL((ssize_t)size, file.Read(data, size));
++		bool found = false;
++		for (off_t i = 0; i + 16 <= size; i++) {
++			if (memcmp(data + i, &key, 16) == 0)
++				found = true;
++		}
++		free(data);
++		CPPUNIT_ASSERT(!found);
++
++		BMessage description;
++		store->Describe(description);
++		BMessage bond;
++		CPPUNIT_ASSERT_EQUAL(B_OK, description.FindMessage("bond", &bond));
++		CPPUNIT_ASSERT(!bond.HasData("link key", B_RAW_TYPE));
++	}
++
++	void TestKeysFileOnlyForOwner()
++	{
++		BondStore* store = NewStore();
++		store->PairingFinished(kSpeakers, make_key(3),
++			kLinkKeyUnauthenticatedP192, bonding_pairing());
++
++		struct stat keys;
++		CPPUNIT_ASSERT_EQUAL(0, stat(FileOf("keys").Path(), &keys));
++		CPPUNIT_ASSERT_EQUAL((mode_t)(S_IRUSR | S_IWUSR),
++			(mode_t)(keys.st_mode & 0777));
++	}
++
++	void TestDebugKeyServesConnectionOnly()
++	{
++		BondStore* store = NewStore();
++		linkkey_t key = make_key(5);
++		CPPUNIT_ASSERT_EQUAL(BondStore::kTemporary, store->PairingFinished(
++			kSpeakers, key, kLinkKeyDebugCombination, bonding_pairing()));
++		CPPUNIT_ASSERT(!store->IsBonded(kSpeakers));
++
++		linkkey_t loaded;
++		CPPUNIT_ASSERT_EQUAL(B_OK, store->KeyForRequest(kSpeakers, loaded));
++		CPPUNIT_ASSERT(same_key(key, loaded));
++
++		store->ConnectionClosed(kSpeakers);
++		CPPUNIT_ASSERT(store->KeyForRequest(kSpeakers, loaded) != B_OK);
++
++		store = NewStore();
++		CPPUNIT_ASSERT(!store->IsBonded(kSpeakers));
++	}
++
++	void TestNoBondingServesConnectionOnly()
++	{
++		BondStore* store = NewStore();
++		CPPUNIT_ASSERT_EQUAL(BondStore::kTemporary, store->PairingFinished(
++			kSpeakers, make_key(6), kLinkKeyUnauthenticatedP192,
++			simple_pairing(HCI_AUTH_REQ_NO_MITM_GENERAL_BOND,
++				HCI_AUTH_REQ_NO_MITM_NO_BOND)));
++		CPPUNIT_ASSERT_EQUAL(BondStore::kTemporary, store->PairingFinished(
++			kPhone, make_key(7), kLinkKeyAuthenticatedP192,
++			simple_pairing(HCI_AUTH_REQ_MITM_NO_BOND,
++				HCI_AUTH_REQ_MITM_GENERAL_BOND)));
++		CPPUNIT_ASSERT_EQUAL(BondStore::kBonded, store->PairingFinished(
++			kPhone, make_key(8), kLinkKeyAuthenticatedP192,
++			simple_pairing(HCI_AUTH_REQ_MITM_DEDICATED_BOND,
++				HCI_AUTH_REQ_MITM_GENERAL_BOND)));
++		CPPUNIT_ASSERT(!store->IsBonded(kSpeakers));
++		CPPUNIT_ASSERT(store->IsBonded(kPhone));
++	}
++
++	void TestLegacyPairingKept()
++	{
++		BondStore* store = NewStore();
++		PairingContext legacy;
++		CPPUNIT_ASSERT_EQUAL(BondStore::kBonded, store->PairingFinished(
++			kSpeakers, make_key(9), kLinkKeyCombination, legacy));
++	}
++
++	void TestChangedKeyKeepsKind()
++	{
++		BondStore* store = NewStore();
++		store->PairingFinished(kSpeakers, make_key(10),
++			kLinkKeyAuthenticatedP192, bonding_pairing());
++		linkkey_t changed = make_key(11);
++		CPPUNIT_ASSERT_EQUAL(BondStore::kBonded, store->PairingFinished(
++			kSpeakers, changed, kLinkKeyChangedCombination,
++			PairingContext()));
++
++		store = NewStore();
++		BondRecord bond;
++		CPPUNIT_ASSERT(store->GetBond(kSpeakers, bond));
++		CPPUNIT_ASSERT_EQUAL((uint8)kLinkKeyAuthenticatedP192, bond.keyType);
++		linkkey_t loaded;
++		store->KeyForRequest(kSpeakers, loaded);
++		CPPUNIT_ASSERT(same_key(changed, loaded));
++	}
++
++	void TestChangedKeyWithoutBond()
++	{
++		BondStore* store = NewStore();
++		store->PairingFinished(kSpeakers, make_key(12),
++			kLinkKeyChangedCombination, PairingContext());
++		BondRecord bond;
++		CPPUNIT_ASSERT(store->GetBond(kSpeakers, bond));
++		CPPUNIT_ASSERT_EQUAL((uint8)kLinkKeyCombination, bond.keyType);
++	}
++
++	void TestPairingWithoutBondDropsOldBond()
++	{
++		BondStore* store = NewStore();
++		store->PairingFinished(kSpeakers, make_key(13),
++			kLinkKeyUnauthenticatedP192, bonding_pairing());
++		linkkey_t fresh = make_key(14);
++		CPPUNIT_ASSERT_EQUAL(BondStore::kTemporary, store->PairingFinished(
++			kSpeakers, fresh, kLinkKeyUnauthenticatedP192,
++			simple_pairing(HCI_AUTH_REQ_NO_MITM_NO_BOND,
++				HCI_AUTH_REQ_NO_MITM_GENERAL_BOND)));
++		CPPUNIT_ASSERT(!store->IsBonded(kSpeakers));
++		linkkey_t loaded;
++		CPPUNIT_ASSERT_EQUAL(B_OK, store->KeyForRequest(kSpeakers, loaded));
++		CPPUNIT_ASSERT(same_key(fresh, loaded));
++
++		store = NewStore();
++		CPPUNIT_ASSERT(store->KeyForRequest(kSpeakers, loaded) != B_OK);
++	}
++
++	void TestForgetRules()
++	{
++		struct {
++			uint8	status;
++			bool	remoteOpened;
++			bool	forget;
++		} rules[] = {
++			{ BT_PIN_OR_KEY_MISSING, false, true },
++			{ BT_PIN_OR_KEY_MISSING, true, true },
++			{ BT_AUTHENTICATION_FAILURE, true, true },
++			{ BT_AUTHENTICATION_FAILURE, false, false },
++			{ 0x04, false, false },		// page timeout
++			{ 0x08, true, false },		// connection timeout
++			{ 0x13, true, false },		// remote user terminated
++			{ 0x22, false, false },		// LMP response timeout
++			{ 0x0d, false, false }		// limited resources
++		};
++
++		for (size_t i = 0; i < sizeof(rules) / sizeof(rules[0]); i++) {
++			BondStore* store = NewStore();
++			store->PairingFinished(kSpeakers, make_key(20 + i),
++				kLinkKeyUnauthenticatedP192, bonding_pairing());
++			CPPUNIT_ASSERT_EQUAL(rules[i].forget,
++				store->AuthenticationFailed(kSpeakers, rules[i].status,
++					rules[i].remoteOpened));
++			CPPUNIT_ASSERT_EQUAL(!rules[i].forget,
++				store->IsBonded(kSpeakers));
++
++			store = NewStore();
++			CPPUNIT_ASSERT_EQUAL(!rules[i].forget,
++				store->IsBonded(kSpeakers));
++			store->Remove(kSpeakers);
++		}
++	}
++
++	void TestRemove()
++	{
++		BondStore* store = NewStore();
++		store->PairingFinished(kSpeakers, make_key(30),
++			kLinkKeyUnauthenticatedP192, bonding_pairing());
++		store->PairingFinished(kPhone, make_key(31),
++			kLinkKeyAuthenticatedP256, bonding_pairing());
++		CPPUNIT_ASSERT_EQUAL(B_OK, store->Remove(kSpeakers));
++		CPPUNIT_ASSERT_EQUAL(B_ENTRY_NOT_FOUND, store->Remove(kSpeakers));
++
++		store = NewStore();
++		CPPUNIT_ASSERT(!store->IsBonded(kSpeakers));
++		CPPUNIT_ASSERT(store->IsBonded(kPhone));
++		linkkey_t loaded;
++		CPPUNIT_ASSERT_EQUAL(B_ENTRY_NOT_FOUND,
++			fVault->Get(kAdapter, kSpeakers, loaded));
++	}
++
++	void TestSecurity()
++	{
++		BondStore* store = NewStore();
++		CPPUNIT_ASSERT_EQUAL(BondStore::kSecurityNone,
++			store->SecurityOf(kSpeakers));
++		store->PairingFinished(kSpeakers, make_key(40),
++			kLinkKeyUnauthenticatedP256, bonding_pairing());
++		CPPUNIT_ASSERT_EQUAL(BondStore::kSecurityUnauthenticated,
++			store->SecurityOf(kSpeakers));
++		store->PairingFinished(kSpeakers, make_key(41),
++			kLinkKeyAuthenticatedP192, bonding_pairing());
++		CPPUNIT_ASSERT_EQUAL(BondStore::kSecurityAuthenticated,
++			store->SecurityOf(kSpeakers));
++		store->PairingFinished(kSpeakers, make_key(42),
++			kLinkKeyAuthenticatedP256, bonding_pairing());
++		CPPUNIT_ASSERT_EQUAL(BondStore::kSecurityAuthenticatedSecure,
++			store->SecurityOf(kSpeakers));
++
++		BondRecord bond;
++		store->GetBond(kSpeakers, bond);
++		CPPUNIT_ASSERT(bond.IsAuthenticated());
++		CPPUNIT_ASSERT(bond.IsSecureConnections());
++	}
++
++	void TestListener()
++	{
++		BondStore* store = NewStore();
++		ChangeCounter counter;
++		store->SetListener(&counter);
++		store->PairingFinished(kSpeakers, make_key(50),
++			kLinkKeyUnauthenticatedP192, bonding_pairing());
++		store->PairingFinished(kSpeakers, make_key(51),
++			kLinkKeyChangedCombination, PairingContext());
++		store->AuthenticationFailed(kSpeakers, BT_AUTHENTICATION_FAILURE,
++			false);
++		store->AuthenticationFailed(kSpeakers, BT_PIN_OR_KEY_MISSING, false);
++		store->SetListener(NULL);
++		CPPUNIT_ASSERT_EQUAL((int32)1, counter.added);
++		CPPUNIT_ASSERT_EQUAL((int32)1, counter.changed);
++		CPPUNIT_ASSERT_EQUAL((int32)1, counter.removed);
++	}
++
++	void TestBrokenBondsFile()
++	{
++		BondStore* store = NewStore();
++		linkkey_t key = make_key(60);
++		store->PairingFinished(kSpeakers, key, kLinkKeyAuthenticatedP192,
++			bonding_pairing());
++
++		BFile file(FileOf("bonds").Path(),
++			B_WRITE_ONLY | B_ERASE_FILE);
++		file.Write("not a message", 13);
++		file.Unset();
++
++		// the key is not lost: the bond comes back, of an unknown kind
++		store = NewStore();
++		BEntry broken(FileOf("bonds.broken").Path());
++		CPPUNIT_ASSERT(broken.Exists());
++		CPPUNIT_ASSERT(store->IsBonded(kSpeakers));
++		BondRecord bond;
++		store->GetBond(kSpeakers, bond);
++		CPPUNIT_ASSERT_EQUAL((uint8)kLinkKeyUnknown, bond.keyType);
++		linkkey_t loaded;
++		CPPUNIT_ASSERT_EQUAL(B_OK, store->KeyForRequest(kSpeakers, loaded));
++		CPPUNIT_ASSERT(same_key(key, loaded));
++	}
++
++	void TestLeftoverTemporaryFile()
++	{
++		BondStore* store = NewStore();
++		store->PairingFinished(kSpeakers, make_key(70),
++			kLinkKeyUnauthenticatedP192, bonding_pairing());
++
++		// a write cut short by a crash
++		BFile file(FileOf("bonds.new").Path(),
++			B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);
++		file.Write("half", 4);
++		file.Unset();
++
++		store = NewStore();
++		CPPUNIT_ASSERT(store->IsBonded(kSpeakers));
++		store->PairingFinished(kPhone, make_key(71),
++			kLinkKeyUnauthenticatedP192, bonding_pairing());
++		store = NewStore();
++		CPPUNIT_ASSERT(store->IsBonded(kSpeakers));
++		CPPUNIT_ASSERT(store->IsBonded(kPhone));
++	}
++
++	void TestBondWithoutKeyDropped()
++	{
++		BondStore* store = NewStore();
++		store->PairingFinished(kSpeakers, make_key(80),
++			kLinkKeyUnauthenticatedP192, bonding_pairing());
++		CPPUNIT_ASSERT_EQUAL(B_OK, fVault->Remove(kAdapter, kSpeakers));
++
++		store = NewStore();
++		CPPUNIT_ASSERT(!store->IsBonded(kSpeakers));
++	}
++
++	void TestUnknownFieldsKept()
++	{
++		BondStore* store = NewStore();
++		store->PairingFinished(kSpeakers, make_key(90),
++			kLinkKeyUnauthenticatedP192, bonding_pairing());
++		delete fStore;
++		fStore = NULL;
++
++		// a later version added a field
++		BMessage file;
++		CPPUNIT_ASSERT_EQUAL(B_OK, SettingsFile::Read(FileOf("bonds"), file));
++		BMessage bond;
++		file.FindMessage("bond", &bond);
++		bond.AddString("future", "kept");
++		file.ReplaceMessage("bond", &bond);
++		CPPUNIT_ASSERT_EQUAL(B_OK, SettingsFile::Write(FileOf("bonds"), file,
++			0644));
++
++		store = NewStore();
++		store->SetEncryptionKeySize(kSpeakers, 16);
++		CPPUNIT_ASSERT_EQUAL(B_OK, store->Flush());
++
++		CPPUNIT_ASSERT_EQUAL(B_OK, SettingsFile::Read(FileOf("bonds"), file));
++		file.FindMessage("bond", &bond);
++		CPPUNIT_ASSERT_EQUAL(BString("kept"),
++			BString(bond.GetString("future", "")));
++		CPPUNIT_ASSERT_EQUAL((uint8)16, bond.GetUInt8("encryption key size",
++			0));
++	}
++
++	void TestAdaptersApart()
++	{
++		BondStore* store = NewStore(kAdapter);
++		store->PairingFinished(kSpeakers, make_key(100),
++			kLinkKeyUnauthenticatedP192, bonding_pairing());
++
++		store = NewStore(kOtherAdapter);
++		CPPUNIT_ASSERT(!store->IsBonded(kSpeakers));
++		linkkey_t loaded;
++		CPPUNIT_ASSERT(store->KeyForRequest(kSpeakers, loaded) != B_OK);
++
++		store = NewStore(kAdapter);
++		CPPUNIT_ASSERT(store->IsBonded(kSpeakers));
++	}
++
++	void TestImport()
++	{
++		BondStore* store = NewStore();
++		linkkey_t key = make_key(110);
++		CPPUNIT_ASSERT_EQUAL(B_OK, store->Import(kSpeakers, key,
++			kLinkKeyUnknown));
++		store = NewStore();
++		linkkey_t loaded;
++		CPPUNIT_ASSERT_EQUAL(B_OK, store->KeyForRequest(kSpeakers, loaded));
++		CPPUNIT_ASSERT(same_key(key, loaded));
++	}
++
++private:
++	BPath			fDirectory;
++	KeyVault*		fVault;
++	BondStore*		fStore;
++};
++
++
++CPPUNIT_TEST_SUITE_NAMED_REGISTRATION(BondStoreTest, getTestSuiteName());
+diff --git a/src/tests/servers/bluetooth/DeviceCacheTest.cpp b/src/tests/servers/bluetooth/DeviceCacheTest.cpp
+new file mode 100644
+index 0000000000..b6dab3e9ad
+--- /dev/null
++++ b/src/tests/servers/bluetooth/DeviceCacheTest.cpp
+@@ -0,0 +1,190 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++#include <FindDirectory.h>
++#include <Message.h>
++#include <Path.h>
++#include <String.h>
++
++#include <TestSuiteAddon.h>
++#include <cppunit/TestFixture.h>
++#include <cppunit/extensions/HelperMacros.h>
++
++#include <bluetooth/HCI/btHCI_event.h>
++
++#include "BondStore.h"
++#include "DeviceCache.h"
++#include "KeyVault.h"
++#include "SettingsFile.h"
++
++
++static const bdaddr_t kAdapter = {{ 0xfd, 0x2c, 0x18, 0x6d, 0x62, 0x6c }};
++static const bdaddr_t kSpeakers = {{ 0x70, 0x56, 0x14, 0x20, 0x8d, 0x3c }};
++static const bdaddr_t kPhone = {{ 0x6a, 0x81, 0xb2, 0xb0, 0x7d, 0x0c }};
++
++
++static bdaddr_t
++address(uint8 last)
++{
++	bdaddr_t address = {{ last, 1, 2, 3, 4, 5 }};
++	return address;
++}
++
++
++class DeviceCacheTest : public CppUnit::TestFixture {
++	CPPUNIT_TEST_SUITE(DeviceCacheTest);
++	CPPUNIT_TEST(TestKeptAfterLoad);
++	CPPUNIT_TEST(TestServiceClasses);
++	CPPUNIT_TEST(TestPruneOld);
++	CPPUNIT_TEST(TestPruneTooMany);
++	CPPUNIT_TEST(TestRemove);
++	CPPUNIT_TEST_SUITE_END();
++
++public:
++	void setUp()
++	{
++		BPath temporary;
++		find_directory(B_SYSTEM_TEMP_DIRECTORY, &temporary);
++		temporary.Append("devicecache_test_XXXXXX");
++		char path[B_PATH_NAME_LENGTH];
++		strlcpy(path, temporary.Path(), sizeof(path));
++		CPPUNIT_ASSERT(mkdtemp(path) != NULL);
++		fDirectory.SetTo(path);
++	}
++
++	void tearDown()
++	{
++		BString command("rm -rf ");
++		command << "'" << fDirectory.Path() << "'";
++		system(command.String());
++	}
++
++	void TestKeptAfterLoad()
++	{
++		{
++			DeviceCache cache(fDirectory, kAdapter);
++			CPPUNIT_ASSERT_EQUAL(B_OK, cache.Load());
++			DeviceRecord record;
++			record.address = kSpeakers;
++			record.name = "Cucina";
++			record.deviceClass[1] = 0x04;
++			record.clockOffset = 0x1234;
++			record.pageScanRepetitionMode = 1;
++			cache.Update(record);
++			CPPUNIT_ASSERT_EQUAL(B_OK, cache.Flush());
++		}
++
++		DeviceCache cache(fDirectory, kAdapter);
++		CPPUNIT_ASSERT_EQUAL(B_OK, cache.Load());
++		DeviceRecord record;
++		CPPUNIT_ASSERT(cache.Get(kSpeakers, record));
++		CPPUNIT_ASSERT_EQUAL(BString("Cucina"), record.name);
++		CPPUNIT_ASSERT_EQUAL((uint8)0x04, record.deviceClass[1]);
++		CPPUNIT_ASSERT_EQUAL((uint16)0x1234, record.clockOffset);
++		CPPUNIT_ASSERT_EQUAL((uint8)1, record.pageScanRepetitionMode);
++		CPPUNIT_ASSERT(record.lastSeen > 0);
++		CPPUNIT_ASSERT(!cache.Get(kPhone, record));
++	}
++
++	void TestServiceClasses()
++	{
++		{
++			DeviceCache cache(fDirectory, kAdapter);
++			cache.Load();
++			uint16 classes[] = { 0x111f, 0x110b, 0x110e };
++			cache.SetServiceClasses(kSpeakers, classes, 3);
++			cache.SetName(kSpeakers, "Cucina");
++		}
++
++		DeviceCache cache(fDirectory, kAdapter);
++		cache.Load();
++		DeviceRecord record;
++		CPPUNIT_ASSERT(cache.Get(kSpeakers, record));
++		CPPUNIT_ASSERT_EQUAL((uint8)3, record.serviceClassCount);
++		CPPUNIT_ASSERT(record.HasServiceClass(0x110b));
++		CPPUNIT_ASSERT(!record.HasServiceClass(0x1124));
++		CPPUNIT_ASSERT_EQUAL(BString("Cucina"), record.name);
++	}
++
++	void TestPruneOld()
++	{
++		// a file with a device not seen for a year, paired and not
++		BMessage file('btDv');
++		int64 longAgo = (int64)time(NULL) - 365 * 24 * 3600;
++		bdaddr_t addresses[] = { kSpeakers, kPhone };
++		for (int i = 0; i < 2; i++) {
++			BMessage device;
++			device.AddData("address", B_RAW_TYPE, &addresses[i],
++				sizeof(bdaddr_t));
++			device.AddInt64("last seen", longAgo);
++			file.AddMessage("device", &device);
++		}
++		BPath directory;
++		SettingsFile::AdapterDirectory(fDirectory, kAdapter, directory);
++		BPath path(directory.Path(), "devices");
++		CPPUNIT_ASSERT_EQUAL(B_OK, SettingsFile::Write(path, file, 0644));
++
++		FileKeyVault vault(fDirectory);
++		BondStore bonds(fDirectory, kAdapter, &vault);
++		bonds.Load();
++		PairingContext context;
++		linkkey_t key;
++		memset(&key, 7, sizeof(key));
++		bonds.PairingFinished(kSpeakers, key, kLinkKeyCombination, context);
++
++		DeviceCache cache(fDirectory, kAdapter);
++		cache.Load();
++		CPPUNIT_ASSERT_EQUAL((int32)1,
++			cache.Prune(bonds, 30 * 24 * 3600, 100));
++		DeviceRecord record;
++		CPPUNIT_ASSERT(cache.Get(kSpeakers, record));
++		CPPUNIT_ASSERT(!cache.Get(kPhone, record));
++	}
++
++	void TestPruneTooMany()
++	{
++		FileKeyVault vault(fDirectory);
++		BondStore bonds(fDirectory, kAdapter, &vault);
++		bonds.Load();
++
++		DeviceCache cache(fDirectory, kAdapter);
++		cache.Load();
++		for (uint8 i = 0; i < 10; i++) {
++			DeviceRecord record;
++			record.address = address(i);
++			cache.Update(record);
++		}
++		CPPUNIT_ASSERT_EQUAL((int32)6,
++			cache.Prune(bonds, 30 * 24 * 3600, 4));
++		CPPUNIT_ASSERT_EQUAL((int32)4, cache.CountRecords());
++	}
++
++	void TestRemove()
++	{
++		DeviceCache cache(fDirectory, kAdapter);
++		cache.Load();
++		cache.SetName(kSpeakers, "Cucina");
++		cache.SetName(kPhone, "moto g15");
++		cache.Remove(kSpeakers);
++		CPPUNIT_ASSERT_EQUAL(B_OK, cache.Flush());
++
++		DeviceCache loaded(fDirectory, kAdapter);
++		loaded.Load();
++		DeviceRecord record;
++		CPPUNIT_ASSERT(!loaded.Get(kSpeakers, record));
++		CPPUNIT_ASSERT(loaded.Get(kPhone, record));
++	}
++
++private:
++	BPath			fDirectory;
++};
++
++
++CPPUNIT_TEST_SUITE_NAMED_REGISTRATION(DeviceCacheTest, getTestSuiteName());
+diff --git a/src/tests/servers/bluetooth/Jamfile b/src/tests/servers/bluetooth/Jamfile
+new file mode 100644
+index 0000000000..c2eb0c3c8c
+--- /dev/null
++++ b/src/tests/servers/bluetooth/Jamfile
+@@ -0,0 +1,20 @@
++SubDir HAIKU_TOP src tests servers bluetooth ;
++
++UsePrivateHeaders bluetooth shared ;
++
++SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src servers bluetooth ] ;
++
++UnitTestLib libbluetooth_servertest.so :
++	BluetoothServerTestAddon.cpp
++
++	BondStoreTest.cpp
++	DeviceCacheTest.cpp
++
++	# from the bluetooth_server
++	BondStore.cpp
++	DeviceCache.cpp
++	KeyVault.cpp
++	SettingsFile.cpp
++
++	: be libbluetooth.so [ TargetLibstdc++ ] [ TargetLibsupc++ ]
++;
+-- 
+2.39.5
+

@@ -1,0 +1,1061 @@
+From 48df0e953aaa4e34c6faa29a4ba045325895a3cf Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 10 Nov 2026 20:35:05 +0100
+Subject: [PATCH 30/42] bluetooth_server: keep the bonds in the bond store
+
+The server keeps one bond store and one device cache per controller
+address, for as long as it runs; a controller takes them once it knows
+its address, which the setup now reads (Read BD_ADDR), and takes the
+answer to whoever asked first. A controller that comes back on the bus
+takes the same ones again: the old one no longer writes the file over
+the new one when it goes. They live in the system settings,
+"bluetooth/<address>/".
+
+Link key requests are answered from the store, new keys go to it with
+what the pairing told (both sides' authentication requirements of a
+simple pairing), and refused keys are forgotten by its rules. A key
+from a pairing is kept also when the device was not in the list yet.
+The paired devices are the bonded ones; names, classes and services go
+to the cache. Removing a device removes its bond, also when it is not
+in the list.
+
+The first time an adapter has no bonds, those of Bluetooth_paired_devices
+are taken in. The file stays as it is, as the Bluetooth audio add-on
+still reads it, but the server no longer writes it.
+
+Bond changes are sent to the watchers of BT_NOTICE_BONDS_CHANGED, from
+the looper. The fingerprints of the keys (made, given to the controller)
+are traced only with "trace keys" in the Bluetooth settings, replacing
+the temporary trace.
+
+Tested on the AC100: 2 bonds and 3 devices taken in, the keys unchanged
+(same fingerprints), "keys" readable by its owner only, "bonds" without
+keys, and the device that had no key no longer listed as paired.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ headers/private/bluetooth/bluetoothserver_p.h |   5 +
+ src/servers/bluetooth/BluetoothServer.cpp     | 230 +++++++++++-
+ src/servers/bluetooth/BluetoothServer.h       |  24 +-
+ src/servers/bluetooth/DeviceCache.cpp         |   1 +
+ src/servers/bluetooth/DeviceCache.h           |   3 +
+ src/servers/bluetooth/LocalDeviceImpl.cpp     | 334 ++++++++++--------
+ src/servers/bluetooth/LocalDeviceImpl.h       |  29 +-
+ 7 files changed, 457 insertions(+), 169 deletions(-)
+
+diff --git a/headers/private/bluetooth/bluetoothserver_p.h b/headers/private/bluetooth/bluetoothserver_p.h
+index 62989cc651..0dddd3da81 100644
+--- a/headers/private/bluetooth/bluetoothserver_p.h
++++ b/headers/private/bluetooth/bluetoothserver_p.h
+@@ -49,5 +49,10 @@
+ 	// (string) and "battery" (int32 percent, -1 unknown) for every connected
+ 	// device
+ 
++// A bond was made, changed or removed: sent with SendNotices() to whoever
++// watches the server for it (BHandler::StartWatching()), with "adapter" and
++// "address" (B_RAW_TYPE, bdaddr_t) and "change" (int32, see BondStore)
++#define BT_NOTICE_BONDS_CHANGED         'btBC'
++
+ 
+ #endif
+diff --git a/src/servers/bluetooth/BluetoothServer.cpp b/src/servers/bluetooth/BluetoothServer.cpp
+index 0b4acdb76e..ed60a76fbe 100644
+--- a/src/servers/bluetooth/BluetoothServer.cpp
++++ b/src/servers/bluetooth/BluetoothServer.cpp
+@@ -13,6 +13,8 @@
+ #include <Entry.h>
+ #include <Deskbar.h>
+ #include <Directory.h>
++#include <File.h>
++#include <FindDirectory.h>
+ #include <Message.h>
+ #include <MessageRunner.h>
+ #include <Path.h>
+@@ -40,6 +42,11 @@
+ #include "Notifications.h"
+ #include "SDPServer.h"
+ #include "SDPClient.h"
++#include "SettingsFile.h"
++
++
++// a bond changed (BondStore::Listener): to the watchers, from the looper
++static const uint32 kMsgBondChanged = 'btBX';
+ 
+ 
+ status_t
+@@ -72,8 +79,16 @@ DispatchEvent(struct hci_event_header* header, int32 code, size_t size)
+ BluetoothServer::BluetoothServer()
+ 	:
+ 	BApplication(BLUETOOTH_SIGNATURE),
+-	fDevicesLock("bluetooth devices")
++	fDevicesLock("bluetooth devices"),
++	fStoresLock("bluetooth stores"),
++	fKeyVault(NULL),
++	fBondStores(2),
++	fDeviceCaches(2)
+ {
++	BPath directory;
++	if (_StateDirectory(directory) == B_OK)
++		fKeyVault = new(std::nothrow) FileKeyVault(directory);
++
+ 	fDeviceManager = new DeviceManager();
+ 	fLocalDevicesList.MakeEmpty();
+ 	fWatchersList.MakeEmpty();
+@@ -110,6 +125,14 @@ bool BluetoothServer::QuitRequested(void)
+ 		_RemoveLocalDevice(fLocalDevicesList.ItemAt(0));
+ 	fDevicesLock.Unlock();
+ 
++	// after the controllers, which borrow them
++	fStoresLock.Lock();
++	fDeviceCaches.MakeEmpty();
++	fBondStores.MakeEmpty();
++	delete fKeyVault;
++	fKeyVault = NULL;
++	fStoresLock.Unlock();
++
+ 	_RemoveDeskbarIcon();
+ 
+ 	fSDPServer->Stop();
+@@ -203,6 +226,14 @@ void BluetoothServer::MessageReceived(BMessage* message)
+ 		}
+ 		break;
+ 
++		case kMsgBondChanged:
++		{
++			BMessage notice(*message);
++			notice.what = BT_NOTICE_BONDS_CHANGED;
++			SendNotices(BT_NOTICE_BONDS_CHANGED, &notice);
++			break;
++		}
++
+ 		case kMsgRescanDevices:
+ 			_RescanDevices();
+ 			break;
+@@ -304,10 +335,17 @@ void BluetoothServer::MessageReceived(BMessage* message)
+ 
+ 			const bdaddr_t* bdaddr;
+ 			ssize_t addr_size;
+-			message->FindData("bdaddr", B_ANY_TYPE, (const void**)&bdaddr, &addr_size);
++			if (message->FindData("bdaddr", B_ANY_TYPE,
++					(const void**)&bdaddr, &addr_size) != B_OK
++				|| addr_size != sizeof(bdaddr_t)) {
++				break;
++			}
+ 
+ 			ServerRemoteDevice* rd = lDeviceImpl->RemoteDeviceByAddr(*bdaddr);
+-			lDeviceImpl->RemoveRemoteDevice(rd);
++			if (rd != NULL)
++				lDeviceImpl->RemoveRemoteDevice(rd);
++			else if (lDeviceImpl->Bonds() != NULL)
++				lDeviceImpl->Bonds()->Remove(*bdaddr);
+ 		}
+ 		break;
+ 
+@@ -345,9 +383,7 @@ void BluetoothServer::MessageReceived(BMessage* message)
+ 					sizeof(rd->classOfDevice));
+ 				device.AddUInt16("clock_offset", rd->clock_offset);
+ 				device.AddUInt8("pscan_rep_mode", rd->pscan_rep_mode);
+-				linkkey_t nullKey = LinkKeyUtils::NullKey();
+-				device.AddBool("trusted",
+-					!LinkKeyUtils::Compare(&rd->link_key, &nullKey));
++				device.AddBool("trusted", lDeviceImpl->IsBonded(rd->bdaddr));
+ 
+ 				reply.AddMessage("remote", &device);
+ 			}
+@@ -390,8 +426,8 @@ void BluetoothServer::MessageReceived(BMessage* message)
+ 				break;
+ 			bdaddr_t bdaddr = bdaddrUtils::FromString(address);
+ 			for (int32 i = 0; i < fLocalDevicesList.CountItems(); i++) {
+-				ServerRemoteDevice* rd
+-					= fLocalDevicesList.ItemAt(i)->RemoteDeviceByAddr(bdaddr);
++				LocalDeviceImpl* local = fLocalDevicesList.ItemAt(i);
++				ServerRemoteDevice* rd = local->RemoteDeviceByAddr(bdaddr);
+ 				if (rd == NULL)
+ 					continue;
+ 				reply.AddString("name", rd->friendly_name);
+@@ -401,10 +437,12 @@ void BluetoothServer::MessageReceived(BMessage* message)
+ 				reply.AddInt8("connection state", (int8)rd->conn_state);
+ 				reply.AddBool("encrypted", rd->encryption_enabled != 0
+ 					&& rd->conn_state == RemoteDevice::CONNECTED);
+-				linkkey_t nullKey = LinkKeyUtils::NullKey();
+-				reply.AddBool("paired",
+-					!LinkKeyUtils::Compare(&rd->link_key, &nullKey));
+-				reply.AddUInt8("key type", rd->key_type);
++				BondRecord bond;
++				bool bonded = local->Bonds() != NULL
++					&& local->Bonds()->GetBond(rd->bdaddr, bond);
++				reply.AddBool("paired", bonded);
++				reply.AddUInt8("key type",
++					bonded ? bond.keyType : kLinkKeyUnknown);
+ 				for (uint8 k = 0; k < rd->serviceClassCount; k++)
+ 					reply.AddUInt16("service class", rd->serviceClasses[k]);
+ 				reply.AddInt32("battery", HIDProfile::BatteryLevel(rd->bdaddr));
+@@ -651,13 +689,179 @@ BluetoothServer::_KeepServiceClasses(ServerRemoteDevice* rd,
+ 	for (int32 i = 0; i < fLocalDevicesList.CountItems(); i++) {
+ 		LocalDeviceImpl* local = fLocalDevicesList.ItemAt(i);
+ 		if (local->RemoteDeviceByAddr(rd->bdaddr) == rd) {
+-			local->SaveRemoteDevices();
++			local->ServicesRead(rd);
+ 			break;
+ 		}
+ 	}
+ }
+ 
+ 
++//	#pragma mark - bonds and known devices
++
++
++/*!	The bonds of an adapter, read when it is first asked for. The first
++	time an adapter has none, those of the file the server kept before
++	(Bluetooth_paired_devices) are taken in.
++*/
++BondStore*
++BluetoothServer::BondStoreFor(const bdaddr_t& adapter)
++{
++	BAutolock locker(fStoresLock);
++	for (int32 i = 0; i < fBondStores.CountItems(); i++) {
++		BondStore* bonds = fBondStores.ItemAt(i);
++		if (bdaddrUtils::Compare(bonds->Adapter(), adapter))
++			return bonds;
++	}
++
++	BPath directory;
++	if (fKeyVault == NULL || _StateDirectory(directory) != B_OK)
++		return NULL;
++	DeviceCache* devices = DeviceCacheFor(adapter);
++	if (devices == NULL)
++		return NULL;
++
++	BPath adapterDirectory;
++	BPath bondsFile;
++	bool firstTime = SettingsFile::AdapterDirectory(directory, adapter,
++			adapterDirectory) == B_OK
++		&& bondsFile.SetTo(adapterDirectory.Path(), "bonds") == B_OK
++		&& !BEntry(bondsFile.Path()).Exists();
++
++	BondStore* bonds = new(std::nothrow) BondStore(directory, adapter,
++		fKeyVault);
++	if (bonds == NULL || !fBondStores.AddItem(bonds)) {
++		delete bonds;
++		return NULL;
++	}
++	bonds->Load();
++	if (firstTime)
++		_ImportPairedDevicesFile(bonds, devices);
++	bonds->SetListener(this);
++	return bonds;
++}
++
++
++DeviceCache*
++BluetoothServer::DeviceCacheFor(const bdaddr_t& adapter)
++{
++	BAutolock locker(fStoresLock);
++	BPath directory;
++	if (_StateDirectory(directory) != B_OK)
++		return NULL;
++
++	for (int32 i = 0; i < fDeviceCaches.CountItems(); i++) {
++		DeviceCache* devices = fDeviceCaches.ItemAt(i);
++		if (bdaddrUtils::Compare(devices->Adapter(), adapter))
++			return devices;
++	}
++
++	DeviceCache* devices = new(std::nothrow) DeviceCache(directory, adapter);
++	if (devices == NULL || !fDeviceCaches.AddItem(devices)) {
++		delete devices;
++		return NULL;
++	}
++	devices->Load();
++	return devices;
++}
++
++
++void
++BluetoothServer::BondChanged(const bdaddr_t& adapter, const bdaddr_t& remote,
++	int32 change)
++{
++	// any thread may change a bond: the looper tells the watchers
++	BMessage message(kMsgBondChanged);
++	message.AddData("adapter", B_RAW_TYPE, &adapter, sizeof(bdaddr_t));
++	message.AddData("address", B_RAW_TYPE, &remote, sizeof(bdaddr_t));
++	message.AddInt32("change", change);
++	PostMessage(&message);
++}
++
++
++/*!	Where the server keeps its state: a folder of the system, as the bonds
++	belong to the adapters, not to a user.
++*/
++status_t
++BluetoothServer::_StateDirectory(BPath& path)
++{
++	status_t status = find_directory(B_SYSTEM_SETTINGS_DIRECTORY, &path, true);
++	if (status == B_OK)
++		status = path.Append("bluetooth");
++	if (status == B_OK) {
++		status = create_directory(path.Path(), 0755);
++		if (status == B_FILE_EXISTS)
++			status = B_OK;
++	}
++	return status;
++}
++
++
++/*!	Takes the paired devices of the file kept before the bond store: the
++	keys become bonds of this adapter (the file did not tell which adapter
++	they were of), and what is known of every device goes to the cache.
++	The file stays as it is, for the Bluetooth audio add-on that still
++	reads it; the server no longer writes it.
++*/
++void
++BluetoothServer::_ImportPairedDevicesFile(BondStore* bonds,
++	DeviceCache* devices)
++{
++	BPath path;
++	if (find_directory(B_USER_SETTINGS_DIRECTORY, &path) != B_OK
++		|| path.Append("Bluetooth_paired_devices") != B_OK) {
++		return;
++	}
++	BFile file(path.Path(), B_READ_ONLY);
++	BMessage paired;
++	if (file.InitCheck() != B_OK || paired.Unflatten(&file) != B_OK)
++		return;
++
++	int32 bonded = 0;
++	int32 known = 0;
++	BMessage device;
++	for (int32 i = 0; paired.FindMessage("remote", i, &device) == B_OK; i++) {
++		const void* data;
++		ssize_t size;
++		if (device.FindData("bdaddr", B_ANY_TYPE, &data, &size) != B_OK
++			|| size != sizeof(bdaddr_t)) {
++			continue;
++		}
++
++		DeviceRecord record;
++		record.address = *(const bdaddr_t*)data;
++		record.name = device.GetString("name", "");
++		if (device.FindData("class_of_device", B_RAW_TYPE, &data, &size)
++				== B_OK && size == sizeof(record.deviceClass)) {
++			memcpy(record.deviceClass, data, size);
++		}
++		record.clockOffset = device.GetUInt16("clock_offset", 0);
++		record.pageScanRepetitionMode = device.GetUInt8("pscan_rep_mode", 0);
++		uint16 serviceClass;
++		while (record.serviceClassCount < B_COUNT_OF(record.serviceClasses)
++			&& device.FindUInt16("service class", record.serviceClassCount,
++				&serviceClass) == B_OK) {
++			record.serviceClasses[record.serviceClassCount++] = serviceClass;
++		}
++		devices->Update(record);
++		known++;
++
++		linkkey_t nullKey = LinkKeyUtils::NullKey();
++		if (device.FindData("link key", B_ANY_TYPE, &data, &size) == B_OK
++			&& size == sizeof(linkkey_t)
++			&& !LinkKeyUtils::Compare((linkkey_t*)data, &nullKey)
++			&& bonds->Import(record.address, *(const linkkey_t*)data,
++				device.GetUInt8("key type", kLinkKeyUnknown)) == B_OK) {
++			bonded++;
++		}
++	}
++	devices->Flush();
++
++	syslog(LOG_NOTICE, "bluetooth_server: %" B_PRId32 " bonds and %" B_PRId32
++		" devices taken from %s, which is no longer written\n", bonded,
++		known, path.Path());
++}
++
++
+ void
+ BluetoothServer::NotifyServices(ServerRemoteDevice* rd)
+ {
+diff --git a/src/servers/bluetooth/BluetoothServer.h b/src/servers/bluetooth/BluetoothServer.h
+index 34fb175e74..245682955d 100644
+--- a/src/servers/bluetooth/BluetoothServer.h
++++ b/src/servers/bluetooth/BluetoothServer.h
+@@ -17,7 +17,10 @@
+ #include <bluetooth/HCI/btHCI_transport.h>
+ #include <bluetooth/HCI/btHCI_command.h>
+ 
++#include "BondStore.h"
++#include "DeviceCache.h"
+ #include "DeviceManager.h"
++#include "KeyVault.h"
+ 
+ class SDPClient;
+ #include "HCIDelegate.h"
+@@ -51,7 +54,7 @@ typedef PortListener<struct hci_event_header,
+ 	24					// Some devices have sent chunks of 24 events(inquiry result)
+ 	> BluetoothPortListener;
+ 
+-class BluetoothServer : public BApplication
++class BluetoothServer : public BApplication, public BondStore::Listener
+ {
+ public:
+ 
+@@ -88,6 +91,16 @@ public:
+ 
+     LocalDeviceImpl*    LocateLocalDeviceImpl(hci_id hid);
+ 
++	// The bonds and the known devices of a controller address, for as long
++	// as the server runs: a controller that comes back on the bus takes
++	// the same ones again, so that two never write the same files.
++	BondStore*			BondStoreFor(const bdaddr_t& adapter);
++	DeviceCache*		DeviceCacheFor(const bdaddr_t& adapter);
++
++	// BondStore::Listener: told to the watchers from the looper
++	virtual	void		BondChanged(const bdaddr_t& adapter,
++							const bdaddr_t& remote, int32 change);
++
+ 	/*!	The local devices and their remote devices are used by the looper
+ 		and by the thread that receives the events of the controllers:
+ 		both hold this lock while they do.
+@@ -117,6 +130,10 @@ private:
+ 	void				_InstallDeskbarIcon();
+ 	void				_RemoveDeskbarIcon();
+ 
++	status_t			_StateDirectory(BPath& path);
++	void				_ImportPairedDevicesFile(BondStore* bonds,
++							DeviceCache* devices);
++
+ 	BLocker				fDevicesLock;
+ 	LocalDevicesList   	fLocalDevicesList;
+ 	WatchersList		fWatchersList;
+@@ -131,6 +148,11 @@ private:
+ 	
+ 	SDPServer*              fSDPServer;
+ 	SDPClient*				fSDPClient;
++
++	BLocker					fStoresLock;
++	KeyVault*				fKeyVault;
++	BObjectList<BondStore, true> fBondStores;
++	BObjectList<DeviceCache, true> fDeviceCaches;
+ };
+ 
+ #endif
+diff --git a/src/servers/bluetooth/DeviceCache.cpp b/src/servers/bluetooth/DeviceCache.cpp
+index ded65a357a..c2c646fedd 100644
+--- a/src/servers/bluetooth/DeviceCache.cpp
++++ b/src/servers/bluetooth/DeviceCache.cpp
+@@ -62,6 +62,7 @@ DeviceRecord::HasServiceClass(uint16 serviceClass) const
+ DeviceCache::DeviceCache(const BPath& directory, const bdaddr_t& adapter)
+ 	:
+ 	fLock("bluetooth devices"),
++	fAdapter(adapter),
+ 	fEntries(20),
+ 	fDirty(false)
+ {
+diff --git a/src/servers/bluetooth/DeviceCache.h b/src/servers/bluetooth/DeviceCache.h
+index f05b50f3e2..b97f08ae28 100644
+--- a/src/servers/bluetooth/DeviceCache.h
++++ b/src/servers/bluetooth/DeviceCache.h
+@@ -53,6 +53,8 @@ public:
+ 			status_t			Flush();
+ 				// writes what changed; the server calls it now and then
+ 
++			const bdaddr_t&		Adapter() const { return fAdapter; }
++
+ 			bool				Get(const bdaddr_t& remote,
+ 									DeviceRecord& _record) const;
+ 			int32				CountRecords() const;
+@@ -83,6 +85,7 @@ private:
+ private:
+ 	mutable	BLocker				fLock;
+ 			BPath				fPath;
++			bdaddr_t			fAdapter;
+ 			BObjectList<Entry, true> fEntries;
+ 			bool				fDirty;
+ };
+diff --git a/src/servers/bluetooth/LocalDeviceImpl.cpp b/src/servers/bluetooth/LocalDeviceImpl.cpp
+index 0c36d28cb0..ed59d0f93c 100644
+--- a/src/servers/bluetooth/LocalDeviceImpl.cpp
++++ b/src/servers/bluetooth/LocalDeviceImpl.cpp
+@@ -42,6 +42,7 @@ static const size_t kInquiryResponseSize = 14;
+ enum {
+ 	kInitReset = 0,
+ 	kInitReadVersion,
++	kInitReadAddress,
+ 	kInitReadBufferSize,
+ 	kInitEventMask,
+ 	kInitSimplePairing,
+@@ -56,6 +57,7 @@ enum {
+ static const uint16 kInitOpcodes[] = {
+ 	PACK_OPCODE(OGF_CONTROL_BASEBAND, OCF_RESET),
+ 	PACK_OPCODE(OGF_INFORMATIONAL_PARAM, OCF_READ_LOCAL_VERSION),
++	PACK_OPCODE(OGF_INFORMATIONAL_PARAM, OCF_READ_BD_ADDR),
+ 	PACK_OPCODE(OGF_INFORMATIONAL_PARAM, OCF_READ_BUFFER_SIZE),
+ 	PACK_OPCODE(OGF_CONTROL_BASEBAND, OCF_SET_EVENT_MASK),
+ 	PACK_OPCODE(OGF_CONTROL_BASEBAND, OCF_WRITE_SIMPLE_PAIRING_MODE),
+@@ -174,12 +176,13 @@ LocalDeviceImpl::CreateTransportAccessor(BPath* path)
+ LocalDeviceImpl::LocalDeviceImpl(HCIDelegate* hd)
+ 	:
+ 	LocalDeviceHandler(hd),
++	fBonds(NULL),
++	fDevices(NULL),
+ 	fDiscoverable(false),
+ 	fInitStep(-1),
+ 	fInitTries(0),
+ 	fLmpVersion(0)
+ {
+-	LoadRemoteDevices();
+ }
+ 
+ 
+@@ -192,7 +195,12 @@ LocalDeviceImpl::~LocalDeviceImpl()
+ 			_LinkDown(rd);
+ 	}
+ 
+-	SaveRemoteDevices();
++	// the stores belong to the server, and outlive this controller: one
++	// that comes back on the bus takes them again
++	if (fDevices != NULL)
++		fDevices->Flush();
++	if (fBonds != NULL)
++		fBonds->Flush();
+ }
+ 
+ 
+@@ -210,11 +218,22 @@ LocalDeviceImpl::Unregister()
+ }
+ 
+ 
+-// TEMPORARY (debugging keys that a device refuses after a restart): a
+-// 16-bit fingerprint of a link key, the same at every step it goes through,
+-// that does not tell the key itself
++/*!	Whether the server traces fingerprints of the link keys ("trace keys"
++	in the Bluetooth settings): 16 bits of a key, the same at every step it
++	goes through, which do not tell the key. They showed that a key a device
++	refused was the one it paired with.
++*/
++static bool
++TraceKeys()
++{
++	BMessage settings;
++	return LoadBluetoothSettings(settings)
++		&& settings.GetBool("trace keys", false);
++}
++
++
+ static void
+-trace_key(const char* step, const bdaddr_t& address, const linkkey_t& key)
++TraceKey(const char* step, const bdaddr_t& address, const linkkey_t& key)
+ {
+ 	uint32 hash = 2166136261u;
+ 	const uint8* bytes = (const uint8*)&key;
+@@ -226,104 +245,112 @@ trace_key(const char* step, const bdaddr_t& address, const linkkey_t& key)
+ }
+ 
+ 
++/*!	The address of the controller is known: its bonds and known devices
++	come in, and the bonded devices make the list of the paired ones.
++*/
+ void
+-LocalDeviceImpl::SaveRemoteDevices()
++LocalDeviceImpl::_AttachStores(const bdaddr_t& address)
+ {
+-	BMessage devices;
++	if (fBonds != NULL)
++		return;
+ 
+-	for (int32 i = 0; i < fRemoteDevicesList.CountItems(); i++) {
+-		ServerRemoteDevice* rd = fRemoteDevicesList.ItemAt(i);
+-		BMessage device;
+-		bdaddr_t bdaddr = rd->bdaddr;
+-		linkkey_t link_key = rd->link_key;
+-		device.AddData("bdaddr", B_ANY_TYPE, &bdaddr, sizeof(bdaddr_t));
+-		device.AddString("name", rd->friendly_name);
+-		device.AddUInt16("clock_offset", rd->clock_offset);
+-		device.AddUInt8("pscan_rep_mode", rd->pscan_rep_mode);
+-		device.AddData("class_of_device", B_RAW_TYPE, rd->classOfDevice,
+-			sizeof(rd->classOfDevice));
+-		device.AddData("link key", B_ANY_TYPE, &link_key, sizeof(linkkey_t));
+-		linkkey_t nullKey = LinkKeyUtils::NullKey();
+-		if (!LinkKeyUtils::Compare(&link_key, &nullKey))
+-			trace_key("saved", bdaddr, link_key);
+-		device.AddUInt8("key type", rd->key_type);
+-		for (uint8 j = 0; j < rd->serviceClassCount; j++)
+-			device.AddUInt16("service class", rd->serviceClasses[j]);
++	BluetoothServer* server = (BluetoothServer*)be_app;
++	fDevices = server->DeviceCacheFor(address);
++	fBonds = server->BondStoreFor(address);
++	if (fBonds == NULL || fDevices == NULL) {
++		syslog(LOG_ERR, "bluetooth_server: the bonds of %s cannot be read\n",
++			bdaddrUtils::ToString(address).String());
++		fBonds = NULL;
++		fDevices = NULL;
++		return;
++	}
+ 
+-		devices.AddMessage("remote", &device);
++	for (int32 i = 0; i < fDevices->CountRecords(); i++) {
++		DeviceRecord record;
++		if (!fDevices->RecordAt(i, record) || !fBonds->IsBonded(record.address)
++			|| RemoteDeviceByAddr(record.address) != NULL) {
++			continue;
++		}
++		ServerRemoteDevice* rd = new(std::nothrow) ServerRemoteDevice();
++		if (rd == NULL)
++			break;
++		rd->bdaddr = record.address;
++		rd->friendly_name = record.name;
++		rd->clock_offset = record.clockOffset;
++		rd->pscan_rep_mode = record.pageScanRepetitionMode;
++		memcpy(rd->classOfDevice, record.deviceClass,
++			sizeof(rd->classOfDevice));
++		memcpy(rd->serviceClasses, record.serviceClasses,
++			sizeof(rd->serviceClasses));
++		rd->serviceClassCount = record.serviceClassCount;
++		rd->conn_state = RemoteDevice::DISCONNECTED;
++		rd->handle = kInvalidHandle;
++		fRemoteDevicesList.AddItem(rd);
+ 	}
+ 
+-	// written aside and then put in place: the keys survive a crash in the
+-	// middle
+-	BPath path;
+-	if (find_directory(B_USER_SETTINGS_DIRECTORY, &path) == B_OK) {
+-		path.Append("Bluetooth_paired_devices");
+-		BString temporary(path.Path());
+-		temporary << ".new";
+-		BFile file(temporary.String(),
+-			B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);
+-		if (file.InitCheck() == B_OK && devices.Flatten(&file) == B_OK
+-			&& file.Sync() == B_OK) {
+-			BEntry entry(temporary.String());
+-			entry.Rename(path.Leaf(), true);
++	// bonds of a device the cache does not know (yet)
++	BMessage bonds;
++	fBonds->Describe(bonds);
++	BMessage bond;
++	for (int32 i = 0; bonds.FindMessage("bond", i, &bond) == B_OK; i++) {
++		const void* data;
++		ssize_t size;
++		if (bond.FindData("address", B_RAW_TYPE, &data, &size) != B_OK
++			|| size != sizeof(bdaddr_t)
++			|| RemoteDeviceByAddr(*(const bdaddr_t*)data) != NULL) {
++			continue;
+ 		}
++		ServerRemoteDevice* rd = new(std::nothrow) ServerRemoteDevice();
++		if (rd == NULL)
++			break;
++		rd->bdaddr = *(const bdaddr_t*)data;
++		rd->conn_state = RemoteDevice::DISCONNECTED;
++		rd->handle = kInvalidHandle;
++		fRemoteDevicesList.AddItem(rd);
+ 	}
+ }
+ 
+ 
++/*!	Keeps what is known of \a rd in the device cache. */
+ void
+-LocalDeviceImpl::LoadRemoteDevices()
++LocalDeviceImpl::_RememberDevice(ServerRemoteDevice* rd)
+ {
+-	BPath path;
+-	BMessage devices;
+-	if (find_directory(B_USER_SETTINGS_DIRECTORY, &path) == B_OK) {
+-		path.Append("Bluetooth_paired_devices");
+-		BFile file(path.Path(), B_READ_ONLY);
+-		if (file.InitCheck()==B_OK)
+-			devices.Unflatten(&file);
++	if (fDevices == NULL)
++		return;
++
++	DeviceRecord record;
++	fDevices->Get(rd->bdaddr, record);
++	record.address = rd->bdaddr;
++	if (!rd->friendly_name.IsEmpty())
++		record.name = rd->friendly_name;
++	if (rd->classOfDevice[0] != 0 || rd->classOfDevice[1] != 0
++		|| rd->classOfDevice[2] != 0) {
++		memcpy(record.deviceClass, rd->classOfDevice,
++			sizeof(record.deviceClass));
+ 	}
++	record.clockOffset = rd->clock_offset;
++	record.pageScanRepetitionMode = rd->pscan_rep_mode;
++	if (rd->serviceClassCount > 0) {
++		memcpy(record.serviceClasses, rd->serviceClasses,
++			sizeof(record.serviceClasses));
++		record.serviceClassCount = rd->serviceClassCount;
++	}
++	fDevices->Update(record);
++	fDevices->Flush();
++}
+ 
+-	BMessage device;
+-	for (int32 i = 0; devices.FindMessage("remote", i, &device) == B_OK; i++) {
+-		ssize_t size;
+-		bdaddr_t* bdaddr;
+-		if (device.FindData("bdaddr", B_ANY_TYPE, (const void**)&bdaddr, &size)
+-				!= B_OK || RemoteDeviceByAddr(*bdaddr) != NULL) {
+-			// older files can list a device more than once
+-			continue;
+-		}
+-		ServerRemoteDevice* rd = new ServerRemoteDevice();
+-		rd->bdaddr = *bdaddr;
+-		device.FindString("name", &rd->friendly_name);
+-		device.FindUInt16("clock_offset", &rd->clock_offset);
+-		device.FindUInt8("pscan_rep_mode", &rd->pscan_rep_mode);
+-		const void* data;
+-		if (device.FindData("class_of_device", B_RAW_TYPE, &data, &size) == B_OK
+-			&& size == sizeof(rd->classOfDevice)) {
+-			memcpy(rd->classOfDevice, data, sizeof(rd->classOfDevice));
+-		}
+-		rd->paired = true;
+-		// FindData() gives a pointer to the key, not the key
+-		rd->link_key = LinkKeyUtils::NullKey();
+-		if (device.FindData("link key", B_ANY_TYPE, &data, &size) == B_OK
+-			&& size == sizeof(linkkey_t)) {
+-			memcpy(&rd->link_key, data, sizeof(linkkey_t));
+-			trace_key("loaded", rd->bdaddr, rd->link_key);
+-		}
+-		// files written before kept no key type: their "link type" was the
+-		// kind of the last link (ACL), so the type is not known
+-		if (device.FindUInt8("key type", &rd->key_type) != B_OK)
+-			rd->key_type = 0xff;
+-		rd->serviceClassCount = 0;
+-		uint16 serviceClass;
+-		while (rd->serviceClassCount < B_COUNT_OF(rd->serviceClasses)
+-			&& device.FindUInt16("service class", rd->serviceClassCount,
+-				&serviceClass) == B_OK)
+-			rd->serviceClasses[rd->serviceClassCount++] = serviceClass;
+-		rd->conn_state = RemoteDevice::DISCONNECTED;
+ 
+-		fRemoteDevicesList.AddItem(rd);
+-	}
++bool
++LocalDeviceImpl::IsBonded(const bdaddr_t& address) const
++{
++	return fBonds != NULL && fBonds->IsBonded(address);
++}
++
++
++void
++LocalDeviceImpl::ServicesRead(ServerRemoteDevice* rd)
++{
++	_RememberDevice(rd);
+ }
+ 
+ 
+@@ -366,7 +393,12 @@ LocalDeviceImpl::RemoveRemoteDevice(ServerRemoteDevice* rd)
+ {
+ 	while (fRemoteDevicesList.RemoveItem(rd))
+ 		;
+-	SaveRemoteDevices();
++	if (fDevices != NULL) {
++		fDevices->Remove(rd->bdaddr);
++		fDevices->Flush();
++	}
++	if (fBonds != NULL)
++		fBonds->Remove(rd->bdaddr);
+ }
+ 
+ 
+@@ -738,6 +770,19 @@ LocalDeviceImpl::HandleEvent(struct hci_event_header* event)
+ 			TRACE_BT("LocalDeviceImpl: Incoming CommandComplete(%d) for %s\n", commandComplete->ncmd,
+ 				BluetoothCommandOpcode(commandComplete->opcode));
+ 
++			// The address of the controller, from the setup or from a
++			// client that asked first: the answer goes to the request that
++			// waits for it, and the setup then never sees it.
++			if (commandComplete->opcode == PACK_OPCODE(OGF_INFORMATIONAL_PARAM,
++					OCF_READ_BD_ADDR)
++				&& event->elen >= sizeof(struct hci_ev_cmd_complete)
++					+ sizeof(struct hci_rp_read_bd_addr)) {
++				const struct hci_rp_read_bd_addr* address
++					= (const struct hci_rp_read_bd_addr*)(commandComplete + 1);
++				if (address->status == BT_OK)
++					_AttachStores(address->bdaddr);
++			}
++
+ 			request = FindPetition(event->ecode, commandComplete->opcode,
+ 				&eventIndexLocation);
+ 
+@@ -1628,7 +1673,7 @@ LocalDeviceImpl::RemoteNameRequestComplete(
+ 				sizeof(remotename->remote_name));
+ 			if (name != rd->friendly_name) {
+ 				rd->friendly_name = name;
+-				SaveRemoteDevices();
++				_RememberDevice(rd);
+ 			}
+ 		}
+ 	}
+@@ -1669,7 +1714,6 @@ LocalDeviceImpl::ConnectionRequest(struct hci_ev_conn_request* event,
+ 		if (serverRd == NULL) {
+ 			serverRd = new ServerRemoteDevice();
+ 			serverRd->bdaddr = event->bdaddr;
+-			serverRd->link_key = LinkKeyUtils::NullKey();
+ 		}
+ 
+ 		// the controller does not ask for a device it still has a link to:
+@@ -1736,7 +1780,6 @@ LocalDeviceImpl::CreateConnection(BMessage* message)
+ 	if (rdConn == NULL) {
+ 		rdConn = new ServerRemoteDevice();
+ 		rdConn->bdaddr = *bdaddr;
+-		rdConn->link_key = LinkKeyUtils::NullKey();
+ 	}
+ 
+ 	rdConn->outgoing = true;
+@@ -1981,6 +2024,14 @@ LocalDeviceImpl::_SendInitStep()
+ 			fHCIDelegate->IssueCommand(version.Data(), version.Size());
+ 			break;
+ 		}
++		case kInitReadAddress:
++		{
++			// the bonds and the known devices are those of this address
++			BluetoothCommand<> address(OGF_INFORMATIONAL_PARAM,
++				OCF_READ_BD_ADDR);
++			fHCIDelegate->IssueCommand(address.Data(), address.Size());
++			break;
++		}
+ 		case kInitReadBufferSize:
+ 		{
+ 			// The host shall read it before it sends data (Vol 4, Part E
+@@ -2174,6 +2225,8 @@ LocalDeviceImpl::ConnectionComplete(struct hci_ev_conn_complete* event)
+ 			rd->link_type = event->link_type;
+ 			rd->encryption_enabled = event->encrypt_mode;
+ 			_LinkUp(rd, event->handle);
++			if (fBonds != NULL)
++				fBonds->Used(rd->bdaddr);
+ 		}
+ 
+ 		TRACE_BT("LocalDeviceImpl: %s: Address %s handle=%#x type=%d encrypt=%d\n", __FUNCTION__,
+@@ -2216,14 +2269,11 @@ LocalDeviceImpl::ConnectionComplete(struct hci_ev_conn_complete* event)
+ 
+ 		reply.what = BT_MSG_CONN_COMPLETED;
+ 	} else {
+-		// A device found in a search and never paired goes again; one
+-		// that was paired stays, also when its key was forgotten (it
+-		// refused it): out of reach is no reason to forget it.
+-		linkkey_t nullLinkKey = LinkKeyUtils::NullKey();
++		// A device found in a search and never paired goes again; a
++		// bonded one stays: out of reach is no reason to forget it.
+ 		if (rd == NULL)
+ 			;
+-		else if (!rd->paired
+-			&& LinkKeyUtils::Compare(&rd->link_key, &nullLinkKey))
++		else if (!IsBonded(rd->bdaddr))
+ 			RemoveRemoteDevice(rd);
+ 		else
+ 			_LinkDown(rd);
+@@ -2251,6 +2301,8 @@ LocalDeviceImpl::DisconnectionComplete(hci_ev_disconnection_complete_reply* even
+ 	if (rd != NULL && linkGone && rd->encryption_enabled == 0)
+ 		_ForgetRejectedKey(rd, event->reason);
+ 	if (rd != NULL && linkGone) {
++		if (fBonds != NULL)
++			fBonds->ConnectionClosed(rd->bdaddr);
+ 		_LinkDown(rd);
+ 		return;
+ 	}
+@@ -2338,18 +2390,35 @@ LocalDeviceImpl::LinkKeyNotify(hci_ev_link_key_notify* event,
+ 	if (request != NULL)
+ 		ClearWantedEvent(request);
+ 
+-	ServerRemoteDevice* rd = RemoteDeviceByAddr(event->bdaddr);
+-	if (rd == NULL)
++	if (fBonds == NULL) {
++		syslog(LOG_WARNING, "bluetooth_server: a key for %s, but the address "
++			"of the controller is not known: it is not kept\n",
++			bdaddrUtils::ToString(event->bdaddr).String());
+ 		return;
++	}
+ 
+-	rd->link_key = event->link_key;
+-	rd->key_type = event->key_type;
+-	rd->paired = true;
+-	trace_key("made by the pairing", rd->bdaddr, rd->link_key);
+-	rd->autoPinTried = false;
++	// How the pairing went: a simple pairing told what both sides asked
++	// for (we always ask for General Bonding, see IOCapabilityRequest()).
++	// Without a device in the list, nothing is known of it: a legacy
++	// pairing, which is kept.
++	ServerRemoteDevice* rd = RemoteDeviceByAddr(event->bdaddr);
++	PairingContext context;
++	if (rd != NULL) {
++		context.pairedByUs = rd->outgoing;
++		if (rd->remoteIOKnown) {
++			context.simplePairing = true;
++			context.localAuthentication = HCI_AUTH_REQ_NO_MITM_GENERAL_BOND;
++			context.remoteAuthentication = rd->remoteAuthentication;
++		}
++		rd->autoPinTried = false;
++	}
+ 
+-	// keep the key at once: the device needs it to connect again
+-	SaveRemoteDevices();
++	if (TraceKeys())
++		TraceKey("made by the pairing", event->bdaddr, event->link_key);
++	if (fBonds->PairingFinished(event->bdaddr, event->link_key,
++			event->key_type, context) == BondStore::kBonded && rd != NULL) {
++		_RememberDevice(rd);
++	}
+ }
+ 
+ 
+@@ -2360,9 +2429,9 @@ LocalDeviceImpl::LinkKeyRequested(struct hci_ev_link_key_req* keyRequested,
+ 	TRACE_BT("LocalDeviceImpl: %s: Address %s\n", __FUNCTION__,
+ 		bdaddrUtils::ToString(keyRequested->bdaddr).String());
+ 
+-	ServerRemoteDevice* rd = RemoteDeviceByAddr(keyRequested->bdaddr);
+-	linkkey_t nullLinkKey = LinkKeyUtils::NullKey();
+-	if (rd == NULL || LinkKeyUtils::Compare(&rd->link_key, &nullLinkKey)) {
++	linkkey_t key;
++	if (fBonds == NULL
++		|| fBonds->KeyForRequest(keyRequested->bdaddr, key) != B_OK) {
+ 		BluetoothCommand<typed_command(hci_cp_link_key_neg_reply)>
+ 			linkKeyNegativeReply(OGF_LINK_CONTROL, OCF_LINK_KEY_NEG_REPLY);
+ 
+@@ -2394,9 +2463,9 @@ LocalDeviceImpl::LinkKeyRequested(struct hci_ev_link_key_req* keyRequested,
+ 		AddWantedEvent(newrequest);
+ 
+ 		bdaddrUtils::Copy(linkKeyReply->bdaddr, keyRequested->bdaddr);
+-		linkKeyReply->link_key = rd->link_key;
+-		trace_key("given to the controller", rd->bdaddr,
+-			linkKeyReply->link_key);
++		linkKeyReply->link_key = key;
++		if (TraceKeys())
++			TraceKey("given to the controller", keyRequested->bdaddr, key);
+ 
+ 		if ((fHCIDelegate)->IssueCommand(linkKeyReply.Data(), linkKeyReply.Size()) == B_ERROR) {
+ 			TRACE_BT("LocalDeviceImpl: Command issued error for reply %s\n", __FUNCTION__);
+@@ -2673,41 +2742,18 @@ LocalDeviceImpl::AuthComplete(struct hci_ev_auth_complete* eventData, BMessage*
+ }
+ 
+ 
+-/*!	The device no longer has the key we keep for it: it was paired again
+-	elsewhere, reset, or told to forget us (a Google Home does when it is
+-	removed from its app). Offering the key again would fail the same way
+-	forever; without it, the next connection pairs anew. The device stays in
+-	the list.
+-
+-	"PIN or Key Missing" says just that. An "Authentication Failure" says it
+-	only on a link the device opened itself: it came to us, so it wants us,
+-	and the keys do not match. On a link we opened, it is also how a device
+-	refuses to be called -- a Google Home does after it was told to
+-	disconnect, and after every start of the computer -- and its key was
+-	good: forgetting it lost the pairing each time.
++/*!	An authentication failed, or a link went away while it was not
++	secured yet: the bond store decides whether the key is of no use any
++	more (see BondStore::AuthenticationFailed()), and the user hears of it
++	when it is forgotten.
+ */
+ void
+ LocalDeviceImpl::_ForgetRejectedKey(ServerRemoteDevice* rd, uint8 reason)
+ {
+-	if (reason != BT_PIN_OR_KEY_MISSING
+-		&& (reason != BT_AUTHENTICATION_FAILURE || rd->outgoing)) {
+-		if (reason == BT_AUTHENTICATION_FAILURE) {
+-			syslog(LOG_NOTICE, "bluetooth_server: %s refused our call, its "
+-				"key is kept\n", bdaddrUtils::ToString(rd->bdaddr).String());
+-		}
+-		return;
++	if (fBonds != NULL
++		&& fBonds->AuthenticationFailed(rd->bdaddr, reason, !rd->outgoing)) {
++		Notifications::KeyRefused(rd);
+ 	}
+-
+-	linkkey_t nullKey = LinkKeyUtils::NullKey();
+-	if (LinkKeyUtils::Compare(&rd->link_key, &nullKey))
+-		return;
+-
+-	syslog(LOG_NOTICE, "bluetooth_server: %s refused its key (%s), it pairs "
+-		"again next time\n", bdaddrUtils::ToString(rd->bdaddr).String(),
+-		BluetoothError(reason));
+-	rd->link_key = nullKey;
+-	SaveRemoteDevices();
+-	Notifications::KeyRefused(rd);
+ }
+ 
+ 
+@@ -2768,6 +2814,8 @@ LocalDeviceImpl::EncryptionKeySize(
+ 	ServerRemoteDevice* rd = RemoteDeviceByHandle(reply->handle);
+ 	if (rd == NULL)
+ 		return;
++	if (fBonds != NULL)
++		fBonds->SetEncryptionKeySize(rd->bdaddr, reply->key_size);
+ 	if (reply->key_size < 7) {
+ 		syslog(LOG_WARNING, "bluetooth_server: %s encrypts with a key of %u "
+ 			"bytes, too short: disconnecting\n",
+diff --git a/src/servers/bluetooth/LocalDeviceImpl.h b/src/servers/bluetooth/LocalDeviceImpl.h
+index cd866a79e9..a22ea0a7a6 100644
+--- a/src/servers/bluetooth/LocalDeviceImpl.h
++++ b/src/servers/bluetooth/LocalDeviceImpl.h
+@@ -13,6 +13,8 @@
+ #include <bluetooth/RemoteDevice.h>
+ #include <ObjectList.h>
+ 
++#include "BondStore.h"
++#include "DeviceCache.h"
+ #include "LocalDeviceHandler.h"
+ 
+ #include "HCIDelegate.h"
+@@ -27,15 +29,12 @@ struct ServerRemoteDevice
+ 	uint16				clock_offset;
+ 	uint8				pscan_rep_mode;
+ 	uint8				classOfDevice[3];
+-	linkkey_t			link_key;
+ 	uint8				link_type;
+-	uint8				key_type;
++		// the kind of the link, ACL or SCO
+ 	uint16				serviceClasses[16];
+ 	uint8				serviceClassCount;
+-		// the classes of its SDP records (Audio Sink, HID...), kept so that
+-		// the media add-on knows speakers without asking them; 0 if unknown
+-		// what the link key is (HCI Link Key Notification): link_type is
+-		// the kind of the link, ACL or SCO
++		// the classes of its SDP records (Audio Sink, HID...), as the
++		// device cache keeps them; 0 if unknown
+ 	uint8				encryption_enabled;
+ 	bool				keySizeChecked;
+ 		// the encryption key is long enough: the services may start
+@@ -51,9 +50,6 @@ struct ServerRemoteDevice
+ 	BMessage			services;
+ 	bool				outgoing;
+ 		// we opened the connection, rather than the device
+-	bool				paired;
+-		// it was paired once (it is in the paired devices file): it stays
+-		// in the list when its key is forgotten and a connection fails
+ };
+ 
+ // no link uses it: the handles go up to 0x0eff
+@@ -103,8 +99,14 @@ public:
+ 	void				AddRemoteDevice(ServerRemoteDevice* rd);
+ 	void				RemoveRemoteDevice(ServerRemoteDevice* rd);
+ 	RemoteDevicesList*	GetRemoteDevicesList();
+-	// writes the paired devices file
+-	void				SaveRemoteDevices();
++
++	// the bonds and the known devices of this controller; NULL until its
++	// address is known (Read BD_ADDR)
++	BondStore*			Bonds() const { return fBonds; }
++	DeviceCache*		Devices() const { return fDevices; }
++	bool				IsBonded(const bdaddr_t& address) const;
++	// the services of a device were read
++	void				ServicesRead(ServerRemoteDevice* rd);
+ 
+ 	// the user answered the confirmation of a pairing
+ 	void				UserConfirmationAnswer(const bdaddr_t& address,
+@@ -113,6 +115,8 @@ public:
+ private:
+ 
+ 	RemoteDevicesList	fRemoteDevicesList;
++	BondStore*			fBonds;
++	DeviceCache*		fDevices;
+ 	bool				fDiscoverable;
+ 	int32				fInitStep;
+ 	int32				fInitTries;
+@@ -122,7 +126,8 @@ private:
+ 	void _InitStepDone(uint16 opcode, uint8 status, const uint8* params,
+ 		size_t length);
+ 
+-	void LoadRemoteDevices();
++	void _AttachStores(const bdaddr_t& address);
++	void _RememberDevice(ServerRemoteDevice* rd);
+ 
+ 	void _LinkUp(ServerRemoteDevice* rd, uint16 handle);
+ 	void _LinkDown(ServerRemoteDevice* rd);
+-- 
+2.39.5
+

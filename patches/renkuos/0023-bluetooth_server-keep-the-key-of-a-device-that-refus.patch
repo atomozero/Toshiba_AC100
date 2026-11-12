@@ -1,0 +1,57 @@
+From f10d051cd5ddf98926743d2adbf480ac5cb98327 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 10 Nov 2026 07:43:03 +0100
+Subject: [PATCH 23/42] bluetooth_server: keep the key of a device that refuses
+ our call
+
+"Authentication Failure" made the key forgotten, as "PIN or Key Missing"
+does. It says the keys do not match only on a link the device opened
+itself; on a link we opened it is also how a device refuses to be called.
+A Google Home does after it was told to disconnect, and after every start
+of the computer: its key was good, and the pairing was lost each time.
+
+The key is now forgotten on "PIN or Key Missing", and on "Authentication
+Failure" only when the device opened the link.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/servers/bluetooth/LocalDeviceImpl.cpp | 18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/src/servers/bluetooth/LocalDeviceImpl.cpp b/src/servers/bluetooth/LocalDeviceImpl.cpp
+index bfcaecac5a..79460d6e3a 100644
+--- a/src/servers/bluetooth/LocalDeviceImpl.cpp
++++ b/src/servers/bluetooth/LocalDeviceImpl.cpp
+@@ -2654,14 +2654,26 @@ LocalDeviceImpl::AuthComplete(struct hci_ev_auth_complete* eventData, BMessage*
+ 	elsewhere, reset, or told to forget us (a Google Home does when it is
+ 	removed from its app). Offering the key again would fail the same way
+ 	forever; without it, the next connection pairs anew. The device stays in
+-	the list. Linux drops the key on "PIN or key missing"; a refused key shows
+-	as an authentication failure too, with some devices.
++	the list.
++
++	"PIN or Key Missing" says just that. An "Authentication Failure" says it
++	only on a link the device opened itself: it came to us, so it wants us,
++	and the keys do not match. On a link we opened, it is also how a device
++	refuses to be called -- a Google Home does after it was told to
++	disconnect, and after every start of the computer -- and its key was
++	good: forgetting it lost the pairing each time.
+ */
+ void
+ LocalDeviceImpl::_ForgetRejectedKey(ServerRemoteDevice* rd, uint8 reason)
+ {
+-	if (reason != BT_PIN_OR_KEY_MISSING && reason != BT_AUTHENTICATION_FAILURE)
++	if (reason != BT_PIN_OR_KEY_MISSING
++		&& (reason != BT_AUTHENTICATION_FAILURE || rd->outgoing)) {
++		if (reason == BT_AUTHENTICATION_FAILURE) {
++			syslog(LOG_NOTICE, "bluetooth_server: %s refused our call, its "
++				"key is kept\n", bdaddrUtils::ToString(rd->bdaddr).String());
++		}
+ 		return;
++	}
+ 
+ 	linkkey_t nullKey = LinkKeyUtils::NullKey();
+ 	if (LinkKeyUtils::Compare(&rd->link_key, &nullKey))
+-- 
+2.39.5
+

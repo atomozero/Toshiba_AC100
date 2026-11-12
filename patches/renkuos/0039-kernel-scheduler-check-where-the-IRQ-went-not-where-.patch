@@ -1,0 +1,46 @@
+From cf574ee0829d6efc38880f2ece8dac1abea7393d Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Thu, 12 Nov 2026 17:53:52 +0100
+Subject: [PATCH 39/42] kernel/scheduler: check where the IRQ went, not where
+ it is in the list
+
+assign_io_interrupt_to_cpu() puts an interrupt the architecture kept
+where it was back at the end of that CPU's list, not at its head. With
+more than one interrupt on the CPU, the first one of the list then
+changes on every round although none moves, and pack_irqs() went on
+forever: InterruptController::AssignToCpu() returns 0 on ARM and ARM64
+unless a controller overrides it, which the GICv3 driver does not, so on
+ARM64 no interrupt ever moves. In QEMU's ARM64 virt machine with a GICv3
+and two CPUs, power saving mode still froze during boot.
+
+Stop when the interrupt is still assigned to this CPU after the attempt.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/system/kernel/scheduler/power_saving.cpp | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/src/system/kernel/scheduler/power_saving.cpp b/src/system/kernel/scheduler/power_saving.cpp
+index 0fbb3c4ea5..5cd69f5590 100644
+--- a/src/system/kernel/scheduler/power_saving.cpp
++++ b/src/system/kernel/scheduler/power_saving.cpp
+@@ -218,11 +218,12 @@ pack_irqs()
+ 		assign_io_interrupt_to_cpu(irq->irq, newCPU);
+ 
+ 		// The architecture may keep an interrupt where it is (one that
+-		// belongs to this CPU, or none moved at all): it is still the first
+-		// one then, and trying again would never end.
+-		locker.Lock();
+-		if (cpu->irqs.First() == irq)
++		// belongs to this CPU, or any when it cannot route them): it is back
++		// in this CPU's list then, and trying again would never end.
++		if (irq->cpu == cpu->cpu_num)
+ 			return;
++
++		locker.Lock();
+ 	}
+ }
+ 
+-- 
+2.39.5
+

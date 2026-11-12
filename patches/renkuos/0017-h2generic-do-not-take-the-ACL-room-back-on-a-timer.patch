@@ -1,0 +1,109 @@
+From 0295cb509ed3fe751ba2c6f2a3c259c7f227ac22 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 10 Nov 2026 07:42:35 +0100
+Subject: [PATCH 17/42] h2generic: do not take the ACL room back on a timer
+
+When no Number Of Completed Packets came for 5 s with the controller
+full, the driver took all the room back and sent more. The controller
+still held the packets: with speakers switched off it retransmits them
+until the link supervision timeout. Sent more, the CSR BC4 stalled every
+endpoint and dropped off the bus, seen at once each time the speakers
+went away during a stream.
+
+The room of a link comes back with its Disconnection Complete, all of it
+with a Reset, as the HCI flow control has it; the driver only tells, once,
+that it is waiting.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../drivers/bluetooth/h2/h2generic/h2flow.cpp | 29 +++++++++++--------
+ .../bluetooth/h2/h2generic/h2generic.h        |  2 +-
+ 2 files changed, 18 insertions(+), 13 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/bluetooth/h2/h2generic/h2flow.cpp b/src/add-ons/kernel/drivers/bluetooth/h2/h2generic/h2flow.cpp
+index ffdc73c2b6..8fab2747aa 100644
+--- a/src/add-ons/kernel/drivers/bluetooth/h2/h2generic/h2flow.cpp
++++ b/src/add-ons/kernel/drivers/bluetooth/h2/h2generic/h2flow.cpp
+@@ -193,7 +193,7 @@ acl_flow_init(bt_usb_dev* bdev)
+ 	bdev->cmdRetried = NULL;
+ 	bdev->eventSkip = 0;
+ 	bdev->aclNoCreditsSince = 0;
+-	bdev->aclCreditsReset = false;
++	bdev->aclStarvedTold = false;
+ 	memset(bdev->aclLinks, 0, sizeof(bdev->aclLinks));
+ 	bdev->aclSent = 0;
+ 	bdev->aclCompleted = 0;
+@@ -338,18 +338,23 @@ acl_flow_take(bt_usb_dev* bdev, net_buffer* nbuf)
+ 	bool start, signaling;
+ 	packet_kind(header, length, &handle, &start, &signaling);
+ 
++	bool starved = false;
+ 	cpu_status state = disable_interrupts();
+ 	acquire_spinlock(&bdev->aclFlowLock);
+ 
+ 	bool send = true;
+ 	if (bdev->aclCredits == 0 && bdev->aclMaxPackets > 0
++		&& !bdev->aclStarvedTold
+ 		&& system_time() - bdev->aclNoCreditsSince > 5000000) {
+-		// No Number Of Completed Packets for 5 s with the controller full:
+-		// one got lost (an event cut by its transfer). Waiting stopped the
+-		// ACL data for good; the room is taken back instead.
+-		bdev->aclCredits = bdev->aclMaxPackets;
+-		memset(bdev->aclFlow, 0, sizeof(bdev->aclFlow));
+-		bdev->aclCreditsReset = true;
++		// No Number Of Completed Packets for 5 s with the controller full.
++		// The room is not taken back: the controller still holds the
++		// packets (it retransmits them until the link supervision timeout
++		// when the device is gone), and sending more overran it -- the CSR
++		// then stalled every endpoint and dropped off the bus. The room of
++		// a link comes back with its Disconnection Complete, all of it
++		// with a Reset (the HCI flow control of the specification).
++		bdev->aclStarvedTold = true;
++		starved = true;
+ 	}
+ 	if (link_held(bdev, handle, start, signaling))
+ 		send = false;
+@@ -364,8 +369,10 @@ acl_flow_take(bt_usb_dev* bdev, net_buffer* nbuf)
+ 			bdev->aclCredits--;
+ 			slot->pending++;
+ 		}
+-		if (bdev->aclCredits == 0)
++		if (bdev->aclCredits == 0) {
+ 			bdev->aclNoCreditsSince = system_time();
++			bdev->aclStarvedTold = false;
++		}
+ 	}
+ 	if (send) {
+ 		// how much of a signaling packet its fragments still carry
+@@ -381,13 +388,11 @@ acl_flow_take(bt_usb_dev* bdev, net_buffer* nbuf)
+ 		}
+ 	}
+ 
+-	bool creditsReset = bdev->aclCreditsReset;
+-	bdev->aclCreditsReset = false;
+ 	release_spinlock(&bdev->aclFlowLock);
+ 	restore_interrupts(state);
+ 
+-	if (creditsReset)
+-		ERROR("ACL credits not returned for 5 s, taken back\n");
++	if (starved)
++		ERROR("ACL credits not returned for 5 s, waiting for the link\n");
+ 	return send;
+ }
+ 
+diff --git a/src/add-ons/kernel/drivers/bluetooth/h2/h2generic/h2generic.h b/src/add-ons/kernel/drivers/bluetooth/h2/h2generic/h2generic.h
+index dd66246c16..fecd225cd1 100644
+--- a/src/add-ons/kernel/drivers/bluetooth/h2/h2generic/h2generic.h
++++ b/src/add-ons/kernel/drivers/bluetooth/h2/h2generic/h2generic.h
+@@ -152,7 +152,7 @@ struct bt_usb_dev {
+ 	int32			eventSkip;		// bytes of an event cut by a transfer,
+ 									// -1: its length byte is still to come
+ 	bigtime_t		aclNoCreditsSince;
+-	bool			aclCreditsReset;	// to be told in the syslog
++	bool			aclStarvedTold;		// no credits for long, told
+ 	int32			aclSent;		// for the syslog: ACL packets sent,
+ 	int32			aclCompleted;	// completed by the controller,
+ 	int32			aclQueued;		// waiting in the driver
+-- 
+2.39.5
+

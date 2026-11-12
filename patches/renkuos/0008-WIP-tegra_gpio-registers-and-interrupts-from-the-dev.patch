@@ -1,0 +1,136 @@
+From 627a70f384d6555b07ee7e90fbe236a6750fd61e Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 8 Nov 2026 22:17:52 +0100
+Subject: [PATCH 08/42] WIP tegra_gpio: registers and interrupts from the
+ device tree
+
+The device manager attaches the driver only on demand, and the GPIO
+controller publishes no device: until then the module used fixed
+defaults. It now reads the reg and interrupts of the
+nvidia,tegra20-gpio node itself (gFDT, as tegra_dc does), with the
+interrupt numbers the FDT bus would give (SPI + 32, PPI + 16); what is
+missing keeps its default.
+---
+ src/add-ons/kernel/busses/gpio/tegra/Jamfile  |  5 +-
+ .../kernel/busses/gpio/tegra/tegra_gpio.cpp   | 67 ++++++++++++++++++-
+ 2 files changed, 70 insertions(+), 2 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/gpio/tegra/Jamfile b/src/add-ons/kernel/busses/gpio/tegra/Jamfile
+index f02e704fac..d91d125b30 100644
+--- a/src/add-ons/kernel/busses/gpio/tegra/Jamfile
++++ b/src/add-ons/kernel/busses/gpio/tegra/Jamfile
+@@ -4,7 +4,10 @@ SubDirC++Flags -fno-rtti ;
+ 
+ UsePrivateHeaders gpio ;
+ UsePrivateKernelHeaders ;
++UseLibraryHeaders [ FDirName libfdt ] ;
+ 
+ KernelAddon tegra_gpio :
+ 	tegra_gpio.cpp
+-;
++	:
++	kernel_fdt.a
++	;
+diff --git a/src/add-ons/kernel/busses/gpio/tegra/tegra_gpio.cpp b/src/add-ons/kernel/busses/gpio/tegra/tegra_gpio.cpp
+index 17e8477fcc..2f74ae1830 100644
+--- a/src/add-ons/kernel/busses/gpio/tegra/tegra_gpio.cpp
++++ b/src/add-ons/kernel/busses/gpio/tegra/tegra_gpio.cpp
+@@ -28,6 +28,7 @@
+ #include <util/AutoLock.h>
+ 
+ #include <gpio/tegra.h>
++#include <libfdt.h>
+ 
+ 
+ #define TEGRA_GPIO_DRIVER_MODULE_NAME	"busses/gpio/tegra_gpio/driver_v1"
+@@ -88,6 +89,8 @@ static const uint32 kDefaultBankIRQs[TEGRA_GPIO_BANK_COUNT] = {
+ };
+ 
+ 
++extern void* gFDT;
++
+ static device_manager_info* gDeviceManager;
+ static tegra_gpio* sGPIO;
+ static mutex sInitLock = MUTEX_INITIALIZER("tegra gpio init");
+@@ -189,6 +192,66 @@ start_clock()
+ }
+ 
+ 
++/*!	The controller's registers and interrupts, from the device tree, for when
++	the interface is used before the device manager attached the driver
++	(which happens only on demand). What the tree does not tell keeps its
++	default.
++*/
++static int
++cells_of(int node, const char* name, int fallback)
++{
++	int length;
++	const fdt32_t* cells = (const fdt32_t*)fdt_getprop(gFDT, node, name,
++		&length);
++	if (cells == NULL || length != sizeof(fdt32_t))
++		return fallback;
++	return fdt32_to_cpu(*cells);
++}
++
++
++static void
++read_device_tree(phys_addr_t* _base, size_t* _size, uint32* irqs)
++{
++	if (gFDT == NULL)
++		return;
++	int node = fdt_node_offset_by_compatible(gFDT, -1, "nvidia,tegra20-gpio");
++	if (node < 0)
++		return;
++
++	int parent = fdt_parent_offset(gFDT, node);
++	int addressCells = cells_of(parent, "#address-cells", 2);
++	int sizeCells = cells_of(parent, "#size-cells", 1);
++	int length;
++	const fdt32_t* reg = (const fdt32_t*)fdt_getprop(gFDT, node, "reg",
++		&length);
++	if (reg != NULL && addressCells >= 1 && addressCells <= 2
++		&& sizeCells >= 1 && sizeCells <= 2
++		&& length >= (int)((addressCells + sizeCells) * sizeof(fdt32_t))) {
++		uint64 base = 0;
++		uint64 size = 0;
++		for (int i = 0; i < addressCells; i++)
++			base = (base << 32) | fdt32_to_cpu(reg[i]);
++		for (int i = 0; i < sizeCells; i++)
++			size = (size << 32) | fdt32_to_cpu(reg[addressCells + i]);
++		*_base = base;
++		*_size = size;
++	}
++
++	// one interrupt per bank, three cells each (type, number, flags) as the
++	// GIC has them: shared peripheral interrupts start at 32, private at 16
++	const fdt32_t* interrupts = (const fdt32_t*)fdt_getprop(gFDT, node,
++		"interrupts", &length);
++	if (interrupts != NULL
++		&& length == (int)(TEGRA_GPIO_BANK_COUNT * 3 * sizeof(fdt32_t))) {
++		for (uint32 bank = 0; bank < TEGRA_GPIO_BANK_COUNT; bank++) {
++			uint32 type = fdt32_to_cpu(interrupts[bank * 3]);
++			uint32 number = fdt32_to_cpu(interrupts[bank * 3 + 1]);
++			irqs[bank] = number + (type == 0 ? 32 : type == 1 ? 16 : 0);
++		}
++	}
++}
++
++
+ /*!	Maps the controller registers. Called with \a sInitLock held. */
+ static status_t
+ create_controller(phys_addr_t base, size_t size)
+@@ -205,8 +268,10 @@ create_controller(phys_addr_t base, size_t size)
+ 	B_INITIALIZE_SPINLOCK(&gpio->interruptLock);
+ 	memcpy(gpio->irqs, kDefaultBankIRQs, sizeof(gpio->irqs));
+ 
+-	if (base == 0)
++	if (base == 0) {
+ 		base = TEGRA20_GPIO_BASE;
++		read_device_tree(&base, &size, gpio->irqs);
++	}
+ 	if (size == 0)
+ 		size = B_PAGE_SIZE;
+ 
+-- 
+2.39.5
+

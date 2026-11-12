@@ -1,0 +1,118 @@
+From f30ca867d6cf4a21562f221391773bbe3ba82329 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 10 Nov 2026 07:42:52 +0100
+Subject: [PATCH 20/42] bluetooth: tell whether a key is kept for a device
+
+RemoteDevice::IsTrustedDevice() returned true for any device. The server
+now says, with the list of the paired devices, whether it keeps a link
+key for each ("trusted"), and the kit answers with that. The new member
+takes the padding after fFriendlyNameIsComplete, so the size of the class
+stays the same; both are initialized now (fFriendlyNameIsComplete was
+not).
+
+The Bluetooth audio add-on uses it: speakers whose key is gone are not
+called, as every call only started a pairing that they refuse outside
+their pairing mode.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ headers/os/bluetooth/RemoteDevice.h                 |  2 ++
+ .../media-add-ons/bluetooth_audio/A2dpSource.cpp    |  8 ++++++++
+ src/kits/bluetooth/RemoteDevice.cpp                 | 13 ++++++++++---
+ src/servers/bluetooth/BluetoothServer.cpp           |  3 +++
+ 4 files changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/headers/os/bluetooth/RemoteDevice.h b/headers/os/bluetooth/RemoteDevice.h
+index ca7777e613..d851a68429 100644
+--- a/headers/os/bluetooth/RemoteDevice.h
++++ b/headers/os/bluetooth/RemoteDevice.h
+@@ -87,6 +87,8 @@ private:
+ 	int8        	fRSSI;
+ 	BString     	fFriendlyName;
+ 	bool        	fFriendlyNameIsComplete;
++	bool			fTrusted;
++		// in the padding after the one above: the size stays the same
+ };
+ 
+ }
+diff --git a/src/add-ons/media/media-add-ons/bluetooth_audio/A2dpSource.cpp b/src/add-ons/media/media-add-ons/bluetooth_audio/A2dpSource.cpp
+index ae09f4a75d..59fb032307 100644
+--- a/src/add-ons/media/media-add-ons/bluetooth_audio/A2dpSource.cpp
++++ b/src/add-ons/media/media-add-ons/bluetooth_audio/A2dpSource.cpp
+@@ -610,6 +610,14 @@ A2dpSource::_EnsureAclConnection(const bdaddr_t& remote)
+ 			bdaddrUtils::ToString(remote).String());
+ 		return false;
+ 	}
++	if (!device->IsTrustedDevice()) {
++		// its key was refused: a call would only start a pairing, which
++		// the device refuses outside its pairing mode. It may still connect
++		// by itself, after being paired again.
++		TRACE_A2DP("%s has no key, it needs to be paired again\n",
++			bdaddrUtils::ToString(remote).String());
++		return false;
++	}
+ 
+ 	status_t status = device->Connect();
+ 	TRACE_A2DP("Asked bluetooth_server for the link to %s: %s\n",
+diff --git a/src/kits/bluetooth/RemoteDevice.cpp b/src/kits/bluetooth/RemoteDevice.cpp
+index 53eb04223d..8a4a1acf30 100644
+--- a/src/kits/bluetooth/RemoteDevice.cpp
++++ b/src/kits/bluetooth/RemoteDevice.cpp
+@@ -35,7 +35,9 @@ bool
+ RemoteDevice::IsTrustedDevice(void)
+ {
+ 	CALLED();
+-	return true;
++	// a link key is kept for it: it connects without pairing (known from
++	// the list of the paired devices, see GetRemoteDevices())
++	return fTrusted;
+ }
+ 
+ 
+@@ -68,6 +70,7 @@ RemoteDevice::GetRemoteDevices(LocalDevice* localDevice)
+ 		device.FindString("name", &rd->fFriendlyName);
+ 		device.FindUInt16("clock_offset", &rd->fClockOffset);
+ 		device.FindUInt8("pscan_rep_mode", &rd->fPageRepetitionMode);
++		device.FindBool("trusted", &rd->fTrusted);
+ 
+ 		rdList.AddItem(rd);
+ 	}
+@@ -368,7 +371,9 @@ RemoteDevice::RemoteDevice(const bdaddr_t address, uint8 record[3])
+ 	fDiscovererLocalDevice(NULL),
+ 	fPageRepetitionMode(1),
+ 	fScanMode(0),
+-	fClockOffset(0)
++	fClockOffset(0),
++	fFriendlyNameIsComplete(false),
++	fTrusted(false)
+ {
+ 	CALLED();
+ 	fBdaddr = address;
+@@ -383,7 +388,9 @@ RemoteDevice::RemoteDevice(const BString& address)
+ 	fDiscovererLocalDevice(NULL),
+ 	fPageRepetitionMode(1),
+ 	fScanMode(0),
+-	fClockOffset(0)
++	fClockOffset(0),
++	fFriendlyNameIsComplete(false),
++	fTrusted(false)
+ {
+ 	CALLED();
+ 	fBdaddr = bdaddrUtils::FromString((const char*)address.String());
+diff --git a/src/servers/bluetooth/BluetoothServer.cpp b/src/servers/bluetooth/BluetoothServer.cpp
+index f958a74243..80e9bd3fc0 100644
+--- a/src/servers/bluetooth/BluetoothServer.cpp
++++ b/src/servers/bluetooth/BluetoothServer.cpp
+@@ -345,6 +345,9 @@ void BluetoothServer::MessageReceived(BMessage* message)
+ 					sizeof(rd->classOfDevice));
+ 				device.AddUInt16("clock_offset", rd->clock_offset);
+ 				device.AddUInt8("pscan_rep_mode", rd->pscan_rep_mode);
++				linkkey_t nullKey = LinkKeyUtils::NullKey();
++				device.AddBool("trusted",
++					!LinkKeyUtils::Compare(&rd->link_key, &nullKey));
+ 
+ 				reply.AddMessage("remote", &device);
+ 			}
+-- 
+2.39.5
+

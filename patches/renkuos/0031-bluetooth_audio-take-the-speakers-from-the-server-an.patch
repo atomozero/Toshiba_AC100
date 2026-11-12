@@ -1,0 +1,475 @@
+From 9b0eb63fff26b523a7c5abb3155f76953b7a8737 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 10 Nov 2026 20:41:30 +0100
+Subject: [PATCH 31/42] bluetooth_audio: take the speakers from the server, and
+ new ones at once
+
+The add-on read the file of the paired devices once, when the media
+services started: speakers paired afterwards became an output only after
+a restart of the media services, and the file held the link keys of every
+device for anyone to read.
+
+It now asks bluetooth_server for the bonded devices (the new
+BT_MSG_GET_BONDED_DEVICES, which gives no keys), and a small looper
+watches the server's BT_NOTICE_BONDS_CHANGED and its start (the server
+may start after the media services, and knows the bonds only once its
+controller is set up; it now tells when it read them). Speakers that are
+new then become an output at once, with NotifyFlavorChange(); a device
+whose bond goes keeps its output until the media services restart, as
+its node knows it by its index.
+
+With nothing reading it any more, the server puts the old file aside as
+Bluetooth_paired_devices.migrated, which only its owner may read.
+
+Tested on the AC100: at boot the media server first stands in with the
+sound card, and goes over to the Google Home as soon as the server has
+read the bonds.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ headers/private/bluetooth/bluetoothserver_p.h |   7 +-
+ .../bluetooth_audio/BluetoothAudioAddOn.cpp   | 164 +++++++++++++++---
+ .../bluetooth_audio/BluetoothAudioAddOn.h     |  13 +-
+ src/servers/bluetooth/BluetoothServer.cpp     |  77 +++++++-
+ src/servers/bluetooth/BluetoothServer.h       |   1 +
+ 5 files changed, 233 insertions(+), 29 deletions(-)
+
+diff --git a/headers/private/bluetooth/bluetoothserver_p.h b/headers/private/bluetooth/bluetoothserver_p.h
+index 0dddd3da81..57e92aa2d0 100644
+--- a/headers/private/bluetooth/bluetoothserver_p.h
++++ b/headers/private/bluetooth/bluetoothserver_p.h
+@@ -51,8 +51,13 @@
+ 
+ // A bond was made, changed or removed: sent with SendNotices() to whoever
+ // watches the server for it (BHandler::StartWatching()), with "adapter" and
+-// "address" (B_RAW_TYPE, bdaddr_t) and "change" (int32, see BondStore)
++// "address" (B_RAW_TYPE, bdaddr_t) and "change" (int32: 0 made, 1 changed,
++// 2 removed, 3 the bonds of "adapter" were read, no "address")
+ #define BT_NOTICE_BONDS_CHANGED         'btBC'
++	// the bonded devices of every controller, without their keys: a
++	// "device" message for each, with "address" (B_RAW_TYPE, bdaddr_t),
++	// "name", "class" (3 bytes) and "service class" (uint16, each)
++#define BT_MSG_GET_BONDED_DEVICES       'btgB'
+ 
+ 
+ #endif
+diff --git a/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioAddOn.cpp b/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioAddOn.cpp
+index ccd891126c..7cce6e5d1d 100644
+--- a/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioAddOn.cpp
++++ b/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioAddOn.cpp
+@@ -11,27 +11,110 @@
+ #include <string.h>
+ #include <syslog.h>
+ 
+-#include <File.h>
++#include <Autolock.h>
+ #include <image.h>
+-#include <FindDirectory.h>
++#include <Looper.h>
+ #include <Message.h>
+-#include <Path.h>
++#include <Messenger.h>
++#include <Roster.h>
++
++#include <bluetooth/bdaddrUtils.h>
++#include <bluetoothserver_p.h>
+ 
+ #include "BluetoothAudioNode.h"
+ 
+ 
++// how long the media add-on server waits for the Bluetooth server at most
++static const bigtime_t kServerTimeout = 500000;
++
++
++/*!	Tells the add-on when the bonds change, and when the Bluetooth server
++	starts (it may come after the media services, and knows the bonds only
++	once its controller is set up). It runs in the media add-on server, as
++	little as it can: it only watches, and asks the add-on to look again.
++*/
++class BondWatcher : public BLooper {
++public:
++	BondWatcher(BluetoothAudioAddOn* addOn)
++		:
++		BLooper("bluetooth audio bonds", B_LOW_PRIORITY),
++		fAddOn(addOn)
++	{
++	}
++
++	void Start()
++	{
++		Run();
++		be_roster->StartWatching(BMessenger(this), B_REQUEST_LAUNCHED);
++		if (Lock()) {
++			_WatchServer();
++			Unlock();
++		}
++	}
++
++	virtual void MessageReceived(BMessage* message)
++	{
++		switch (message->what) {
++			case B_SOME_APP_LAUNCHED:
++				if (strcmp(message->GetString("be:signature", ""),
++						BLUETOOTH_SIGNATURE) == 0) {
++					_WatchServer();
++					fAddOn->BondsChanged();
++				}
++				break;
++
++			case B_OBSERVER_NOTICE_CHANGE:
++				if (message->GetInt32(B_OBSERVE_WHAT_CHANGE, 0)
++						== BT_NOTICE_BONDS_CHANGED) {
++					fAddOn->BondsChanged();
++				}
++				break;
++
++			default:
++				BLooper::MessageReceived(message);
++				break;
++		}
++	}
++
++	virtual void Quit()
++	{
++		be_roster->StopWatching(BMessenger(this));
++		BLooper::Quit();
++	}
++
++private:
++	void _WatchServer()
++	{
++		BMessenger server(BLUETOOTH_SIGNATURE);
++		if (server.IsValid())
++			StartWatching(server, BT_NOTICE_BONDS_CHANGED);
++	}
++
++	BluetoothAudioAddOn*	fAddOn;
++};
++
++
+ BluetoothAudioAddOn::BluetoothAudioAddOn(image_id image)
+ 	:
+-	BMediaAddOn(image)
++	BMediaAddOn(image),
++	fLock("bluetooth audio devices"),
++	fWatcher(NULL)
+ {
+ 	_LoadDevices();
+ 	syslog(LOG_INFO, "bluetooth_audio: %" B_PRId32 " outputs\n",
+ 		fDevices.CountItems());
++
++	fWatcher = new(std::nothrow) BondWatcher(this);
++	if (fWatcher != NULL)
++		fWatcher->Start();
+ }
+ 
+ 
+ BluetoothAudioAddOn::~BluetoothAudioAddOn()
+ {
++	if (fWatcher != NULL && fWatcher->Lock())
++		fWatcher->Quit();
++
+ 	for (int32 i = 0; i < fDevices.CountItems(); i++) {
+ 		free((char*)fDevices.ItemAt(i)->flavor.name);
+ 		free((char*)fDevices.ItemAt(i)->flavor.info);
+@@ -49,6 +132,7 @@ BluetoothAudioAddOn::InitCheck(const char** _failureText)
+ int32
+ BluetoothAudioAddOn::CountFlavors()
+ {
++	BAutolock locker(fLock);
+ 	return fDevices.CountItems();
+ }
+ 
+@@ -56,6 +140,7 @@ BluetoothAudioAddOn::CountFlavors()
+ status_t
+ BluetoothAudioAddOn::GetFlavorAt(int32 index, const flavor_info** _info)
+ {
++	BAutolock locker(fLock);
+ 	BluetoothAudioDevice* device = fDevices.ItemAt(index);
+ 	if (device == NULL)
+ 		return B_BAD_INDEX;
+@@ -68,6 +153,7 @@ BMediaNode*
+ BluetoothAudioAddOn::InstantiateNodeFor(const flavor_info* info,
+ 	BMessage* config, status_t* _error)
+ {
++	BAutolock locker(fLock);
+ 	BluetoothAudioDevice* device = fDevices.ItemAt(info->internal_id);
+ 	if (device == NULL) {
+ 		*_error = B_BAD_INDEX;
+@@ -83,34 +169,59 @@ BluetoothAudioAddOn::InstantiateNodeFor(const flavor_info* info,
+ }
+ 
+ 
+-/*!	The paired devices that are speakers or headphones: those with an
+-	Audio Sink record, as bluetooth_server kept them. For a device whose
+-	records were not read yet, the class says: audio and video, or nothing
+-	(a Google Home has no class at all); phones, computers, peripherals such
+-	as keyboards and game pads, and imaging devices are left out.
++/*!	Looks at the bonds again: speakers paired meanwhile become outputs at
++	once, without a restart of the media services.
+ */
+ void
++BluetoothAudioAddOn::BondsChanged()
++{
++	if (_LoadDevices() > 0) {
++		syslog(LOG_INFO, "bluetooth_audio: %" B_PRId32 " outputs\n",
++			CountFlavors());
++		NotifyFlavorChange();
++	}
++}
++
++
++/*!	The bonded devices that are speakers or headphones, as bluetooth_server
++	tells them: those with an Audio Sink record. For a device whose records
++	were not read yet, the class says: audio and video, or nothing (a Google
++	Home has no class at all); phones, computers, peripherals such as
++	keyboards and game pads, and imaging devices are left out.
++
++	Only devices not known yet are added; a device whose bond goes keeps its
++	output until the media services restart, as its node knows it by its
++	index (it no longer calls the speakers: they have no key).
++	Returns how many were added.
++*/
++int32
+ BluetoothAudioAddOn::_LoadDevices()
+ {
+-	BPath path;
+-	if (find_directory(B_USER_SETTINGS_DIRECTORY, &path) != B_OK
+-		|| path.Append("Bluetooth_paired_devices") != B_OK)
+-		return;
+-	BFile file(path.Path(), B_READ_ONLY);
++	BMessage request(BT_MSG_GET_BONDED_DEVICES);
+ 	BMessage devices;
+-	if (file.InitCheck() != B_OK || devices.Unflatten(&file) != B_OK)
+-		return;
++	if (BMessenger(BLUETOOTH_SIGNATURE).SendMessage(&request, &devices,
++			kServerTimeout, kServerTimeout) != B_OK) {
++		return 0;
++	}
+ 
++	BAutolock locker(fLock);
++	int32 added = 0;
+ 	BMessage remote;
+-	for (int32 i = 0; devices.FindMessage("remote", i, &remote) == B_OK;
++	for (int32 i = 0; devices.FindMessage("device", i, &remote) == B_OK;
+ 			i++) {
+ 		const bdaddr_t* address;
+ 		ssize_t size;
+-		if (remote.FindData("bdaddr", B_ANY_TYPE, (const void**)&address,
+-				&size) != B_OK || size != sizeof(bdaddr_t))
++		if (remote.FindData("address", B_RAW_TYPE, (const void**)&address,
++				&size) != B_OK || size != sizeof(bdaddr_t)) {
++			continue;
++		}
++		bool known = false;
++		for (int32 j = 0; j < fDevices.CountItems() && !known; j++)
++			known = bdaddrUtils::Compare(fDevices.ItemAt(j)->address, *address);
++		if (known)
+ 			continue;
+ 
+-		// the service classes bluetooth_server kept from the SDP records:
++		// the service classes bluetooth_server read from the SDP records:
+ 		// speakers have an Audio Sink (0x110b)
+ 		uint16 serviceClass;
+ 		bool servicesKnown = false;
+@@ -127,7 +238,7 @@ BluetoothAudioAddOn::_LoadDevices()
+ 			// something; 1 computer, 2 phone, 5 peripheral, 6 imaging
+ 			uint32 major = 0x1f;
+ 			const uint8* deviceClass;
+-			if (remote.FindData("class_of_device", B_RAW_TYPE,
++			if (remote.FindData("class", B_RAW_TYPE,
+ 					(const void**)&deviceClass, &size) == B_OK && size == 3)
+ 				major = deviceClass[1] & 0x1f;
+ 			if (major == 1 || major == 2 || major == 5 || major == 6)
+@@ -136,7 +247,7 @@ BluetoothAudioAddOn::_LoadDevices()
+ 
+ 		BluetoothAudioDevice* device = new(std::nothrow) BluetoothAudioDevice;
+ 		if (device == NULL)
+-			return;
++			break;
+ 		memcpy(&device->address, address, sizeof(bdaddr_t));
+ 		device->name = remote.GetString("name", "");
+ 		if (device->name.IsEmpty())
+@@ -164,8 +275,15 @@ BluetoothAudioAddOn::_LoadDevices()
+ 		flavor.out_format_flags = 0;
+ 		flavor.out_formats = NULL;
+ 
+-		fDevices.AddItem(device);
++		if (!fDevices.AddItem(device)) {
++			free((char*)flavor.name);
++			free((char*)flavor.info);
++			delete device;
++			break;
++		}
++		added++;
+ 	}
++	return added;
+ }
+ 
+ 
+diff --git a/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioAddOn.h b/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioAddOn.h
+index 9126c3414f..beb3109c9b 100644
+--- a/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioAddOn.h
++++ b/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioAddOn.h
+@@ -9,6 +9,7 @@
+ #define BLUETOOTH_AUDIO_ADD_ON_H
+ 
+ 
++#include <Locker.h>
+ #include <MediaAddOn.h>
+ #include <ObjectList.h>
+ #include <String.h>
+@@ -16,6 +17,9 @@
+ #include <bluetooth/bluetooth.h>
+ 
+ 
++class BondWatcher;
++
++
+ struct BluetoothAudioDevice {
+ 	bdaddr_t		address;
+ 	BString			name;
+@@ -39,10 +43,17 @@ public:
+ 	// outputs by itself, as those of sound cards.
+ 	virtual	bool				WantsAutoStart() { return false; }
+ 
++			// the bonds changed, or the Bluetooth server started
++			void				BondsChanged();
++
+ private:
+-			void				_LoadDevices();
++			int32				_LoadDevices();
+ 
++			BLocker				fLock;
+ 			BObjectList<BluetoothAudioDevice, true> fDevices;
++				// only added to while running: a node knows its device by
++				// its index
++			BondWatcher*		fWatcher;
+ };
+ 
+ 
+diff --git a/src/servers/bluetooth/BluetoothServer.cpp b/src/servers/bluetooth/BluetoothServer.cpp
+index ed60a76fbe..6467c0ccf0 100644
+--- a/src/servers/bluetooth/BluetoothServer.cpp
++++ b/src/servers/bluetooth/BluetoothServer.cpp
+@@ -226,6 +226,43 @@ void BluetoothServer::MessageReceived(BMessage* message)
+ 		}
+ 		break;
+ 
++		case BT_MSG_GET_BONDED_DEVICES:
++		{
++			BMessage reply(BT_MSG_GET_BONDED_DEVICES);
++			BAutolock locker(fStoresLock);
++			for (int32 i = 0; i < fBondStores.CountItems(); i++) {
++				BondStore* bonds = fBondStores.ItemAt(i);
++				DeviceCache* devices = DeviceCacheFor(bonds->Adapter());
++				BMessage described;
++				bonds->Describe(described);
++				BMessage bond;
++				for (int32 j = 0; described.FindMessage("bond", j, &bond)
++						== B_OK; j++) {
++					const void* data;
++					ssize_t size;
++					if (bond.FindData("address", B_RAW_TYPE, &data, &size)
++							!= B_OK || size != sizeof(bdaddr_t)) {
++						continue;
++					}
++					DeviceRecord record;
++					if (devices != NULL)
++						devices->Get(*(const bdaddr_t*)data, record);
++					BMessage device;
++					device.AddData("address", B_RAW_TYPE, data, size);
++					device.AddString("name", record.name);
++					device.AddData("class", B_RAW_TYPE, record.deviceClass,
++						sizeof(record.deviceClass));
++					for (uint8 k = 0; k < record.serviceClassCount; k++) {
++						device.AddUInt16("service class",
++							record.serviceClasses[k]);
++					}
++					reply.AddMessage("device", &device);
++				}
++			}
++			message->SendReply(&reply);
++			return;
++		}
++
+ 		case kMsgBondChanged:
+ 		{
+ 			BMessage notice(*message);
+@@ -736,7 +773,15 @@ BluetoothServer::BondStoreFor(const bdaddr_t& adapter)
+ 	bonds->Load();
+ 	if (firstTime)
+ 		_ImportPairedDevicesFile(bonds, devices);
++	_RetirePairedDevicesFile();
+ 	bonds->SetListener(this);
++
++	// whoever waits for the bonds of the controllers (the Bluetooth audio
++	// add-on, which may have started before us) can ask for them now
++	BMessage loaded(kMsgBondChanged);
++	loaded.AddData("adapter", B_RAW_TYPE, &adapter, sizeof(bdaddr_t));
++	loaded.AddInt32("change", 3);
++	PostMessage(&loaded);
+ 	return bonds;
+ }
+ 
+@@ -799,8 +844,8 @@ BluetoothServer::_StateDirectory(BPath& path)
+ /*!	Takes the paired devices of the file kept before the bond store: the
+ 	keys become bonds of this adapter (the file did not tell which adapter
+ 	they were of), and what is known of every device goes to the cache.
+-	The file stays as it is, for the Bluetooth audio add-on that still
+-	reads it; the server no longer writes it.
++	The server no longer writes the file; it is put aside afterwards (see
++	_RetirePairedDevicesFile()).
+ */
+ void
+ BluetoothServer::_ImportPairedDevicesFile(BondStore* bonds,
+@@ -857,8 +902,32 @@ BluetoothServer::_ImportPairedDevicesFile(BondStore* bonds,
+ 	devices->Flush();
+ 
+ 	syslog(LOG_NOTICE, "bluetooth_server: %" B_PRId32 " bonds and %" B_PRId32
+-		" devices taken from %s, which is no longer written\n", bonded,
+-		known, path.Path());
++		" devices taken from %s\n", bonded, known, path.Path());
++}
++
++
++/*!	Puts the file of the paired devices kept before the bond store aside,
++	once its content was taken in: as "Bluetooth_paired_devices.migrated",
++	which only its owner may read, as it holds link keys. Nothing reads it
++	any more.
++*/
++void
++BluetoothServer::_RetirePairedDevicesFile()
++{
++	BPath path;
++	if (find_directory(B_USER_SETTINGS_DIRECTORY, &path) != B_OK
++		|| path.Append("Bluetooth_paired_devices") != B_OK) {
++		return;
++	}
++	BEntry entry(path.Path());
++	if (!entry.Exists())
++		return;
++
++	entry.SetPermissions(S_IRUSR | S_IWUSR);
++	if (entry.Rename("Bluetooth_paired_devices.migrated", true) == B_OK) {
++		syslog(LOG_NOTICE, "bluetooth_server: %s is no longer used, it is "
++			"now %s.migrated\n", path.Path(), path.Leaf());
++	}
+ }
+ 
+ 
+diff --git a/src/servers/bluetooth/BluetoothServer.h b/src/servers/bluetooth/BluetoothServer.h
+index 245682955d..4abc509543 100644
+--- a/src/servers/bluetooth/BluetoothServer.h
++++ b/src/servers/bluetooth/BluetoothServer.h
+@@ -133,6 +133,7 @@ private:
+ 	status_t			_StateDirectory(BPath& path);
+ 	void				_ImportPairedDevicesFile(BondStore* bonds,
+ 							DeviceCache* devices);
++	void				_RetirePairedDevicesFile();
+ 
+ 	BLocker				fDevicesLock;
+ 	LocalDevicesList   	fLocalDevicesList;
+-- 
+2.39.5
+

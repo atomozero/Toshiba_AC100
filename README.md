@@ -80,7 +80,9 @@ git am ../Toshiba_AC100/patches/buildtools/*.patch
 # RenkuOS con il supporto all'AC100
 cd ../haiku
 git checkout $(cut -d' ' -f2 ../Toshiba_AC100/patches/renkuos/BASE.txt)
-git am ../Toshiba_AC100/patches/renkuos/*.patch
+git apply --index ../Toshiba_AC100/patches/renkuos/0001-*.patch
+git commit -m "AC100 tree at the merge of RenkuOS main"
+git am $(ls ../Toshiba_AC100/patches/renkuos/0*.patch | tail -n +2)
 ```
 
 ### 3. jam e toolchain ARM (VFPv3-D16)
@@ -112,7 +114,9 @@ git clone https://github.com/haikuports/haikuports.git
 git clone https://github.com/RenkuOS/Source.git haiku-bs
 cd haiku-bs
 git checkout $(cut -d' ' -f2 ../Toshiba_AC100/patches/renkuos/BASE.txt)
-git am ../Toshiba_AC100/patches/renkuos/*.patch
+git apply --index ../Toshiba_AC100/patches/renkuos/0001-*.patch
+git commit -m "AC100 tree at the merge of RenkuOS main"
+git am $(ls ../Toshiba_AC100/patches/renkuos/0*.patch | tail -n +2)
 mkdir generated.arm && cd generated.arm
 ../configure --cross-tools-prefix ~/haiku-arm/haiku/generated.arm/cross-tools-arm/bin/arm-unknown-haiku- \
     --bootstrap ../../haikuporter/haikuporter ../../haikuports.cross ../../haikuports

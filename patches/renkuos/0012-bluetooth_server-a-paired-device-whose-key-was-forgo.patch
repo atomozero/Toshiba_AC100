@@ -1,0 +1,75 @@
+From 9de978155fa2a9b06ba0d30ea662e01d5b9beaf8 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 8 Nov 2026 23:21:45 +0100
+Subject: [PATCH 12/42] bluetooth_server: a paired device whose key was
+ forgotten stays paired
+
+A device that refuses its key has it forgotten, so that it pairs again
+next time, and is meant to stay in the list. But a connection that then
+failed (the speakers switched off or out of reach) removed every device
+without a key, which is meant for devices found in a search and never
+paired: the Google Home went from the paired devices this way, and with
+it its audio output.
+
+Devices loaded from the paired devices file, or that got a key, are now
+marked paired, and only the others are removed when a connection fails.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/servers/bluetooth/LocalDeviceImpl.cpp | 8 +++++++-
+ src/servers/bluetooth/LocalDeviceImpl.h   | 3 +++
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/src/servers/bluetooth/LocalDeviceImpl.cpp b/src/servers/bluetooth/LocalDeviceImpl.cpp
+index 3cd85c105b..4c90740990 100644
+--- a/src/servers/bluetooth/LocalDeviceImpl.cpp
++++ b/src/servers/bluetooth/LocalDeviceImpl.cpp
+@@ -283,6 +283,7 @@ LocalDeviceImpl::LoadRemoteDevices()
+ 			&& size == sizeof(rd->classOfDevice)) {
+ 			memcpy(rd->classOfDevice, data, sizeof(rd->classOfDevice));
+ 		}
++		rd->paired = true;
+ 		// FindData() gives a pointer to the key, not the key
+ 		rd->link_key = LinkKeyUtils::NullKey();
+ 		if (device.FindData("link key", B_ANY_TYPE, &data, &size) == B_OK
+@@ -2195,10 +2196,14 @@ LocalDeviceImpl::ConnectionComplete(struct hci_ev_conn_complete* event)
+ 
+ 		reply.what = BT_MSG_CONN_COMPLETED;
+ 	} else {
++		// A device found in a search and never paired goes again; one
++		// that was paired stays, also when its key was forgotten (it
++		// refused it): out of reach is no reason to forget it.
+ 		linkkey_t nullLinkKey = LinkKeyUtils::NullKey();
+ 		if (rd == NULL)
+ 			;
+-		else if (LinkKeyUtils::Compare(&rd->link_key, &nullLinkKey))
++		else if (!rd->paired
++			&& LinkKeyUtils::Compare(&rd->link_key, &nullLinkKey))
+ 			RemoveRemoteDevice(rd);
+ 		else
+ 			_LinkDown(rd);
+@@ -2319,6 +2324,7 @@ LocalDeviceImpl::LinkKeyNotify(hci_ev_link_key_notify* event,
+ 
+ 	rd->link_key = event->link_key;
+ 	rd->key_type = event->key_type;
++	rd->paired = true;
+ 	rd->autoPinTried = false;
+ 
+ 	// keep the key at once: the device needs it to connect again
+diff --git a/src/servers/bluetooth/LocalDeviceImpl.h b/src/servers/bluetooth/LocalDeviceImpl.h
+index 48a6fccddd..cd866a79e9 100644
+--- a/src/servers/bluetooth/LocalDeviceImpl.h
++++ b/src/servers/bluetooth/LocalDeviceImpl.h
+@@ -51,6 +51,9 @@ struct ServerRemoteDevice
+ 	BMessage			services;
+ 	bool				outgoing;
+ 		// we opened the connection, rather than the device
++	bool				paired;
++		// it was paired once (it is in the paired devices file): it stays
++		// in the list when its key is forgotten and a connection fails
+ };
+ 
+ // no link uses it: the handles go up to 0x0eff
+-- 
+2.39.5
+

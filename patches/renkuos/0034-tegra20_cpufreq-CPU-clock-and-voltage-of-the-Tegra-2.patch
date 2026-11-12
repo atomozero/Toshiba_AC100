@@ -1,0 +1,1157 @@
+From 79c44155e16920ab19d31e7f1df628b9c4d81d93 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Wed, 11 Nov 2026 21:47:34 +0100
+Subject: [PATCH 34/42] tegra20_cpufreq: CPU clock and voltage of the Tegra 2
+ together
+
+A cpufreq module for the NVIDIA Tegra 2: it runs the CPUs at one of the
+operating points of Linux' tegra20-cpu-opp.dtsi, from 216 to 1000 MHz,
+each at the lowest CPU voltage that the fuses of the chip allow (CPU
+process and SoC speedo ID, read as Linux' speedo-tegra20.c does). Raising
+the rate raises the CPU supply (SM1 of the TPS6586x) first, lowering it
+lowers the supply after; the core supply must stay 120 mV above. The
+clock part is the one tegra_dvfs had, which now asks the module through
+"cclk <MHz>" and shows its state.
+
+For now the rate is only chosen by hand: the scheduler's hooks note
+nothing yet, a governor comes next. "disabled true" in the tegra20_cpufreq
+driver settings keeps the module from loading.
+
+The kernel now reports the rate the module set (arm_set_cpu_frequency()),
+not the one it measured once at boot. A reset of the chip leaves the
+power management IC as it is while the boot firmware starts at full
+speed: before resetting, the kernel raises the supplies to their nominal
+voltages again (arm_tegra_prepare_reset()), as Linux does.
+
+Tested on the Toshiba AC100 (process 1, speedo ID 0: 216/750, 312/750,
+456/825, 608/900, 760/975, 816/1000, 912/1050, 1000/1100 MHz/mV):
+tests/ac100diag/cpucheck, the same integer and floating point work on
+both CPUs checked against its first result, 20 s at every point going
+down without an error; tests/ac100diag/clocktest, 27 changes with jumps
+of up to 350 mV, timing kept. On battery, idle with the screen on:
+4.66 W at 1000 MHz, 4.31 W at 456 MHz, 4.23 W at 216 MHz.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ build/jam/packages/Haiku                      |   1 +
+ headers/private/drivers/tegra20_cpufreq.h     |  32 +
+ .../kernel/drivers/power/tegra_dvfs/Jamfile   |   1 +
+ .../drivers/power/tegra_dvfs/tegra_dvfs.cpp   | 200 +----
+ src/add-ons/kernel/power/cpufreq/Jamfile      |   1 +
+ .../power/cpufreq/tegra20_cpufreq/Jamfile     |  11 +
+ .../tegra20_cpufreq/tegra20_cpufreq.cpp       | 685 ++++++++++++++++++
+ src/system/kernel/arch/arm/arch_cpu.cpp       |   3 +
+ .../kernel/arch/arm/arch_real_time_clock.cpp  |  13 +
+ .../kernel/arch/arm/arch_system_info.cpp      |  10 +
+ 10 files changed, 784 insertions(+), 173 deletions(-)
+ create mode 100644 headers/private/drivers/tegra20_cpufreq.h
+ create mode 100644 src/add-ons/kernel/power/cpufreq/tegra20_cpufreq/Jamfile
+ create mode 100644 src/add-ons/kernel/power/cpufreq/tegra20_cpufreq/tegra20_cpufreq.cpp
+
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index 6369994b35..e00fa207ed 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -119,6 +119,7 @@ AddFilesToPackage add-ons kernel interrupt_controllers :
+ AddFilesToPackage add-ons kernel power cpufreq :
+ 	amd_pstates@x86,x86_64
+ 	intel_pstates@x86,x86_64
++	tegra20_cpufreq@arm
+ 	;
+ AddFilesToPackage add-ons kernel power cpuidle :
+ 	x86_cstates@x86,x86_64
+diff --git a/headers/private/drivers/tegra20_cpufreq.h b/headers/private/drivers/tegra20_cpufreq.h
+new file mode 100644
+index 0000000000..ba332d9705
+--- /dev/null
++++ b/headers/private/drivers/tegra20_cpufreq.h
+@@ -0,0 +1,32 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef _TEGRA20_CPUFREQ_H
++#define _TEGRA20_CPUFREQ_H
++
++
++#include <cpufreq.h>
++
++
++#define TEGRA20_CPUFREQ_MODULE_NAME	CPUFREQ_MODULES_PREFIX "/tegra20_cpufreq/v1"
++
++
++/*!	The cpufreq module of the NVIDIA Tegra 2. Besides the hooks the kernel
++	calls, it lets a driver (tegra_dvfs) choose an operating point by hand
++	and describe the state, for testing and measuring.
++*/
++typedef struct tegra20_cpufreq_module_info {
++	cpufreq_module_info	info;
++
++	/*!	Runs the CPUs at \a mhz, one of the rates of the table, at the
++		voltage the table gives this chip for it. */
++	status_t			(*set_frequency)(uint32 mhz);
++	//!	The rate the CPUs run at, in MHz.
++	uint32				(*frequency)(void);
++	//!	The operating points and the current one, as text.
++	size_t				(*describe)(char* buffer, size_t size);
++} tegra20_cpufreq_module_info;
++
++
++#endif	// _TEGRA20_CPUFREQ_H
+diff --git a/src/add-ons/kernel/drivers/power/tegra_dvfs/Jamfile b/src/add-ons/kernel/drivers/power/tegra_dvfs/Jamfile
+index eeac90d3e6..0278b0dded 100644
+--- a/src/add-ons/kernel/drivers/power/tegra_dvfs/Jamfile
++++ b/src/add-ons/kernel/drivers/power/tegra_dvfs/Jamfile
+@@ -1,5 +1,6 @@
+ SubDir HAIKU_TOP src add-ons kernel drivers power tegra_dvfs ;
+ 
++UsePrivateHeaders drivers ;
+ UsePrivateKernelHeaders ;
+ 
+ KernelAddon tegra_dvfs :
+diff --git a/src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp b/src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp
+index 64301aab20..e3334d957a 100644
+--- a/src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp
++++ b/src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp
+@@ -12,12 +12,9 @@
+ 	within the limits of the AC100 and keeping the core 120 mV above the CPU
+ 	and within 170 mV of the RTC domain, as Linux does.
+ 
+-	Writing "cclk <MHz>" sets the CPU clock: 216 MHz runs it from PLLP and
+-	switches PLLX off, the others from PLLX, which is reprogrammed while the
+-	CPU runs from PLLP meanwhile, as Linux does. The private timers of the
+-	CPUs, which run at a quarter of that clock and give the kernel its timer
+-	events, are told the new rate. For now the CPU supply must be at its
+-	highest voltage (1100 mV), which every rate allows.
++	Writing "cclk <MHz>" asks the cpufreq module (tegra20_cpufreq) for an
++	operating point: the CPU clock with the CPU supply the fuses of the chip
++	allow for it. Reading shows its state too.
+ */
+ 
+ 
+@@ -31,6 +28,8 @@
+ #include <lock.h>
+ #include <util/AutoLock.h>
+ 
++#include <tegra20_cpufreq.h>
++
+ 
+ #define TPS6586X_ADDRESS			0x34
+ #define TPS6586X_SUPPLYENA			0x10
+@@ -74,28 +73,7 @@
+ #define CAR_PLLM_BASE				0x90
+ #define CAR_PLLP_BASE				0xa0
+ #define CAR_PLLX_BASE				0xe0
+-#define CAR_PLLX_MISC				0xe4
+ #define CAR_CLK_SOURCE_EMC			0x19c
+-
+-#define PLL_BASE_BYPASS				(1U << 31)
+-#define PLL_BASE_ENABLE				(1U << 30)
+-#define PLL_BASE_LOCK				(1U << 27)
+-#define PLL_BASE_DIVP_SHIFT			20
+-#define PLL_BASE_DIVN_SHIFT			8
+-#define PLL_MISC_LOCK_ENABLE		(1U << 18)
+-
+-// CCLK_BURST_POLICY: the CPU state in bits 31:28, then a 4 bit source for
+-// each state (FIQ, IRQ, run, idle); 4 is PLLP_OUT0, 8 PLLX_OUT0
+-#define CCLK_STATE_RUN				(2U << 28)
+-#define CCLK_ALL_FROM_PLLP			0x4444
+-#define CCLK_ALL_FROM_PLLX			0x8888
+-#define CCLK_SOURCE_MASK			0xffff
+-#define CCLK_RUN_SOURCE(policy)		(((policy) >> 4) & 0xf)
+-#define CCLK_SOURCE_PLLP			4
+-#define CCLK_SOURCE_PLLX			8
+-
+-#define PLLP_KHZ					216000
+-#define PLLX_LOCK_TIMEOUT			1000	// microseconds
+ #define CAR_CLK_OUT_ENB_H			0x14
+ #define CAR_CLK_ENB_FUSE			(1 << 7)
+ 
+@@ -116,8 +94,6 @@ extern "C" status_t arm_dvc_i2c_read(uint8 address, uint8 reg, uint8* data,
+ 	uint32 length);
+ extern "C" status_t arm_dvc_i2c_write(uint8 address, uint8 reg,
+ 	const uint8* data, uint32 length);
+-extern "C" uint32 tegra_twd_frequency(void);
+-extern "C" status_t tegra_twd_set_frequency(uint32 frequency);
+ 
+ 
+ static const char* sDeviceNames[] = { "power/tegra_dvfs", NULL };
+@@ -476,158 +452,35 @@ set_supply(int32 index, uint32 target)
+ //	#pragma mark - CPU clock
+ 
+ 
+-// The rates of Linux' Tegra 2 CPU table, which all run at 1100 mV
+-static const uint32 kCPUClocksMHz[] = {
+-	216, 312, 456, 608, 760, 816, 912, 1000
+-};
+-
+-static uint32 sTWDBaseFrequency;	// the private timer rate at sCPUBaseKHz
+-static uint32 sCPUBaseKHz;
+-
+-
+-/*!	The CPU clock in kHz, from the source of its run state. */
+-static uint32
+-cpu_clock_khz(volatile uint32* car)
+-{
+-	uint32 policy = car[CAR_CCLK_BURST_POLICY / 4];
+-	switch (CCLK_RUN_SOURCE(policy)) {
+-		case CCLK_SOURCE_PLLP:
+-			return pll_khz(car[CAR_PLLP_BASE / 4]);
+-		case CCLK_SOURCE_PLLX:
+-			return pll_khz(car[CAR_PLLX_BASE / 4]);
+-	}
+-	return 0;
+-}
+-
+-
+-/*!	Tells the kernel the rate of the private timers for the CPU clock
+-	\a khz: a quarter of it, measured against the 1 MHz timer at boot.
+-*/
+-static status_t
+-cpu_clock_changed(uint32 khz)
+-{
+-	return tegra_twd_set_frequency(
+-		(uint64)sTWDBaseFrequency * khz / sCPUBaseKHz);
+-}
+-
+-
+-static void
+-set_cpu_source(volatile uint32* car, uint32 sources)
+-{
+-	uint32 policy = car[CAR_CCLK_BURST_POLICY / 4];
+-	car[CAR_CCLK_BURST_POLICY / 4] = (policy & ~(0xfU << 28 | CCLK_SOURCE_MASK))
+-		| CCLK_STATE_RUN | sources;
+-	// the switch is glitch free and takes a few cycles of both clocks
+-	car[CAR_CCLK_BURST_POLICY / 4];
+-	spin(1);
+-}
+-
+-
+-/*!	PLLX from the 12 MHz oscillator: M = 12, so N is the rate in MHz, with a
+-	VCO of at least 600 MHz (P = 1 halves it for 456 MHz and below). The
+-	charge pump and the other MISC settings stay as the firmware set them
+-	for 1 GHz, which suits a comparison frequency of 1 MHz and N >= 600.
++/*!	The CPU clock belongs to the cpufreq module, which moves the CPU supply
++	with it: "cclk <MHz>" asks it for an operating point.
+ */
+-static status_t
+-program_pllx(volatile uint32* car, uint32 mhz)
+-{
+-	uint32 p = mhz < 600 ? 1 : 0;
+-	uint32 n = mhz << p;
+-	uint32 base = car[CAR_PLLX_BASE / 4];
+-	uint32 m = base & 0x1f;
+-	if (m != OSCILLATOR_KHZ / 1000 || n > 1000)
+-		return B_NOT_SUPPORTED;
+-
+-	car[CAR_PLLX_MISC / 4] |= PLL_MISC_LOCK_ENABLE;
+-	base &= ~(PLL_BASE_ENABLE | PLL_BASE_BYPASS | (0x7U << PLL_BASE_DIVP_SHIFT)
+-		| (0x3ffU << PLL_BASE_DIVN_SHIFT));
+-	base |= (p << PLL_BASE_DIVP_SHIFT) | (n << PLL_BASE_DIVN_SHIFT);
+-	car[CAR_PLLX_BASE / 4] = base;
+-	car[CAR_PLLX_BASE / 4] = base | PLL_BASE_ENABLE;
+-
+-	bigtime_t timeout = system_time() + PLLX_LOCK_TIMEOUT;
+-	while ((car[CAR_PLLX_BASE / 4] & PLL_BASE_LOCK) == 0) {
+-		if (system_time() > timeout)
+-			return B_TIMED_OUT;
+-		spin(10);
+-	}
+-	// settle, as Linux waits its lock delay
+-	spin(300);
+-	return B_OK;
+-}
+-
+-
+ static status_t
+ set_cpu_clock(uint32 mhz)
+ {
+-	bool known = false;
+-	for (size_t i = 0; i < B_COUNT_OF(kCPUClocksMHz); i++)
+-		known |= kCPUClocksMHz[i] == mhz;
+-	if (!known)
+-		return B_BAD_VALUE;
+-
+-	MutexLocker locker(sLock);
+-
+-	uint32 cpuMillivolts;
+-	status_t status = read_supply(kSupplies[SUPPLY_CPU], &cpuMillivolts);
++	tegra20_cpufreq_module_info* cpufreq;
++	status_t status = get_module(TEGRA20_CPUFREQ_MODULE_NAME,
++		(module_info**)&cpufreq);
+ 	if (status != B_OK)
+ 		return status;
+-	if (cpuMillivolts != CPU_MAX_MV) {
+-		TRACE_ALWAYS("cclk: the CPU supply is at %" B_PRIu32 " mV, not %d\n",
+-			cpuMillivolts, CPU_MAX_MV);
+-		return B_NOT_ALLOWED;
+-	}
+-
+-	void* address;
+-	area_id area = map_physical_memory("tegra car", TEGRA20_CAR_BASE,
+-		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+-		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
+-	if (area < B_OK)
+-		return area;
+-	volatile uint32* car = (volatile uint32*)address;
+-
+-	if (sCPUBaseKHz == 0) {
+-		sCPUBaseKHz = cpu_clock_khz(car);
+-		sTWDBaseFrequency = tegra_twd_frequency();
+-		if (sCPUBaseKHz == 0 || sTWDBaseFrequency == 0) {
+-			sCPUBaseKHz = 0;
+-			delete_area(area);
+-			return B_NOT_SUPPORTED;
+-		}
+-	}
++	status = cpufreq->set_frequency(mhz);
++	put_module(TEGRA20_CPUFREQ_MODULE_NAME);
++	return status;
++}
+ 
+-	uint32 oldKHz = cpu_clock_khz(car);
+-	if (oldKHz == mhz * 1000) {
+-		delete_area(area);
+-		return B_OK;
+-	}
+ 
+-	// Away from PLLX first, if it runs from it
+-	if (CCLK_RUN_SOURCE(car[CAR_CCLK_BURST_POLICY / 4]) != CCLK_SOURCE_PLLP) {
+-		set_cpu_source(car, CCLK_ALL_FROM_PLLP);
+-		cpu_clock_changed(PLLP_KHZ);
+-	}
+-
+-	if (mhz * 1000 == PLLP_KHZ) {
+-		// PLLX is not needed any more
+-		car[CAR_PLLX_BASE / 4] &= ~PLL_BASE_ENABLE;
+-	} else {
+-		status = program_pllx(car, mhz);
+-		if (status != B_OK) {
+-			TRACE_ALWAYS("cclk: PLLX at %" B_PRIu32 " MHz: %s, staying at "
+-				"216 MHz\n", mhz, strerror(status));
+-			delete_area(area);
+-			return status;
+-		}
+-		set_cpu_source(car, CCLK_ALL_FROM_PLLX);
+-		cpu_clock_changed(cpu_clock_khz(car));
++static size_t
++report_cpufreq(char* buffer, size_t size, size_t length)
++{
++	tegra20_cpufreq_module_info* cpufreq;
++	if (get_module(TEGRA20_CPUFREQ_MODULE_NAME, (module_info**)&cpufreq)
++			!= B_OK) {
++		return append(buffer, size, length, "cpufreq: not loaded\n");
+ 	}
+-
+-	uint32 newKHz = cpu_clock_khz(car);
+-	delete_area(area);
+-	TRACE_ALWAYS("cclk: %" B_PRIu32 " -> %" B_PRIu32 " kHz, private timers %"
+-		B_PRIu32 " Hz\n", oldKHz, newKHz, tegra_twd_frequency());
+-	return B_OK;
++	if (length < size)
++		length += cpufreq->describe(buffer + length, size - length);
++	put_module(TEGRA20_CPUFREQ_MODULE_NAME);
++	return length;
+ }
+ 
+ 
+@@ -666,10 +519,11 @@ tegra_dvfs_control(void* cookie, uint32 op, void* arg, size_t length)
+ static status_t
+ tegra_dvfs_read(void* cookie, off_t position, void* buffer, size_t* _length)
+ {
+-	char text[1536];
++	char text[2048];
+ 	size_t textLength = report_pmic(text, sizeof(text), 0);
+ 	textLength = report_clocks(text, sizeof(text), textLength);
+ 	textLength = report_fuses(text, sizeof(text), textLength);
++	textLength = report_cpufreq(text, sizeof(text), textLength);
+ 	if (textLength >= sizeof(text))
+ 		textLength = sizeof(text) - 1;
+ 
+diff --git a/src/add-ons/kernel/power/cpufreq/Jamfile b/src/add-ons/kernel/power/cpufreq/Jamfile
+index 81306a7e6b..f6bfdffdb4 100644
+--- a/src/add-ons/kernel/power/cpufreq/Jamfile
++++ b/src/add-ons/kernel/power/cpufreq/Jamfile
+@@ -2,4 +2,5 @@ SubDir HAIKU_TOP src add-ons kernel power cpufreq ;
+ 
+ SubInclude HAIKU_TOP src add-ons kernel power cpufreq amd_pstates ;
+ SubInclude HAIKU_TOP src add-ons kernel power cpufreq intel_pstates ;
++SubInclude HAIKU_TOP src add-ons kernel power cpufreq tegra20_cpufreq ;
+ 
+diff --git a/src/add-ons/kernel/power/cpufreq/tegra20_cpufreq/Jamfile b/src/add-ons/kernel/power/cpufreq/tegra20_cpufreq/Jamfile
+new file mode 100644
+index 0000000000..75b4e52ee1
+--- /dev/null
++++ b/src/add-ons/kernel/power/cpufreq/tegra20_cpufreq/Jamfile
+@@ -0,0 +1,11 @@
++SubDir HAIKU_TOP src add-ons kernel power cpufreq tegra20_cpufreq ;
++
++UsePrivateHeaders drivers ;
++UsePrivateKernelHeaders ;
++UseLibraryHeaders [ FDirName libfdt ] ;
++
++KernelAddon tegra20_cpufreq :
++	tegra20_cpufreq.cpp
++	:
++	kernel_fdt.a
++	;
+diff --git a/src/add-ons/kernel/power/cpufreq/tegra20_cpufreq/tegra20_cpufreq.cpp b/src/add-ons/kernel/power/cpufreq/tegra20_cpufreq/tegra20_cpufreq.cpp
+new file mode 100644
+index 0000000000..862c8e1be4
+--- /dev/null
++++ b/src/add-ons/kernel/power/cpufreq/tegra20_cpufreq/tegra20_cpufreq.cpp
+@@ -0,0 +1,685 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++/*!	CPU clock and voltage of the NVIDIA Tegra 2 (Tegra20), as in the Toshiba
++	AC100: the CPU clock comes from PLLX or PLLP, the CPU supply from SM1 of
++	the TPS6586x power management IC.
++
++	The operating points are those of Linux' tegra20-cpu-opp.dtsi and
++	tegra20-cpu-opp-microvolt.dtsi: each rate has the lowest voltage that the
++	fuses of this chip (CPU process and SoC speedo, as Linux reads them)
++	allow. Raising the rate raises the voltage first, lowering it lowers the
++	voltage after. Only the CPU supply moves: the core and RTC supplies stay
++	where they are, and must stay 120 mV above it.
++
++	The CPU timer events come from the Cortex-A9 private timers, which run at
++	a quarter of the CPU clock: every change tells the kernel the new rate.
++
++	For now the rate is only chosen by hand, through tegra_dvfs
++	("cclk <MHz>"); the kernel's hooks do nothing yet. "disabled true" in
++	~/config/settings/kernel/drivers/tegra20_cpufreq keeps the module from
++	loading.
++*/
++
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <string.h>
++
++#include <KernelExport.h>
++#include <driver_settings.h>
++#include <lock.h>
++#include <util/AutoLock.h>
++
++#include <libfdt.h>
++
++#include <tegra20_cpufreq.h>
++
++
++//#define TRACE_CPUFREQ
++#ifdef TRACE_CPUFREQ
++#	define TRACE(x...) dprintf("tegra20_cpufreq: " x)
++#else
++#	define TRACE(x...) ;
++#endif
++#define TRACE_ALWAYS(x...) dprintf("tegra20_cpufreq: " x)
++
++
++extern void* gFDT;
++
++extern "C" status_t arm_dvc_i2c_read(uint8 address, uint8 reg, uint8* data,
++	uint32 length);
++extern "C" status_t arm_dvc_i2c_write(uint8 address, uint8 reg,
++	const uint8* data, uint32 length);
++extern "C" uint32 tegra_twd_frequency(void);
++extern "C" status_t tegra_twd_set_frequency(uint32 frequency);
++extern "C" void arm_set_cpu_frequency(uint64 frequency);
++
++
++// TPS6586x: SM0 is the core supply, SM1 the CPU supply
++#define TPS6586X_ADDRESS			0x34
++#define TPS6586X_VCC1				0x20
++#define TPS6586X_VCC1_SM1_GO		(1 << 0)
++#define TPS6586X_VCC1_SM1_V2		(1 << 1)
++#define TPS6586X_VCC1_SM0_V2		(1 << 3)
++#define TPS6586X_SM1V1				0x23
++#define TPS6586X_SM0V1				0x26
++#define TPS6586X_DVM_MIN_MV			725
++#define TPS6586X_DVM_STEP_MV		25
++
++#define CORE_OVER_CPU_MV			120
++
++#define TEGRA20_CAR_BASE			0x60006000
++#define CAR_CCLK_BURST_POLICY		0x20
++#define CAR_CLK_OUT_ENB_H			0x14
++#define CAR_CLK_ENB_FUSE			(1U << 7)
++#define CAR_PLLP_BASE				0xa0
++#define CAR_PLLX_BASE				0xe0
++#define CAR_PLLX_MISC				0xe4
++
++#define PLL_BASE_BYPASS				(1U << 31)
++#define PLL_BASE_ENABLE				(1U << 30)
++#define PLL_BASE_LOCK				(1U << 27)
++#define PLL_BASE_DIVP_SHIFT			20
++#define PLL_BASE_DIVN_SHIFT			8
++#define PLL_MISC_LOCK_ENABLE		(1U << 18)
++
++// CCLK_BURST_POLICY: the CPU state in bits 31:28, then a 4 bit source for
++// each state (FIQ, IRQ, run, idle); 4 is PLLP_OUT0, 8 PLLX_OUT0
++#define CCLK_STATE_RUN				(2U << 28)
++#define CCLK_ALL_FROM_PLLP			0x4444
++#define CCLK_ALL_FROM_PLLX			0x8888
++#define CCLK_SOURCE_MASK			0xffff
++#define CCLK_RUN_SOURCE(policy)		(((policy) >> 4) & 0xf)
++#define CCLK_SOURCE_PLLP			4
++#define CCLK_SOURCE_PLLX			8
++
++#define OSCILLATOR_KHZ				12000
++#define PLLP_MHZ					216
++#define PLLX_LOCK_TIMEOUT			1000	// microseconds
++#define PLLX_LOCK_DELAY				300
++
++#define TEGRA20_APB_MISC_BASE		0x70000000
++#define APB_MISC_GP_HIDREV			0x804
++#define TEGRA20_FUSE_BASE			0x7000f000
++	// the fuse registers start at 0x7000f800, past the first page
++#define FUSE_SKU_INFO				0x910
++#define FUSE_SPARE_BIT				0xa00
++
++
++struct operating_point_source {
++	uint32	mhz;
++	uint32	millivolts;
++	uint32	processMask;	// BIT(CPU process)
++	uint32	speedoMask;		// BIT(SoC speedo ID)
++};
++
++// Linux' tegra20-cpu-opp.dtsi and tegra20-cpu-opp-microvolt.dtsi: for
++// each rate, the first entry this chip matches applies
++static const operating_point_source kOperatingPoints[] = {
++	{ 216, 750, 0x0f, 0x3 },
++	{ 216, 800, 0x0f, 0x4 },
++	{ 312, 750, 0x0f, 0x3 },
++	{ 312, 800, 0x0f, 0x4 },
++	{ 456, 750, 0x0c, 0x3 },
++	{ 456, 800, 0x03, 0x6 },
++	{ 456, 825, 0x03, 0x1 },
++	{ 608, 750, 0x08, 0x3 },
++	{ 608, 800, 0x04, 0x6 },
++	{ 608, 825, 0x04, 0x1 },
++	{ 608, 850, 0x03, 0x6 },
++	{ 608, 900, 0x03, 0x1 },
++	{ 760, 775, 0x08, 0x3 },
++	{ 760, 800, 0x08, 0x4 },
++	{ 760, 850, 0x04, 0x6 },
++	{ 760, 875, 0x04, 0x1 },
++	{ 760, 900, 0x01, 0x2 },
++	{ 760, 975, 0x03, 0x1 },
++	{ 816, 800, 0x08, 0x7 },
++	{ 816, 850, 0x04, 0x2 },
++	{ 816, 875, 0x04, 0x5 },
++	{ 816, 950, 0x03, 0x6 },
++	{ 816, 1000, 0x03, 0x1 },
++	{ 912, 850, 0x08, 0x7 },
++	{ 912, 900, 0x04, 0x2 },
++	{ 912, 925, 0x04, 0x1 },
++	{ 912, 950, 0x02, 0x6 },
++	{ 912, 1000, 0x01, 0x2 },
++	{ 912, 1050, 0x03, 0x1 },
++	{ 1000, 875, 0x08, 0x7 },
++	{ 1000, 900, 0x04, 0x2 },
++	{ 1000, 950, 0x04, 0x4 },
++	{ 1000, 975, 0x04, 0x1 },
++	{ 1000, 1000, 0x02, 0x6 },
++	{ 1000, 1025, 0x01, 0x2 },
++	{ 1000, 1100, 0x03, 0x1 },
++};
++
++// The rates the AC100 firmware's 1 GHz is the highest of
++static const uint32 kRates[] = { 216, 312, 456, 608, 760, 816, 912, 1000 };
++#define RATE_COUNT		B_COUNT_OF(kRates)
++
++struct operating_point {
++	uint32	mhz;
++	uint32	millivolts;
++};
++
++
++static mutex sLock = MUTEX_INITIALIZER("tegra20 cpufreq");
++static area_id sCARArea = -1;
++static volatile uint32* sCAR;
++static operating_point sPoints[RATE_COUNT];
++static int32 sPointCount;
++static uint32 sProcess;
++static uint32 sSpeedo;
++static uint32 sTWDBaseFrequency;	// the private timer rate at sBaseKHz
++static uint32 sBaseKHz;
++static enum scheduler_mode sSchedulerMode = SCHEDULER_MODE_LOW_LATENCY;
++
++
++//	#pragma mark - fuses
++
++
++/*!	A run of spare fuse bits, the most significant first, ORed with its
++	redundant copy, as Linux reads the speedo values.
++*/
++static uint32
++read_speedo(volatile uint32* spare, int32 msb, int32 lsb, int32 redundant)
++{
++	uint32 value = 0;
++	for (int32 i = msb; i >= lsb; i--)
++		value = (value << 1) | ((spare[i] | spare[i + redundant]) & 1);
++	return value * 4;
++}
++
++
++/*!	The CPU process and the SoC speedo ID, as Linux' speedo-tegra20.c finds
++	them: they choose the voltage of each rate.
++*/
++static status_t
++read_chip_corners()
++{
++	if ((sCAR[CAR_CLK_OUT_ENB_H / 4] & CAR_CLK_ENB_FUSE) == 0)
++		return B_NOT_SUPPORTED;
++
++	void* address;
++	area_id area = map_physical_memory("tegra apb misc", TEGRA20_APB_MISC_BASE,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA, &address);
++	if (area < B_OK)
++		return area;
++	uint32 chipID = ((volatile uint32*)address)[APB_MISC_GP_HIDREV / 4];
++	delete_area(area);
++	if (((chipID >> 8) & 0xff) != 0x20)
++		return B_NOT_SUPPORTED;
++
++	area = map_physical_memory("tegra fuse", TEGRA20_FUSE_BASE, B_PAGE_SIZE,
++		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA, &address);
++	if (area < B_OK)
++		return area;
++	volatile uint32* fuse = (volatile uint32*)address;
++	uint32 sku = fuse[FUSE_SKU_INFO / 4];
++	volatile uint32* spare = fuse + FUSE_SPARE_BIT / 4;
++	uint32 cpuSpeedo = read_speedo(spare, 29, 20, 10);
++	bool a03p = (spare[18] | spare[19]) & 1;
++	delete_area(area);
++
++	// Linux' revisions: 1 = A01, 2 = A02, 3 = A03, 4 = A03p, 5 = A04
++	uint32 minor = (chipID >> 16) & 0xf;
++	uint32 revision = minor <= 2 ? minor : minor == 3 ? (a03p ? 4 : 3) : 5;
++	if (revision <= 2)
++		sSpeedo = 0;
++	else if (sku != 20 && sku != 23 && sku != 24 && sku != 27 && sku != 28)
++		sSpeedo = 1;
++	else
++		sSpeedo = 2;
++
++	static const uint32 kCPUProcessSpeedos[3][3] = {
++		{ 315, 366, 420 }, { 303, 368, 419 }, { 316, 331, 383 } };
++	sProcess = 0;
++	while (sProcess < 3 && cpuSpeedo > kCPUProcessSpeedos[sSpeedo][sProcess])
++		sProcess++;
++
++	TRACE_ALWAYS("chip revision %" B_PRIu32 ", sku %" B_PRIu32 ", speedo id %"
++		B_PRIu32 ", cpu speedo %" B_PRIu32 " (process %" B_PRIu32 ")\n",
++		revision, sku, sSpeedo, cpuSpeedo, sProcess);
++	return B_OK;
++}
++
++
++static void
++choose_operating_points()
++{
++	sPointCount = 0;
++	for (size_t i = 0; i < RATE_COUNT; i++) {
++		for (size_t j = 0; j < B_COUNT_OF(kOperatingPoints); j++) {
++			const operating_point_source& source = kOperatingPoints[j];
++			if (source.mhz != kRates[i]
++				|| (source.processMask & (1U << sProcess)) == 0
++				|| (source.speedoMask & (1U << sSpeedo)) == 0) {
++				continue;
++			}
++			sPoints[sPointCount].mhz = source.mhz;
++			sPoints[sPointCount].millivolts = source.millivolts;
++			sPointCount++;
++			break;
++		}
++	}
++}
++
++
++static const operating_point*
++find_point(uint32 mhz)
++{
++	for (int32 i = 0; i < sPointCount; i++) {
++		if (sPoints[i].mhz == mhz)
++			return &sPoints[i];
++	}
++	return NULL;
++}
++
++
++//	#pragma mark - CPU supply
++
++
++static status_t
++read_millivolts(uint8 reg, uint8 v2Bit, uint32* _millivolts)
++{
++	uint8 control, value;
++	status_t status = arm_dvc_i2c_read(TPS6586X_ADDRESS, TPS6586X_VCC1,
++		&control, 1);
++	if (status == B_OK)
++		status = arm_dvc_i2c_read(TPS6586X_ADDRESS, reg, &value, 1);
++	if (status != B_OK)
++		return status;
++	// only the V1 registers are used
++	if ((control & v2Bit) != 0)
++		return B_NOT_SUPPORTED;
++	*_millivolts = TPS6586X_DVM_MIN_MV + (value & 0x1f) * TPS6586X_DVM_STEP_MV;
++	return B_OK;
++}
++
++
++/*!	Moves the CPU supply to \a millivolts in one go: the regulator ramps at
++	its slew rate, waited for here at the slowest the TPS6586x has
++	(0.11 mV/µs). The core supply must stay 120 mV above.
++*/
++static status_t
++set_cpu_millivolts(uint32 millivolts)
++{
++	uint32 current, core;
++	status_t status = read_millivolts(TPS6586X_SM1V1, TPS6586X_VCC1_SM1_V2,
++		&current);
++	if (status == B_OK) {
++		status = read_millivolts(TPS6586X_SM0V1, TPS6586X_VCC1_SM0_V2,
++			&core);
++	}
++	if (status != B_OK)
++		return status;
++	if (current == millivolts)
++		return B_OK;
++	if (millivolts + CORE_OVER_CPU_MV > core
++		|| millivolts < TPS6586X_DVM_MIN_MV
++		|| (millivolts - TPS6586X_DVM_MIN_MV) % TPS6586X_DVM_STEP_MV != 0) {
++		TRACE_ALWAYS("cpu %" B_PRIu32 " mV refused (core %" B_PRIu32
++			" mV)\n", millivolts, core);
++		return B_NOT_ALLOWED;
++	}
++
++	uint8 value;
++	status = arm_dvc_i2c_read(TPS6586X_ADDRESS, TPS6586X_SM1V1, &value, 1);
++	if (status != B_OK)
++		return status;
++	value = (value & ~0x1f)
++		| ((millivolts - TPS6586X_DVM_MIN_MV) / TPS6586X_DVM_STEP_MV);
++	status = arm_dvc_i2c_write(TPS6586X_ADDRESS, TPS6586X_SM1V1, &value, 1);
++	if (status != B_OK)
++		return status;
++	uint8 go = TPS6586X_VCC1_SM1_GO;
++	status = arm_dvc_i2c_write(TPS6586X_ADDRESS, TPS6586X_VCC1, &go, 1);
++	if (status != B_OK)
++		return status;
++
++	uint32 difference = millivolts > current
++		? millivolts - current : current - millivolts;
++	snooze(difference * 10 + 500);
++
++	uint32 actual;
++	status = read_millivolts(TPS6586X_SM1V1, TPS6586X_VCC1_SM1_V2, &actual);
++	if (status != B_OK)
++		return status;
++	return actual == millivolts ? B_OK : B_ERROR;
++}
++
++
++//	#pragma mark - CPU clock
++
++
++static uint32
++pll_khz(uint32 base)
++{
++	if ((base & PLL_BASE_ENABLE) == 0)
++		return 0;
++	if ((base & PLL_BASE_BYPASS) != 0)
++		return OSCILLATOR_KHZ;
++	uint32 m = base & 0x1f;
++	uint32 n = (base >> PLL_BASE_DIVN_SHIFT) & 0x3ff;
++	uint32 p = (base >> PLL_BASE_DIVP_SHIFT) & 0x7;
++	if (m == 0)
++		return 0;
++	return (uint64)OSCILLATOR_KHZ * n / m >> p;
++}
++
++
++static uint32
++cpu_clock_khz()
++{
++	switch (CCLK_RUN_SOURCE(sCAR[CAR_CCLK_BURST_POLICY / 4])) {
++		case CCLK_SOURCE_PLLP:
++			return pll_khz(sCAR[CAR_PLLP_BASE / 4]);
++		case CCLK_SOURCE_PLLX:
++			return pll_khz(sCAR[CAR_PLLX_BASE / 4]);
++	}
++	return 0;
++}
++
++
++/*!	Tells the kernel the new CPU clock: the rate of the private timers (a
++	quarter of it, as measured at boot) and the frequency it reports.
++*/
++static void
++cpu_clock_changed(uint32 khz)
++{
++	tegra_twd_set_frequency((uint64)sTWDBaseFrequency * khz / sBaseKHz);
++	arm_set_cpu_frequency((uint64)khz * 1000);
++}
++
++
++static void
++set_cpu_source(uint32 sources)
++{
++	uint32 policy = sCAR[CAR_CCLK_BURST_POLICY / 4];
++	sCAR[CAR_CCLK_BURST_POLICY / 4] = (policy
++			& ~(0xfU << 28 | CCLK_SOURCE_MASK))
++		| CCLK_STATE_RUN | sources;
++	// the switch is glitch free and takes a few cycles of both clocks
++	sCAR[CAR_CCLK_BURST_POLICY / 4];
++	spin(1);
++}
++
++
++/*!	PLLX from the 12 MHz oscillator: M = 12, so N is the rate in MHz, with a
++	VCO of at least 600 MHz (P = 1 halves it below that). The charge pump and
++	the other MISC settings stay as the firmware set them for 1 GHz, which
++	suits a comparison frequency of 1 MHz and N >= 600. The CPU must not run
++	from PLLX meanwhile.
++*/
++static status_t
++program_pllx(uint32 mhz)
++{
++	uint32 p = mhz < 600 ? 1 : 0;
++	uint32 n = mhz << p;
++	uint32 base = sCAR[CAR_PLLX_BASE / 4];
++	if ((base & 0x1f) != OSCILLATOR_KHZ / 1000 || n > 1000)
++		return B_NOT_SUPPORTED;
++
++	sCAR[CAR_PLLX_MISC / 4] |= PLL_MISC_LOCK_ENABLE;
++	base &= ~(PLL_BASE_ENABLE | PLL_BASE_BYPASS | (0x7U << PLL_BASE_DIVP_SHIFT)
++		| (0x3ffU << PLL_BASE_DIVN_SHIFT));
++	base |= (p << PLL_BASE_DIVP_SHIFT) | (n << PLL_BASE_DIVN_SHIFT);
++	sCAR[CAR_PLLX_BASE / 4] = base;
++	sCAR[CAR_PLLX_BASE / 4] = base | PLL_BASE_ENABLE;
++
++	bigtime_t timeout = system_time() + PLLX_LOCK_TIMEOUT;
++	while ((sCAR[CAR_PLLX_BASE / 4] & PLL_BASE_LOCK) == 0) {
++		if (system_time() > timeout)
++			return B_TIMED_OUT;
++		spin(10);
++	}
++	// settle, as Linux waits its lock delay
++	spin(PLLX_LOCK_DELAY);
++	return B_OK;
++}
++
++
++/*!	Runs the CPU at \a mhz: from PLLP for its own rate, with PLLX off, or
++	from PLLX, reprogrammed while the CPU runs from PLLP, as Linux does.
++*/
++static status_t
++set_cpu_clock(uint32 mhz)
++{
++	if (cpu_clock_khz() == mhz * 1000)
++		return B_OK;
++
++	if (CCLK_RUN_SOURCE(sCAR[CAR_CCLK_BURST_POLICY / 4])
++			!= CCLK_SOURCE_PLLP) {
++		set_cpu_source(CCLK_ALL_FROM_PLLP);
++		cpu_clock_changed(PLLP_MHZ * 1000);
++	}
++
++	if (mhz == PLLP_MHZ) {
++		// PLLX is not needed meanwhile
++		sCAR[CAR_PLLX_BASE / 4] &= ~PLL_BASE_ENABLE;
++		return B_OK;
++	}
++
++	status_t status = program_pllx(mhz);
++	if (status != B_OK)
++		return status;
++	set_cpu_source(CCLK_ALL_FROM_PLLX);
++	cpu_clock_changed(cpu_clock_khz());
++	return B_OK;
++}
++
++
++//	#pragma mark - interface
++
++
++static status_t
++set_frequency(uint32 mhz)
++{
++	const operating_point* point = find_point(mhz);
++	if (point == NULL)
++		return B_BAD_VALUE;
++
++	MutexLocker locker(sLock);
++
++	uint32 currentMHz = cpu_clock_khz() / 1000;
++	const operating_point* current = find_point(currentMHz);
++	if (current == NULL) {
++		TRACE_ALWAYS("the CPU runs at %" B_PRIu32 " MHz, not a rate of the "
++			"table\n", currentMHz);
++		return B_ERROR;
++	}
++
++	status_t status = B_OK;
++	if (point->mhz > current->mhz) {
++		// the voltage first, then the clock
++		status = set_cpu_millivolts(point->millivolts);
++		if (status == B_OK)
++			status = set_cpu_clock(point->mhz);
++	} else {
++		status = set_cpu_clock(point->mhz);
++		if (status == B_OK)
++			status = set_cpu_millivolts(point->millivolts);
++	}
++
++	if (status != B_OK) {
++		TRACE_ALWAYS("%" B_PRIu32 " -> %" B_PRIu32 " MHz: %s\n", current->mhz,
++			point->mhz, strerror(status));
++		// whatever went wrong: a voltage that is enough for the rate the CPU
++		// is at
++		const operating_point* now = find_point(cpu_clock_khz() / 1000);
++		if (now != NULL)
++			set_cpu_millivolts(now->millivolts);
++		return status;
++	}
++
++	TRACE("%" B_PRIu32 " MHz, %" B_PRIu32 " mV\n", point->mhz,
++		point->millivolts);
++	return B_OK;
++}
++
++
++static uint32
++frequency()
++{
++	return cpu_clock_khz() / 1000;
++}
++
++
++static size_t
++describe(char* buffer, size_t size)
++{
++	MutexLocker locker(sLock);
++
++	uint32 millivolts = 0;
++	read_millivolts(TPS6586X_SM1V1, TPS6586X_VCC1_SM1_V2, &millivolts);
++
++	size_t length = snprintf(buffer, size, "cpufreq: %" B_PRIu32 " MHz, cpu %"
++		B_PRIu32 " mV, private timers %" B_PRIu32 " Hz, %s\n",
++		cpu_clock_khz() / 1000, millivolts, tegra_twd_frequency(),
++		sSchedulerMode == SCHEDULER_MODE_POWER_SAVING
++			? "power saving" : "low latency");
++	length += snprintf(buffer + min_c(length, size), size - min_c(length, size),
++		"operating points (process %" B_PRIu32 ", speedo id %" B_PRIu32 "):",
++		sProcess, sSpeedo);
++	for (int32 i = 0; i < sPointCount; i++) {
++		length += snprintf(buffer + min_c(length, size),
++			size - min_c(length, size), " %" B_PRIu32 "/%" B_PRIu32,
++			sPoints[i].mhz, sPoints[i].millivolts);
++	}
++	length += snprintf(buffer + min_c(length, size), size - min_c(length, size),
++		" MHz/mV\n");
++	return min_c(length, size);
++}
++
++
++static void
++set_scheduler_mode(enum scheduler_mode mode)
++{
++	sSchedulerMode = mode;
++}
++
++
++/*!	Called by the scheduler, with interrupts disabled: nothing may be done
++	here but noting the request. The governor comes later.
++*/
++static status_t
++increase_performance(int delta)
++{
++	return B_OK;
++}
++
++
++static status_t
++decrease_performance(int delta)
++{
++	return B_OK;
++}
++
++
++//	#pragma mark - module
++
++
++static void
++uninit()
++{
++	delete_area(sCARArea);
++	sCARArea = -1;
++	sCAR = NULL;
++}
++
++
++static status_t
++init()
++{
++	void* settings = load_driver_settings("tegra20_cpufreq");
++	bool disabled = get_driver_boolean_parameter(settings, "disabled", false,
++		true);
++	unload_driver_settings(settings);
++	if (disabled)
++		return B_NOT_SUPPORTED;
++
++	if (gFDT == NULL || fdt_node_check_compatible(gFDT, 0, "nvidia,tegra20")
++			!= 0) {
++		return B_NOT_SUPPORTED;
++	}
++	if (tegra_twd_frequency() == 0)
++		return B_NOT_SUPPORTED;
++
++	void* address;
++	sCARArea = map_physical_memory("tegra20 cpufreq car", TEGRA20_CAR_BASE,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++	if (sCARArea < B_OK)
++		return sCARArea;
++	sCAR = (volatile uint32*)address;
++
++	status_t status = read_chip_corners();
++	if (status != B_OK) {
++		uninit();
++		return status;
++	}
++	choose_operating_points();
++
++	// it must start from a known state: a rate of the table, and a CPU
++	// supply in the V1 register that the PMIC driver can reach
++	uint32 khz = cpu_clock_khz();
++	uint32 millivolts;
++	if (find_point(khz / 1000) == NULL || khz % 1000 != 0
++		|| read_millivolts(TPS6586X_SM1V1, TPS6586X_VCC1_SM1_V2, &millivolts)
++			!= B_OK) {
++		TRACE_ALWAYS("unexpected state (CPU %" B_PRIu32 " kHz), not used\n",
++			khz);
++		uninit();
++		return B_NOT_SUPPORTED;
++	}
++	sBaseKHz = khz;
++	sTWDBaseFrequency = tegra_twd_frequency();
++	arm_set_cpu_frequency((uint64)khz * 1000);
++
++	TRACE_ALWAYS("CPU at %" B_PRIu32 " MHz, %" B_PRIu32 " mV; %" B_PRId32
++		" operating points\n", khz / 1000, millivolts, sPointCount);
++	return B_OK;
++}
++
++
++static status_t
++std_ops(int32 op, ...)
++{
++	switch (op) {
++		case B_MODULE_INIT:
++			return init();
++		case B_MODULE_UNINIT:
++			uninit();
++			return B_OK;
++	}
++	return B_ERROR;
++}
++
++
++static tegra20_cpufreq_module_info sTegra20CPUFreq = {
++	{
++		{
++			TEGRA20_CPUFREQ_MODULE_NAME,
++			B_KEEP_LOADED,
++			std_ops,
++		},
++		1.0f,
++		set_scheduler_mode,
++		increase_performance,
++		decrease_performance,
++	},
++	set_frequency,
++	frequency,
++	describe,
++};
++
++
++module_info* modules[] = {
++	(module_info*)&sTegra20CPUFreq,
++	NULL
++};
+diff --git a/src/system/kernel/arch/arm/arch_cpu.cpp b/src/system/kernel/arch/arm/arch_cpu.cpp
+index 013986262b..04eaba4c94 100644
+--- a/src/system/kernel/arch/arm/arch_cpu.cpp
++++ b/src/system/kernel/arch/arm/arch_cpu.cpp
+@@ -100,6 +100,8 @@ static bool sRebootResets = true;
+ // set by the driver that can switch the machine off, like the embedded
+ // controller of the Toshiba AC100
+ extern "C" {
++extern "C" void arm_tegra_prepare_reset(void);
++
+ void (*gArmPowerOffHook)(void) = NULL;
+ }
+ 
+@@ -147,6 +149,7 @@ arch_cpu_shutdown(bool reboot)
+ 	}
+ 
+ 	if (reboot && sTegraPMC != NULL) {
++		arm_tegra_prepare_reset();
+ 		disable_interrupts();
+ 		sTegraPMC[TEGRA_PMC_CNTRL / 4] |= TEGRA_PMC_CNTRL_MAIN_RST;
+ 		spin(100000);
+diff --git a/src/system/kernel/arch/arm/arch_real_time_clock.cpp b/src/system/kernel/arch/arm/arch_real_time_clock.cpp
+index 89a08a7f53..0d0a9ef466 100644
+--- a/src/system/kernel/arch/arm/arch_real_time_clock.cpp
++++ b/src/system/kernel/arch/arm/arch_real_time_clock.cpp
+@@ -526,6 +526,19 @@ arch_rtc_init(kernel_args *args, struct real_time_data *data)
+ }
+ 
+ 
++/*!	Before the chip is reset: the boot firmware runs the CPU at full speed
++	again, which a lowered CPU supply (a cpufreq module) may not carry, and a
++	reset of the chip leaves the power management IC as it is. Raises the
++	supplies to their nominal voltages, as Linux does before a restart.
++*/
++extern "C" void
++arm_tegra_prepare_reset(void)
++{
++	if (sDVC != NULL && sTPS6586xRead)
++		tps6586x_set_nominal_voltages();
++}
++
++
+ uint64
+ arch_rtc_get_hw_time(void)
+ {
+diff --git a/src/system/kernel/arch/arm/arch_system_info.cpp b/src/system/kernel/arch/arm/arch_system_info.cpp
+index cb060f6246..96f413c446 100644
+--- a/src/system/kernel/arch/arm/arch_system_info.cpp
++++ b/src/system/kernel/arch/arm/arch_system_info.cpp
+@@ -63,6 +63,16 @@ measure_cpu_frequency()
+ }
+ 
+ 
++/*!	For the drivers that change the CPU clock: the frequency to report from
++	now on, instead of the one measured once.
++*/
++extern "C" void
++arm_set_cpu_frequency(uint64 frequency)
++{
++	sCPUFrequency = frequency;
++}
++
++
+ static uint64
+ cpu_frequency()
+ {
+-- 
+2.39.5
+

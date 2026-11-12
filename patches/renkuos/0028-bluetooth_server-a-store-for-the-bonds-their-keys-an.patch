@@ -1,0 +1,1804 @@
+From ed529cc2cefc16f6274bda12b2ffc5cd79ddeda8 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 10 Nov 2026 07:52:56 +0100
+Subject: [PATCH 28/42] bluetooth_server: a store for the bonds, their keys and
+ the known devices
+
+The paired devices were kept in one file of the user's settings, written
+whole from the list of the devices the server met: the link keys with
+the names, classes and services, readable by everyone, for whatever
+adapter, and devices that never paired with them. The rules on when a
+pairing is kept and when a key is forgotten were spread over the server.
+
+BondStore keeps the bonds of one adapter and applies the rules of the
+specification in one place: a key is kept when both sides of a simple
+pairing asked for a bond (Dedicated or General Bonding), and for legacy
+pairings; a debug key, or a pairing without a bond, serves the connection
+only; a changed combination key keeps the kind it replaces; a key is
+forgotten on "PIN or Key Missing", and on "Authentication Failure" only
+on a link the device opened. It tells a listener of its changes, outside
+its lock, and gives out copies only.
+
+The keys are not in it but in a KeyVault, which the store only asks.
+FileKeyVault keeps them in a file of their own, which only the owner may
+read; the key store of the system can be another vault once it encrypts
+what it keeps. DeviceCache keeps what is known of the devices, paired or
+not, and lets those that are not go after a while.
+
+Each adapter has a folder of its own, named after its address, with the
+files "bonds", "devices" and "keys". They are written aside and put in
+place; one that cannot be read is put aside as "<name>.broken", and a key
+is never thrown away on reading. Fields a later version adds are kept.
+
+Not used by the server yet.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/servers/bluetooth/BondStore.cpp    | 629 +++++++++++++++++++++++++
+ src/servers/bluetooth/BondStore.h      | 187 ++++++++
+ src/servers/bluetooth/DeviceCache.cpp  | 342 ++++++++++++++
+ src/servers/bluetooth/DeviceCache.h    |  91 ++++
+ src/servers/bluetooth/Jamfile          |   4 +
+ src/servers/bluetooth/KeyVault.cpp     | 209 ++++++++
+ src/servers/bluetooth/KeyVault.h       |  86 ++++
+ src/servers/bluetooth/SettingsFile.cpp |  86 ++++
+ src/servers/bluetooth/SettingsFile.h   |  41 ++
+ 9 files changed, 1675 insertions(+)
+ create mode 100644 src/servers/bluetooth/BondStore.cpp
+ create mode 100644 src/servers/bluetooth/BondStore.h
+ create mode 100644 src/servers/bluetooth/DeviceCache.cpp
+ create mode 100644 src/servers/bluetooth/DeviceCache.h
+ create mode 100644 src/servers/bluetooth/KeyVault.cpp
+ create mode 100644 src/servers/bluetooth/KeyVault.h
+ create mode 100644 src/servers/bluetooth/SettingsFile.cpp
+ create mode 100644 src/servers/bluetooth/SettingsFile.h
+
+diff --git a/src/servers/bluetooth/BondStore.cpp b/src/servers/bluetooth/BondStore.cpp
+new file mode 100644
+index 0000000000..f9283a993d
+--- /dev/null
++++ b/src/servers/bluetooth/BondStore.cpp
+@@ -0,0 +1,629 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "BondStore.h"
++
++#include <new>
++#include <string.h>
++#include <syslog.h>
++#include <time.h>
++
++#include <Autolock.h>
++
++#include <bluetooth/bdaddrUtils.h>
++#include <bluetooth/bluetooth_error.h>
++#include <bluetooth/HCI/btHCI_event.h>
++
++#include "KeyVault.h"
++#include "SettingsFile.h"
++
++
++static const uint32 kMsgBonds = 'btBd';
++static const int32 kBondsVersion = 1;
++
++
++struct BondStore::Bond {
++			BondRecord			record;
++			BMessage			archive;
++				// as it was read: what a later version added stays
++};
++
++
++struct BondStore::TemporaryKey {
++			bdaddr_t			address;
++			linkkey_t			key;
++			uint8				keyType;
++};
++
++
++static int64
++now()
++{
++	return (int64)time(NULL);
++}
++
++
++static BString
++address_string(const bdaddr_t& address)
++{
++	return bdaddrUtils::ToString(address);
++}
++
++
++//	#pragma mark - BondRecord, PairingContext
++
++
++BondRecord::BondRecord()
++	:
++	address(bdaddrUtils::NullAddress()),
++	keyType(kLinkKeyUnknown),
++	encryptionKeySize(0),
++	pairedByUs(false),
++	created(0),
++	lastUsed(0)
++{
++}
++
++
++bool
++BondRecord::IsAuthenticated() const
++{
++	return keyType == kLinkKeyAuthenticatedP192
++		|| keyType == kLinkKeyAuthenticatedP256;
++}
++
++
++bool
++BondRecord::IsSecureConnections() const
++{
++	return keyType == kLinkKeyUnauthenticatedP256
++		|| keyType == kLinkKeyAuthenticatedP256;
++}
++
++
++PairingContext::PairingContext()
++	:
++	simplePairing(false),
++	localAuthentication(kAuthenticationUnknown),
++	remoteAuthentication(kAuthenticationUnknown),
++	pairedByUs(false)
++{
++}
++
++
++//	#pragma mark - BondStore
++
++
++BondStore::Listener::~Listener()
++{
++}
++
++
++BondStore::BondStore(const BPath& directory, const bdaddr_t& adapter,
++	KeyVault* vault)
++	:
++	fLock("bluetooth bonds"),
++	fAdapter(adapter),
++	fVault(vault),
++	fListener(NULL),
++	fBonds(10),
++	fTemporaryKeys(4),
++	fDirty(false)
++{
++	BPath adapterDirectory;
++	if (SettingsFile::AdapterDirectory(directory, adapter, adapterDirectory)
++			== B_OK) {
++		fPath.SetTo(adapterDirectory.Path(), "bonds");
++	}
++}
++
++
++BondStore::~BondStore()
++{
++	Flush();
++}
++
++
++/*!	Reads the bonds. A bond whose key the vault does not have is dropped;
++	a key the vault has for a device with no bond becomes a bond of an
++	unknown kind: a key is never thrown away on reading, as the file of the
++	bonds may have been put aside as broken.
++*/
++status_t
++BondStore::Load()
++{
++	BAutolock locker(fLock);
++	if (fPath.InitCheck() != B_OK)
++		return fPath.InitCheck();
++
++	fBonds.MakeEmpty();
++	BMessage file;
++	status_t status = SettingsFile::Read(fPath, file);
++	if (status != B_OK && status != B_ENTRY_NOT_FOUND
++		&& status != B_BAD_DATA) {
++		return status;
++	}
++
++	BMessage archive;
++	for (int32 i = 0; file.FindMessage("bond", i, &archive) == B_OK; i++) {
++		const void* address;
++		ssize_t size;
++		if (archive.FindData("address", B_RAW_TYPE, &address, &size) != B_OK
++			|| size != sizeof(bdaddr_t)
++			|| _FindBond(*(const bdaddr_t*)address) != NULL) {
++			continue;
++		}
++
++		Bond* bond = new(std::nothrow) Bond;
++		if (bond == NULL)
++			return B_NO_MEMORY;
++		BondRecord& record = bond->record;
++		record.address = *(const bdaddr_t*)address;
++		record.keyType = archive.GetUInt8("key type", kLinkKeyUnknown);
++		record.encryptionKeySize
++			= archive.GetUInt8("encryption key size", 0);
++		record.pairedByUs = archive.GetBool("paired by us", false);
++		record.created = archive.GetInt64("created", 0);
++		record.lastUsed = archive.GetInt64("last used", 0);
++		bond->archive = archive;
++
++		linkkey_t key;
++		if (fVault->Get(fAdapter, record.address, key) != B_OK) {
++			syslog(LOG_WARNING, "bluetooth_server: the key of %s is "
++				"missing, the bond is dropped\n",
++				address_string(record.address).String());
++			delete bond;
++			fDirty = true;
++			continue;
++		}
++		fBonds.AddItem(bond);
++	}
++
++	BMessage remotes;
++	fVault->GetRemotes(fAdapter, remotes);
++	const void* address;
++	ssize_t size;
++	for (int32 i = 0; remotes.FindData("address", B_RAW_TYPE, i, &address,
++			&size) == B_OK; i++) {
++		if (size != sizeof(bdaddr_t)
++			|| _FindBond(*(const bdaddr_t*)address) != NULL) {
++			continue;
++		}
++		Bond* bond = new(std::nothrow) Bond;
++		if (bond == NULL)
++			return B_NO_MEMORY;
++		bond->record.address = *(const bdaddr_t*)address;
++		syslog(LOG_NOTICE, "bluetooth_server: a key is kept for %s without "
++			"a bond, the bond is made again\n",
++			address_string(bond->record.address).String());
++		fBonds.AddItem(bond);
++		fDirty = true;
++	}
++
++	if (fDirty)
++		_Save();
++	return B_OK;
++}
++
++
++status_t
++BondStore::Flush()
++{
++	BAutolock locker(fLock);
++	return fDirty ? _Save() : B_OK;
++}
++
++
++void
++BondStore::SetListener(Listener* listener)
++{
++	BAutolock locker(fLock);
++	fListener = listener;
++}
++
++
++/*!	The key for a Link Key Request: that of the connection when it is not
++	kept, else that of the bond.
++*/
++status_t
++BondStore::KeyForRequest(const bdaddr_t& remote, linkkey_t& _key)
++{
++	BAutolock locker(fLock);
++	TemporaryKey* temporary = _FindTemporary(remote);
++	if (temporary != NULL) {
++		_key = temporary->key;
++		return B_OK;
++	}
++	if (_FindBond(remote) == NULL)
++		return B_ENTRY_NOT_FOUND;
++	return fVault->Get(fAdapter, remote, _key);
++}
++
++
++/*!	A Link Key Notification. The key is kept as a bond unless it is a debug
++	key, or a simple pairing where one side asked for no bond: then it
++	serves the connection only, and a bond kept before goes, as its key is
++	no longer the device's. A changed combination key replaces the key of
++	the bond or of the connection, and keeps the kind it replaces.
++*/
++BondStore::PairingResult
++BondStore::PairingFinished(const bdaddr_t& remote, const linkkey_t& key,
++	uint8 keyType, const PairingContext& context)
++{
++	int32 change = -1;
++	PairingResult result = kTemporary;
++	{
++		BAutolock locker(fLock);
++		Bond* bond = _FindBond(remote);
++		TemporaryKey* temporary = _FindTemporary(remote);
++
++		bool keep;
++		bool changedKey = keyType == kLinkKeyChangedCombination
++			&& (bond != NULL || temporary != NULL);
++		if (changedKey) {
++			// the key of a bond stays that of a bond, the key of the
++			// connection that of the connection
++			keep = temporary == NULL;
++			keyType = keep ? bond->record.keyType : temporary->keyType;
++		} else {
++			if (keyType == kLinkKeyChangedCombination)
++				keyType = kLinkKeyCombination;
++			keep = keyType != kLinkKeyDebugCombination
++				&& (!context.simplePairing
++					|| (_AsksForBond(context.localAuthentication)
++						&& _AsksForBond(context.remoteAuthentication)));
++		}
++
++		bool pairedByUs = changedKey && keep
++			? bond->record.pairedByUs : context.pairedByUs;
++
++		if (keep && _KeepBond(remote, key, keyType, pairedByUs, change)
++				== B_OK) {
++			if (temporary != NULL)
++				fTemporaryKeys.RemoveItem(temporary, true);
++			result = kBonded;
++		} else {
++			if (bond != NULL) {
++				// the device has another key now, which is not kept
++				fVault->Remove(fAdapter, remote);
++				fBonds.RemoveItem(bond, true);
++				_Save();
++				change = kBondRemoved;
++			}
++			if (temporary == NULL) {
++				temporary = new(std::nothrow) TemporaryKey;
++				if (temporary != NULL && !fTemporaryKeys.AddItem(temporary)) {
++					delete temporary;
++					temporary = NULL;
++				}
++			}
++			if (temporary != NULL) {
++				temporary->address = remote;
++				temporary->key = key;
++				temporary->keyType = keyType;
++			}
++			syslog(LOG_INFO, "bluetooth_server: the key of %s serves this "
++				"connection only\n", address_string(remote).String());
++		}
++	}
++
++	if (change >= 0)
++		_Notify(remote, change);
++	return result;
++}
++
++
++/*!	An authentication failed, or a link went away for it. "PIN or Key
++	Missing" says the device no longer has the key. "Authentication
++	Failure" says so only on a link the device opened itself; on a link we
++	opened, it is also how a device refuses to be called (a Google Home
++	does), and the key is good.
++*/
++bool
++BondStore::AuthenticationFailed(const bdaddr_t& remote, uint8 status,
++	bool remoteOpened)
++{
++	bool forget = status == BT_PIN_OR_KEY_MISSING
++		|| (status == BT_AUTHENTICATION_FAILURE && remoteOpened);
++
++	bool hadBond;
++	{
++		BAutolock locker(fLock);
++		hadBond = _FindBond(remote) != NULL;
++		if (!forget) {
++			if (hadBond && status == BT_AUTHENTICATION_FAILURE) {
++				syslog(LOG_NOTICE, "bluetooth_server: %s refused our call, "
++					"its key is kept\n", address_string(remote).String());
++			}
++			return false;
++		}
++		if (!_Forget(remote))
++			return false;
++		syslog(LOG_NOTICE, "bluetooth_server: %s refused its key (%#x), it "
++			"pairs again next time\n", address_string(remote).String(),
++			status);
++	}
++
++	if (hadBond)
++		_Notify(remote, kBondRemoved);
++	return true;
++}
++
++
++void
++BondStore::ConnectionClosed(const bdaddr_t& remote)
++{
++	BAutolock locker(fLock);
++	TemporaryKey* temporary = _FindTemporary(remote);
++	if (temporary != NULL)
++		fTemporaryKeys.RemoveItem(temporary, true);
++}
++
++
++void
++BondStore::SetEncryptionKeySize(const bdaddr_t& remote, uint8 size)
++{
++	BAutolock locker(fLock);
++	Bond* bond = _FindBond(remote);
++	if (bond != NULL && bond->record.encryptionKeySize != size) {
++		bond->record.encryptionKeySize = size;
++		fDirty = true;
++	}
++}
++
++
++void
++BondStore::Used(const bdaddr_t& remote)
++{
++	BAutolock locker(fLock);
++	Bond* bond = _FindBond(remote);
++	if (bond != NULL) {
++		bond->record.lastUsed = now();
++		fDirty = true;
++	}
++}
++
++
++bool
++BondStore::IsBonded(const bdaddr_t& remote) const
++{
++	BAutolock locker(fLock);
++	return _FindBond(remote) != NULL;
++}
++
++
++bool
++BondStore::GetBond(const bdaddr_t& remote, BondRecord& _bond) const
++{
++	BAutolock locker(fLock);
++	Bond* bond = _FindBond(remote);
++	if (bond == NULL)
++		return false;
++	_bond = bond->record;
++	return true;
++}
++
++
++BondStore::Security
++BondStore::SecurityOf(const bdaddr_t& remote) const
++{
++	BAutolock locker(fLock);
++	TemporaryKey* temporary = _FindTemporary(remote);
++	if (temporary != NULL)
++		return _SecurityOf(temporary->keyType);
++	Bond* bond = _FindBond(remote);
++	return bond != NULL ? _SecurityOf(bond->record.keyType) : kSecurityNone;
++}
++
++
++/*!	The user removed the device: its bond and its key go. */
++status_t
++BondStore::Remove(const bdaddr_t& remote)
++{
++	{
++		BAutolock locker(fLock);
++		if (_FindBond(remote) == NULL && _FindTemporary(remote) == NULL)
++			return B_ENTRY_NOT_FOUND;
++		_Forget(remote);
++	}
++	_Notify(remote, kBondRemoved);
++	return B_OK;
++}
++
++
++void
++BondStore::Describe(BMessage& bonds) const
++{
++	BAutolock locker(fLock);
++	for (int32 i = 0; i < fBonds.CountItems(); i++) {
++		const BondRecord& record = fBonds.ItemAt(i)->record;
++		BMessage bond;
++		bond.AddData("address", B_RAW_TYPE, &record.address,
++			sizeof(bdaddr_t));
++		bond.AddUInt8("key type", record.keyType);
++		bond.AddBool("authenticated", record.IsAuthenticated());
++		bond.AddBool("secure connections", record.IsSecureConnections());
++		bond.AddUInt8("encryption key size", record.encryptionKeySize);
++		bond.AddBool("paired by us", record.pairedByUs);
++		bond.AddInt64("created", record.created);
++		bond.AddInt64("last used", record.lastUsed);
++		bonds.AddMessage("bond", &bond);
++	}
++}
++
++
++status_t
++BondStore::Import(const bdaddr_t& remote, const linkkey_t& key,
++	uint8 keyType)
++{
++	int32 change = -1;
++	status_t status;
++	{
++		BAutolock locker(fLock);
++		status = _KeepBond(remote, key, keyType, false, change);
++	}
++	if (change >= 0)
++		_Notify(remote, change);
++	return status;
++}
++
++
++BondStore::Bond*
++BondStore::_FindBond(const bdaddr_t& remote) const
++{
++	for (int32 i = 0; i < fBonds.CountItems(); i++) {
++		Bond* bond = fBonds.ItemAt(i);
++		if (bdaddrUtils::Compare(bond->record.address, remote))
++			return bond;
++	}
++	return NULL;
++}
++
++
++BondStore::TemporaryKey*
++BondStore::_FindTemporary(const bdaddr_t& remote) const
++{
++	for (int32 i = 0; i < fTemporaryKeys.CountItems(); i++) {
++		TemporaryKey* temporary = fTemporaryKeys.ItemAt(i);
++		if (bdaddrUtils::Compare(temporary->address, remote))
++			return temporary;
++	}
++	return NULL;
++}
++
++
++/*!	Drops the bond and the key of \a remote. The lock is held. */
++bool
++BondStore::_Forget(const bdaddr_t& remote)
++{
++	bool forgotten = false;
++	TemporaryKey* temporary = _FindTemporary(remote);
++	if (temporary != NULL) {
++		fTemporaryKeys.RemoveItem(temporary, true);
++		forgotten = true;
++	}
++	Bond* bond = _FindBond(remote);
++	if (bond != NULL) {
++		fVault->Remove(fAdapter, remote);
++		fBonds.RemoveItem(bond, true);
++		_Save();
++		forgotten = true;
++	}
++	return forgotten;
++}
++
++
++/*!	Keeps \a key in the vault and the bond with it, and writes the bonds.
++	The lock is held.
++*/
++status_t
++BondStore::_KeepBond(const bdaddr_t& remote, const linkkey_t& key,
++	uint8 keyType, bool pairedByUs, int32& _change)
++{
++	status_t status = fVault->Put(fAdapter, remote, key);
++	if (status != B_OK) {
++		syslog(LOG_ERR, "bluetooth_server: the key of %s could not be kept: "
++			"%s\n", address_string(remote).String(), strerror(status));
++		return status;
++	}
++
++	Bond* bond = _FindBond(remote);
++	if (bond == NULL) {
++		bond = new(std::nothrow) Bond;
++		if (bond == NULL || !fBonds.AddItem(bond)) {
++			delete bond;
++			fVault->Remove(fAdapter, remote);
++			return B_NO_MEMORY;
++		}
++		bond->record.address = remote;
++		bond->record.created = now();
++		_change = kBondAdded;
++	} else
++		_change = kBondChanged;
++
++	BondRecord& record = bond->record;
++	if (record.keyType != keyType)
++		record.encryptionKeySize = 0;
++	record.keyType = keyType;
++	record.pairedByUs = pairedByUs;
++	record.lastUsed = now();
++	return _Save();
++}
++
++
++/*!	Writes the bonds, without their keys. The lock is held. */
++status_t
++BondStore::_Save()
++{
++	BMessage file(kMsgBonds);
++	file.AddInt32("version", kBondsVersion);
++	for (int32 i = 0; i < fBonds.CountItems(); i++) {
++		Bond* bond = fBonds.ItemAt(i);
++		const BondRecord& record = bond->record;
++		BMessage& archive = bond->archive;
++		archive.RemoveName("address");
++		archive.RemoveName("key type");
++		archive.RemoveName("encryption key size");
++		archive.RemoveName("paired by us");
++		archive.RemoveName("created");
++		archive.RemoveName("last used");
++		archive.AddData("address", B_RAW_TYPE, &record.address,
++			sizeof(bdaddr_t));
++		archive.AddUInt8("key type", record.keyType);
++		archive.AddUInt8("encryption key size", record.encryptionKeySize);
++		archive.AddBool("paired by us", record.pairedByUs);
++		archive.AddInt64("created", record.created);
++		archive.AddInt64("last used", record.lastUsed);
++		file.AddMessage("bond", &archive);
++	}
++
++	status_t status = SettingsFile::Write(fPath, file,
++		S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
++	if (status == B_OK)
++		fDirty = false;
++	return status;
++}
++
++
++void
++BondStore::_Notify(const bdaddr_t& remote, int32 change)
++{
++	Listener* listener;
++	{
++		BAutolock locker(fLock);
++		listener = fListener;
++	}
++	if (listener != NULL)
++		listener->BondChanged(fAdapter, remote, change);
++}
++
++
++/*!	Whether the Authentication Requirements of a side ask for a bond
++	(Dedicated or General Bonding). Unknown requirements count as asking:
++	a legacy pairing has none, and is kept.
++*/
++/*static*/ bool
++BondStore::_AsksForBond(uint8 authentication)
++{
++	if (authentication == kAuthenticationUnknown)
++		return true;
++	return authentication >= HCI_AUTH_REQ_NO_MITM_DEDICATED_BOND
++		&& authentication <= HCI_AUTH_REQ_MITM_GENERAL_BOND;
++}
++
++
++/*static*/ BondStore::Security
++BondStore::_SecurityOf(uint8 keyType)
++{
++	switch (keyType) {
++		case kLinkKeyAuthenticatedP256:
++			return kSecurityAuthenticatedSecure;
++		case kLinkKeyAuthenticatedP192:
++			return kSecurityAuthenticated;
++		default:
++			return kSecurityUnauthenticated;
++	}
++}
+diff --git a/src/servers/bluetooth/BondStore.h b/src/servers/bluetooth/BondStore.h
+new file mode 100644
+index 0000000000..a44a7e5887
+--- /dev/null
++++ b/src/servers/bluetooth/BondStore.h
+@@ -0,0 +1,187 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef _BLUETOOTH_BOND_STORE_H_
++#define _BLUETOOTH_BOND_STORE_H_
++
++
++#include <Locker.h>
++#include <Message.h>
++#include <ObjectList.h>
++#include <Path.h>
++
++#include <bluetooth/bluetooth.h>
++
++
++class KeyVault;
++
++
++// The kinds of link key, as the Link Key Notification event tells them
++enum {
++	kLinkKeyCombination				= 0x00,
++	kLinkKeyLocalUnit				= 0x01,
++	kLinkKeyRemoteUnit				= 0x02,
++	kLinkKeyDebugCombination		= 0x03,
++	kLinkKeyUnauthenticatedP192		= 0x04,
++	kLinkKeyAuthenticatedP192		= 0x05,
++	kLinkKeyChangedCombination		= 0x06,
++	kLinkKeyUnauthenticatedP256		= 0x07,
++	kLinkKeyAuthenticatedP256		= 0x08,
++	kLinkKeyUnknown					= 0xff
++		// kept by a version that did not keep the kind
++};
++
++
++/*!	What is kept of a pairing that lasts (a bond): everything but the key,
++	which is in the KeyVault.
++*/
++struct BondRecord {
++								BondRecord();
++
++			bool				IsAuthenticated() const;
++				// the key protects from a man in the middle
++			bool				IsSecureConnections() const;
++				// the key comes from a P-256 pairing
++
++			bdaddr_t			address;
++			uint8				keyType;
++			uint8				encryptionKeySize;
++				// as Read Encryption Key Size gave it; 0 if not read
++			bool				pairedByUs;
++			int64				created;
++			int64				lastUsed;
++				// seconds since the epoch
++};
++
++
++/*!	How a pairing went, as the server saw it: for Secure Simple Pairing,
++	whether both sides asked for a bond in their IO Capability exchange.
++*/
++struct PairingContext {
++								PairingContext();
++
++			bool				simplePairing;
++			uint8				localAuthentication;
++			uint8				remoteAuthentication;
++				// the Authentication Requirements each side gave;
++				// kAuthenticationUnknown if not known
++			bool				pairedByUs;
++};
++
++static const uint8 kAuthenticationUnknown = 0xff;
++
++
++/*!	The bonds of one adapter (controller) with the remote devices, and the
++	rules of the specification on when a pairing is kept and when a key is
++	forgotten, all in one place.
++
++	One store serves an adapter address for as long as the server runs:
++	when a controller comes back on the bus (a new LocalDeviceImpl for the
++	same address), it takes the same store again, so that two never write
++	the same files. It is made once the address of the controller is known
++	(Read BD_ADDR), as everything in it belongs to that address.
++
++	All of it may be used from any thread: what it gives out are copies.
++	The listener is told of changes after the store let go of its lock.
++*/
++class BondStore {
++public:
++			enum PairingResult {
++				kBonded,
++					// kept, also after a restart
++				kTemporary
++					// for the connection only: no bond was asked for, or a
++					// debug key; forgotten at ConnectionClosed()
++			};
++
++			enum Security {
++				kSecurityNone,
++				kSecurityUnauthenticated,
++				kSecurityAuthenticated,
++				kSecurityAuthenticatedSecure
++			};
++
++			enum Change {
++				kBondAdded,
++				kBondChanged,
++				kBondRemoved
++			};
++
++			class Listener {
++			public:
++				virtual					~Listener();
++				virtual	void			BondChanged(const bdaddr_t& adapter,
++											const bdaddr_t& remote,
++											int32 change) = 0;
++			};
++
++								BondStore(const BPath& directory,
++									const bdaddr_t& adapter,
++									KeyVault* vault);
++								~BondStore();
++
++			status_t			Load();
++			status_t			Flush();
++				// writes what changed without hurry (last use, key size)
++
++			const bdaddr_t&		Adapter() const { return fAdapter; }
++			void				SetListener(Listener* listener);
++
++			// the events of the controller
++			status_t			KeyForRequest(const bdaddr_t& remote,
++									linkkey_t& _key);
++			PairingResult		PairingFinished(const bdaddr_t& remote,
++									const linkkey_t& key, uint8 keyType,
++									const PairingContext& context);
++			bool				AuthenticationFailed(const bdaddr_t& remote,
++									uint8 status, bool remoteOpened);
++				// true if the key was forgotten
++			void				ConnectionClosed(const bdaddr_t& remote);
++			void				SetEncryptionKeySize(const bdaddr_t& remote,
++									uint8 size);
++			void				Used(const bdaddr_t& remote);
++
++			// what the clients ask, through the server
++			bool				IsBonded(const bdaddr_t& remote) const;
++			bool				GetBond(const bdaddr_t& remote,
++									BondRecord& _bond) const;
++			Security			SecurityOf(const bdaddr_t& remote) const;
++			status_t			Remove(const bdaddr_t& remote);
++			void				Describe(BMessage& bonds) const;
++				// a "bond" message for each, never with the key
++
++			// a bond kept by a version before this store
++			status_t			Import(const bdaddr_t& remote,
++									const linkkey_t& key, uint8 keyType);
++
++private:
++			struct Bond;
++			struct TemporaryKey;
++
++			Bond*				_FindBond(const bdaddr_t& remote) const;
++			TemporaryKey*		_FindTemporary(const bdaddr_t& remote) const;
++			bool				_Forget(const bdaddr_t& remote);
++			status_t			_KeepBond(const bdaddr_t& remote,
++									const linkkey_t& key, uint8 keyType,
++									bool pairedByUs, int32& _change);
++			status_t			_Save();
++			void				_Notify(const bdaddr_t& remote,
++									int32 change);
++
++	static	bool				_AsksForBond(uint8 authentication);
++	static	Security			_SecurityOf(uint8 keyType);
++
++private:
++	mutable	BLocker				fLock;
++			BPath				fPath;
++			bdaddr_t			fAdapter;
++			KeyVault*			fVault;
++			Listener*			fListener;
++			BObjectList<Bond, true> fBonds;
++			BObjectList<TemporaryKey, true> fTemporaryKeys;
++			bool				fDirty;
++};
++
++
++#endif	// _BLUETOOTH_BOND_STORE_H_
+diff --git a/src/servers/bluetooth/DeviceCache.cpp b/src/servers/bluetooth/DeviceCache.cpp
+new file mode 100644
+index 0000000000..ded65a357a
+--- /dev/null
++++ b/src/servers/bluetooth/DeviceCache.cpp
+@@ -0,0 +1,342 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "DeviceCache.h"
++
++#include <new>
++#include <string.h>
++#include <time.h>
++
++#include <Autolock.h>
++
++#include <bluetooth/bdaddrUtils.h>
++
++#include "BondStore.h"
++#include "SettingsFile.h"
++
++
++static const uint32 kMsgDevices = 'btDv';
++static const int32 kDevicesVersion = 1;
++
++
++struct DeviceCache::Entry {
++			DeviceRecord		record;
++			BMessage			archive;
++				// as it was read: what a later version added stays
++};
++
++
++//	#pragma mark - DeviceRecord
++
++
++DeviceRecord::DeviceRecord()
++	:
++	address(bdaddrUtils::NullAddress()),
++	clockOffset(0),
++	pageScanRepetitionMode(0),
++	serviceClassCount(0),
++	lastSeen(0)
++{
++	memset(deviceClass, 0, sizeof(deviceClass));
++	memset(serviceClasses, 0, sizeof(serviceClasses));
++}
++
++
++bool
++DeviceRecord::HasServiceClass(uint16 serviceClass) const
++{
++	for (uint8 i = 0; i < serviceClassCount; i++) {
++		if (serviceClasses[i] == serviceClass)
++			return true;
++	}
++	return false;
++}
++
++
++//	#pragma mark - DeviceCache
++
++
++DeviceCache::DeviceCache(const BPath& directory, const bdaddr_t& adapter)
++	:
++	fLock("bluetooth devices"),
++	fEntries(20),
++	fDirty(false)
++{
++	BPath adapterDirectory;
++	if (SettingsFile::AdapterDirectory(directory, adapter, adapterDirectory)
++			== B_OK) {
++		fPath.SetTo(adapterDirectory.Path(), "devices");
++	}
++}
++
++
++DeviceCache::~DeviceCache()
++{
++	Flush();
++}
++
++
++status_t
++DeviceCache::Load()
++{
++	BAutolock locker(fLock);
++	if (fPath.InitCheck() != B_OK)
++		return fPath.InitCheck();
++
++	fEntries.MakeEmpty();
++	BMessage file;
++	status_t status = SettingsFile::Read(fPath, file);
++	if (status == B_ENTRY_NOT_FOUND || status == B_BAD_DATA)
++		return B_OK;
++	if (status != B_OK)
++		return status;
++
++	BMessage archive;
++	for (int32 i = 0; file.FindMessage("device", i, &archive) == B_OK;
++			i++) {
++		const void* data;
++		ssize_t size;
++		if (archive.FindData("address", B_RAW_TYPE, &data, &size) != B_OK
++			|| size != sizeof(bdaddr_t)
++			|| _Find(*(const bdaddr_t*)data) != NULL) {
++			continue;
++		}
++
++		Entry* entry = new(std::nothrow) Entry;
++		if (entry == NULL || !fEntries.AddItem(entry)) {
++			delete entry;
++			return B_NO_MEMORY;
++		}
++		DeviceRecord& record = entry->record;
++		record.address = *(const bdaddr_t*)data;
++		record.name = archive.GetString("name", "");
++		if (archive.FindData("class", B_RAW_TYPE, &data, &size) == B_OK
++			&& size == sizeof(record.deviceClass)) {
++			memcpy(record.deviceClass, data, size);
++		}
++		record.clockOffset = archive.GetUInt16("clock offset", 0);
++		record.pageScanRepetitionMode
++			= archive.GetUInt8("page scan repetition mode", 0);
++		uint16 serviceClass;
++		while (record.serviceClassCount < B_COUNT_OF(record.serviceClasses)
++			&& archive.FindUInt16("service class", record.serviceClassCount,
++				&serviceClass) == B_OK) {
++			record.serviceClasses[record.serviceClassCount++] = serviceClass;
++		}
++		record.lastSeen = archive.GetInt64("last seen", 0);
++		entry->archive = archive;
++	}
++	return B_OK;
++}
++
++
++status_t
++DeviceCache::Flush()
++{
++	BAutolock locker(fLock);
++	return fDirty ? _Save() : B_OK;
++}
++
++
++bool
++DeviceCache::Get(const bdaddr_t& remote, DeviceRecord& _record) const
++{
++	BAutolock locker(fLock);
++	Entry* entry = _Find(remote);
++	if (entry == NULL)
++		return false;
++	_record = entry->record;
++	return true;
++}
++
++
++int32
++DeviceCache::CountRecords() const
++{
++	BAutolock locker(fLock);
++	return fEntries.CountItems();
++}
++
++
++bool
++DeviceCache::RecordAt(int32 index, DeviceRecord& _record) const
++{
++	BAutolock locker(fLock);
++	Entry* entry = fEntries.ItemAt(index);
++	if (entry == NULL)
++		return false;
++	_record = entry->record;
++	return true;
++}
++
++
++void
++DeviceCache::Update(const DeviceRecord& record)
++{
++	BAutolock locker(fLock);
++	Entry* entry = _FindOrAdd(record.address);
++	if (entry == NULL)
++		return;
++	entry->record = record;
++	entry->record.lastSeen = (int64)time(NULL);
++	fDirty = true;
++}
++
++
++void
++DeviceCache::SetName(const bdaddr_t& remote, const char* name)
++{
++	BAutolock locker(fLock);
++	Entry* entry = _FindOrAdd(remote);
++	if (entry == NULL || entry->record.name == name)
++		return;
++	entry->record.name = name;
++	fDirty = true;
++}
++
++
++void
++DeviceCache::SetServiceClasses(const bdaddr_t& remote, const uint16* classes,
++	uint8 count)
++{
++	BAutolock locker(fLock);
++	Entry* entry = _FindOrAdd(remote);
++	if (entry == NULL)
++		return;
++	DeviceRecord& record = entry->record;
++	if (count > B_COUNT_OF(record.serviceClasses))
++		count = B_COUNT_OF(record.serviceClasses);
++	if (count == record.serviceClassCount
++		&& memcmp(classes, record.serviceClasses,
++			count * sizeof(uint16)) == 0) {
++		return;
++	}
++	memcpy(record.serviceClasses, classes, count * sizeof(uint16));
++	record.serviceClassCount = count;
++	fDirty = true;
++}
++
++
++void
++DeviceCache::Remove(const bdaddr_t& remote)
++{
++	BAutolock locker(fLock);
++	Entry* entry = _Find(remote);
++	if (entry == NULL)
++		return;
++	fEntries.RemoveItem(entry, true);
++	fDirty = true;
++}
++
++
++int32
++DeviceCache::Prune(const BondStore& bonds, int64 maxAge, int32 maxCount)
++{
++	BAutolock locker(fLock);
++	int64 now = (int64)time(NULL);
++	int32 removed = 0;
++
++	// the ones not seen for long
++	for (int32 i = fEntries.CountItems() - 1; i >= 0; i--) {
++		Entry* entry = fEntries.ItemAt(i);
++		if (!bonds.IsBonded(entry->record.address)
++			&& now - entry->record.lastSeen > maxAge) {
++			fEntries.RemoveItemAt(i);
++			delete entry;
++			removed++;
++		}
++	}
++
++	// then the oldest, while there are too many
++	while (fEntries.CountItems() > maxCount) {
++		int32 oldest = -1;
++		for (int32 i = 0; i < fEntries.CountItems(); i++) {
++			const DeviceRecord& record = fEntries.ItemAt(i)->record;
++			if (bonds.IsBonded(record.address))
++				continue;
++			if (oldest < 0 || record.lastSeen
++					< fEntries.ItemAt(oldest)->record.lastSeen) {
++				oldest = i;
++			}
++		}
++		if (oldest < 0)
++			break;
++		delete fEntries.RemoveItemAt(oldest);
++		removed++;
++	}
++
++	if (removed > 0)
++		fDirty = true;
++	return removed;
++}
++
++
++DeviceCache::Entry*
++DeviceCache::_Find(const bdaddr_t& remote) const
++{
++	for (int32 i = 0; i < fEntries.CountItems(); i++) {
++		Entry* entry = fEntries.ItemAt(i);
++		if (bdaddrUtils::Compare(entry->record.address, remote))
++			return entry;
++	}
++	return NULL;
++}
++
++
++DeviceCache::Entry*
++DeviceCache::_FindOrAdd(const bdaddr_t& remote)
++{
++	Entry* entry = _Find(remote);
++	if (entry != NULL)
++		return entry;
++
++	entry = new(std::nothrow) Entry;
++	if (entry == NULL || !fEntries.AddItem(entry)) {
++		delete entry;
++		return NULL;
++	}
++	entry->record.address = remote;
++	entry->record.lastSeen = (int64)time(NULL);
++	return entry;
++}
++
++
++status_t
++DeviceCache::_Save()
++{
++	BMessage file(kMsgDevices);
++	file.AddInt32("version", kDevicesVersion);
++	for (int32 i = 0; i < fEntries.CountItems(); i++) {
++		Entry* entry = fEntries.ItemAt(i);
++		const DeviceRecord& record = entry->record;
++		BMessage& archive = entry->archive;
++		archive.RemoveName("address");
++		archive.RemoveName("name");
++		archive.RemoveName("class");
++		archive.RemoveName("clock offset");
++		archive.RemoveName("page scan repetition mode");
++		archive.RemoveName("service class");
++		archive.RemoveName("last seen");
++		archive.AddData("address", B_RAW_TYPE, &record.address,
++			sizeof(bdaddr_t));
++		archive.AddString("name", record.name);
++		archive.AddData("class", B_RAW_TYPE, record.deviceClass,
++			sizeof(record.deviceClass));
++		archive.AddUInt16("clock offset", record.clockOffset);
++		archive.AddUInt8("page scan repetition mode",
++			record.pageScanRepetitionMode);
++		for (uint8 j = 0; j < record.serviceClassCount; j++)
++			archive.AddUInt16("service class", record.serviceClasses[j]);
++		archive.AddInt64("last seen", record.lastSeen);
++		file.AddMessage("device", &archive);
++	}
++
++	status_t status = SettingsFile::Write(fPath, file,
++		S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
++	if (status == B_OK)
++		fDirty = false;
++	return status;
++}
+diff --git a/src/servers/bluetooth/DeviceCache.h b/src/servers/bluetooth/DeviceCache.h
+new file mode 100644
+index 0000000000..f05b50f3e2
+--- /dev/null
++++ b/src/servers/bluetooth/DeviceCache.h
+@@ -0,0 +1,91 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef _BLUETOOTH_DEVICE_CACHE_H_
++#define _BLUETOOTH_DEVICE_CACHE_H_
++
++
++#include <Locker.h>
++#include <Message.h>
++#include <ObjectList.h>
++#include <Path.h>
++#include <String.h>
++
++#include <bluetooth/bluetooth.h>
++
++
++class BondStore;
++
++
++/*!	What is known of a remote device, paired or not: nothing secret. */
++struct DeviceRecord {
++								DeviceRecord();
++
++			bool				HasServiceClass(uint16 serviceClass) const;
++
++			bdaddr_t			address;
++			BString				name;
++			uint8				deviceClass[3];
++			uint16				clockOffset;
++			uint8				pageScanRepetitionMode;
++			uint16				serviceClasses[16];
++			uint8				serviceClassCount;
++				// the classes of its SDP records; 0 if not read yet
++			int64				lastSeen;
++				// seconds since the epoch
++};
++
++
++/*!	The devices an adapter met: in searches, connections, pairings. Their
++	names, classes and services are kept for the next time, so that the
++	paired devices show with their names and the Bluetooth audio add-on
++	knows speakers without asking them. Devices that are not paired go
++	after a while.
++*/
++class DeviceCache {
++public:
++								DeviceCache(const BPath& directory,
++									const bdaddr_t& adapter);
++								~DeviceCache();
++
++			status_t			Load();
++			status_t			Flush();
++				// writes what changed; the server calls it now and then
++
++			bool				Get(const bdaddr_t& remote,
++									DeviceRecord& _record) const;
++			int32				CountRecords() const;
++			bool				RecordAt(int32 index,
++									DeviceRecord& _record) const;
++
++			void				Update(const DeviceRecord& record);
++				// replaces what is known of the device, and marks it seen
++			void				SetName(const bdaddr_t& remote,
++									const char* name);
++			void				SetServiceClasses(const bdaddr_t& remote,
++									const uint16* classes, uint8 count);
++			void				Remove(const bdaddr_t& remote);
++
++			int32				Prune(const BondStore& bonds, int64 maxAge,
++									int32 maxCount);
++				// drops the devices without a bond not seen for maxAge
++				// seconds, and the oldest of them beyond maxCount; returns
++				// how many went
++
++private:
++			struct Entry;
++
++			Entry*				_Find(const bdaddr_t& remote) const;
++			Entry*				_FindOrAdd(const bdaddr_t& remote);
++			status_t			_Save();
++
++private:
++	mutable	BLocker				fLock;
++			BPath				fPath;
++			BObjectList<Entry, true> fEntries;
++			bool				fDirty;
++};
++
++
++#endif	// _BLUETOOTH_DEVICE_CACHE_H_
+diff --git a/src/servers/bluetooth/Jamfile b/src/servers/bluetooth/Jamfile
+index 2bb58fb86b..13053130db 100644
+--- a/src/servers/bluetooth/Jamfile
++++ b/src/servers/bluetooth/Jamfile
+@@ -7,18 +7,22 @@ AddResources bluetooth_server : bluetooth_server.rdef ;
+ Application bluetooth_server
+  	:
+ 	BluetoothServer.cpp
++	BondStore.cpp
+ 	DeskbarReplicant.cpp
++	DeviceCache.cpp
+ 	DeviceManager.cpp
+ 	HCIControllerAccessor.cpp
+ 	HCITransportAccessor.cpp
+ 	HIDDescriptor.cpp
+ 	HIDProfile.cpp
++	KeyVault.cpp
+ 	LocalDeviceHandler.cpp
+ 	LocalDeviceImpl.cpp
+ 	Notifications.cpp
+ 	Scripting.cpp
+ 	SDPServer.cpp
+ 	SDPClient.cpp
++	SettingsFile.cpp
+ 	: be media network libbluetooth.so localestub
+ 	[ TargetLibstdc++ ]
+ ;
+diff --git a/src/servers/bluetooth/KeyVault.cpp b/src/servers/bluetooth/KeyVault.cpp
+new file mode 100644
+index 0000000000..bbf70083f5
+--- /dev/null
++++ b/src/servers/bluetooth/KeyVault.cpp
+@@ -0,0 +1,209 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "KeyVault.h"
++
++#include <string.h>
++
++#include <Autolock.h>
++
++#include <bluetooth/bdaddrUtils.h>
++
++#include "SettingsFile.h"
++
++
++static const uint32 kMsgKeys = 'btKy';
++static const int32 kKeysVersion = 1;
++
++
++KeyVault::~KeyVault()
++{
++}
++
++
++//	#pragma mark - FileKeyVault
++
++
++FileKeyVault::FileKeyVault(const BPath& directory)
++	:
++	fLock("bluetooth keys"),
++	fDirectory(directory),
++	fAdapter(bdaddrUtils::NullAddress()),
++	fLoaded(false)
++{
++}
++
++
++FileKeyVault::~FileKeyVault()
++{
++	// nothing of the keys stays in the memory of the server
++	fKeys.MakeEmpty();
++}
++
++
++const char*
++FileKeyVault::Name() const
++{
++	return "file";
++}
++
++
++status_t
++FileKeyVault::InitCheck() const
++{
++	return fDirectory.InitCheck();
++}
++
++
++status_t
++FileKeyVault::Get(const bdaddr_t& adapter, const bdaddr_t& remote,
++	linkkey_t& _key)
++{
++	BAutolock locker(fLock);
++	status_t status = _Load(adapter);
++	if (status != B_OK)
++		return status;
++
++	int32 index = _IndexOf(remote);
++	if (index < 0)
++		return B_ENTRY_NOT_FOUND;
++
++	BMessage entry;
++	const void* data;
++	ssize_t size;
++	if (fKeys.FindMessage("key", index, &entry) != B_OK
++		|| entry.FindData("link key", B_RAW_TYPE, &data, &size) != B_OK
++		|| size != sizeof(linkkey_t)) {
++		return B_BAD_DATA;
++	}
++	memcpy(&_key, data, sizeof(linkkey_t));
++	return B_OK;
++}
++
++
++status_t
++FileKeyVault::Put(const bdaddr_t& adapter, const bdaddr_t& remote,
++	const linkkey_t& key)
++{
++	BAutolock locker(fLock);
++	status_t status = _Load(adapter);
++	if (status != B_OK && status != B_ENTRY_NOT_FOUND)
++		return status;
++
++	BMessage entry;
++	entry.AddData("address", B_RAW_TYPE, &remote, sizeof(bdaddr_t));
++	entry.AddData("link key", B_RAW_TYPE, &key, sizeof(linkkey_t));
++
++	int32 index = _IndexOf(remote);
++	if (index >= 0)
++		status = fKeys.ReplaceMessage("key", index, &entry);
++	else
++		status = fKeys.AddMessage("key", &entry);
++	if (status != B_OK)
++		return status;
++	return _Save();
++}
++
++
++status_t
++FileKeyVault::Remove(const bdaddr_t& adapter, const bdaddr_t& remote)
++{
++	BAutolock locker(fLock);
++	status_t status = _Load(adapter);
++	if (status != B_OK)
++		return status;
++
++	int32 index = _IndexOf(remote);
++	if (index < 0)
++		return B_ENTRY_NOT_FOUND;
++	fKeys.RemoveData("key", index);
++	return _Save();
++}
++
++
++status_t
++FileKeyVault::GetRemotes(const bdaddr_t& adapter, BMessage& remotes)
++{
++	BAutolock locker(fLock);
++	status_t status = _Load(adapter);
++	if (status == B_ENTRY_NOT_FOUND)
++		return B_OK;
++	if (status != B_OK)
++		return status;
++
++	BMessage entry;
++	for (int32 i = 0; fKeys.FindMessage("key", i, &entry) == B_OK; i++) {
++		const void* address;
++		ssize_t size;
++		if (entry.FindData("address", B_RAW_TYPE, &address, &size) == B_OK
++			&& size == sizeof(bdaddr_t)) {
++			remotes.AddData("address", B_RAW_TYPE, address, size);
++		}
++	}
++	return B_OK;
++}
++
++
++/*!	Reads the keys of \a adapter, unless they are loaded already. The lock
++	is held.
++*/
++status_t
++FileKeyVault::_Load(const bdaddr_t& adapter)
++{
++	if (fLoaded && bdaddrUtils::Compare(adapter, fAdapter))
++		return B_OK;
++
++	fLoaded = false;
++	fKeys.MakeEmpty();
++	fKeys.what = kMsgKeys;
++
++	BPath directory;
++	status_t status = SettingsFile::AdapterDirectory(fDirectory, adapter,
++		directory);
++	if (status == B_OK)
++		status = fPath.SetTo(directory.Path(), "keys");
++	if (status != B_OK)
++		return status;
++
++	fAdapter = adapter;
++	fLoaded = true;
++
++	status = SettingsFile::Read(fPath, fKeys);
++	if (status != B_OK) {
++		// none yet, or a broken file put aside: a vault without keys
++		fKeys.MakeEmpty();
++		fKeys.what = kMsgKeys;
++		return status == B_ENTRY_NOT_FOUND ? status : B_OK;
++	}
++	return B_OK;
++}
++
++
++status_t
++FileKeyVault::_Save()
++{
++	fKeys.what = kMsgKeys;
++	fKeys.RemoveName("version");
++	fKeys.AddInt32("version", kKeysVersion);
++	return SettingsFile::Write(fPath, fKeys, S_IRUSR | S_IWUSR);
++}
++
++
++int32
++FileKeyVault::_IndexOf(const bdaddr_t& remote) const
++{
++	BMessage entry;
++	for (int32 i = 0; fKeys.FindMessage("key", i, &entry) == B_OK; i++) {
++		const void* address;
++		ssize_t size;
++		if (entry.FindData("address", B_RAW_TYPE, &address, &size) == B_OK
++			&& size == sizeof(bdaddr_t)
++			&& bdaddrUtils::Compare(*(const bdaddr_t*)address, remote)) {
++			return i;
++		}
++	}
++	return -1;
++}
+diff --git a/src/servers/bluetooth/KeyVault.h b/src/servers/bluetooth/KeyVault.h
+new file mode 100644
+index 0000000000..b6d1d8aa3b
+--- /dev/null
++++ b/src/servers/bluetooth/KeyVault.h
+@@ -0,0 +1,86 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef _BLUETOOTH_KEY_VAULT_H_
++#define _BLUETOOTH_KEY_VAULT_H_
++
++
++#include <Locker.h>
++#include <Message.h>
++#include <Path.h>
++
++#include <bluetooth/bluetooth.h>
++
++
++/*!	Where the link keys are kept, apart from everything else known of the
++	paired devices: the BondStore asks it for a key, and tells it to keep or
++	forget one, and knows nothing more of how it is done. The key store of
++	the system (BKeyStore) is meant to be one, once it encrypts the keys.
++
++	A key belongs to the pair of an adapter (controller) and a device, as
++	the specification has it.
++*/
++class KeyVault {
++public:
++	virtual						~KeyVault();
++
++	virtual	const char*			Name() const = 0;
++	virtual	status_t			InitCheck() const = 0;
++
++	virtual	status_t			Get(const bdaddr_t& adapter,
++									const bdaddr_t& remote,
++									linkkey_t& _key) = 0;
++	virtual	status_t			Put(const bdaddr_t& adapter,
++									const bdaddr_t& remote,
++									const linkkey_t& key) = 0;
++	virtual	status_t			Remove(const bdaddr_t& adapter,
++									const bdaddr_t& remote) = 0;
++
++	// adds an "address" (B_RAW_TYPE, bdaddr_t) to \a remotes for each key
++	// kept for \a adapter
++	virtual	status_t			GetRemotes(const bdaddr_t& adapter,
++									BMessage& remotes) = 0;
++};
++
++
++/*!	The keys of each adapter in a file of their own, "keys" in the folder
++	of the adapter, which only the owner may read or write. They are not
++	encrypted: there is nothing in the system yet to encrypt them with.
++*/
++class FileKeyVault : public KeyVault {
++public:
++								FileKeyVault(const BPath& directory);
++	virtual						~FileKeyVault();
++
++	virtual	const char*			Name() const;
++	virtual	status_t			InitCheck() const;
++
++	virtual	status_t			Get(const bdaddr_t& adapter,
++									const bdaddr_t& remote,
++									linkkey_t& _key);
++	virtual	status_t			Put(const bdaddr_t& adapter,
++									const bdaddr_t& remote,
++									const linkkey_t& key);
++	virtual	status_t			Remove(const bdaddr_t& adapter,
++									const bdaddr_t& remote);
++	virtual	status_t			GetRemotes(const bdaddr_t& adapter,
++									BMessage& remotes);
++
++private:
++			status_t			_Load(const bdaddr_t& adapter);
++			status_t			_Save();
++			int32				_IndexOf(const bdaddr_t& remote) const;
++
++private:
++			BLocker				fLock;
++			BPath				fDirectory;
++			bdaddr_t			fAdapter;
++				// the adapter whose keys are loaded in fKeys
++			bool				fLoaded;
++			BPath				fPath;
++			BMessage			fKeys;
++};
++
++
++#endif	// _BLUETOOTH_KEY_VAULT_H_
+diff --git a/src/servers/bluetooth/SettingsFile.cpp b/src/servers/bluetooth/SettingsFile.cpp
+new file mode 100644
+index 0000000000..792c2b6a1a
+--- /dev/null
++++ b/src/servers/bluetooth/SettingsFile.cpp
+@@ -0,0 +1,86 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++#include "SettingsFile.h"
++
++#include <stdio.h>
++#include <string.h>
++#include <syslog.h>
++
++#include <Directory.h>
++#include <Entry.h>
++#include <File.h>
++#include <Message.h>
++#include <String.h>
++
++
++status_t
++SettingsFile::AdapterDirectory(const BPath& base, const bdaddr_t& adapter,
++	BPath& _path)
++{
++	// the address as the controller reads it out, most significant first
++	char name[13];
++	snprintf(name, sizeof(name), "%02X%02X%02X%02X%02X%02X", adapter.b[5],
++		adapter.b[4], adapter.b[3], adapter.b[2], adapter.b[1], adapter.b[0]);
++
++	status_t status = _path.SetTo(base.Path(), name);
++	if (status != B_OK)
++		return status;
++	status = create_directory(_path.Path(), 0755);
++	return status == B_FILE_EXISTS ? B_OK : status;
++}
++
++
++status_t
++SettingsFile::Read(const BPath& path, BMessage& message)
++{
++	BFile file(path.Path(), B_READ_ONLY);
++	status_t status = file.InitCheck();
++	if (status != B_OK)
++		return status == B_ENTRY_NOT_FOUND ? status : B_ERROR;
++
++	status = message.Unflatten(&file);
++	if (status == B_OK)
++		return B_OK;
++
++	// kept for whoever wants to look at it; the next write would lose it
++	BString broken(path.Leaf());
++	broken << ".broken";
++	BEntry entry(path.Path());
++	entry.Rename(broken.String(), true);
++	syslog(LOG_WARNING, "bluetooth_server: %s could not be read, it is now "
++		"%s\n", path.Path(), broken.String());
++	return B_BAD_DATA;
++}
++
++
++status_t
++SettingsFile::Write(const BPath& path, const BMessage& message, mode_t mode)
++{
++	BString temporary(path.Path());
++	temporary << ".new";
++
++	BFile file(temporary.String(), B_WRITE_ONLY | B_CREATE_FILE
++		| B_ERASE_FILE);
++	status_t status = file.InitCheck();
++	if (status == B_OK)
++		status = file.SetPermissions(mode);
++	if (status == B_OK)
++		status = message.Flatten(&file);
++	if (status == B_OK)
++		status = file.Sync();
++	file.Unset();
++
++	BEntry entry(temporary.String());
++	if (status == B_OK)
++		status = entry.Rename(path.Leaf(), true);
++	if (status != B_OK) {
++		entry.Remove();
++		syslog(LOG_ERR, "bluetooth_server: %s could not be written: %s\n",
++			path.Path(), strerror(status));
++	}
++	return status;
++}
+diff --git a/src/servers/bluetooth/SettingsFile.h b/src/servers/bluetooth/SettingsFile.h
+new file mode 100644
+index 0000000000..bb2ac125ac
+--- /dev/null
++++ b/src/servers/bluetooth/SettingsFile.h
+@@ -0,0 +1,41 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef _BLUETOOTH_SETTINGS_FILE_H_
++#define _BLUETOOTH_SETTINGS_FILE_H_
++
++
++#include <Path.h>
++#include <SupportDefs.h>
++#include <sys/stat.h>
++
++#include <bluetooth/bluetooth.h>
++
++
++class BMessage;
++
++
++/*!	The files the Bluetooth server keeps its state in: flattened messages,
++	written aside and then put in place, so that a crash in the middle
++	leaves the previous version whole.
++*/
++namespace SettingsFile {
++
++// The folder of the state of one adapter (controller), in \a base:
++// "<base>/6C626D182CFD". It is created if needed.
++status_t	AdapterDirectory(const BPath& base, const bdaddr_t& adapter,
++				BPath& _path);
++
++// Reads \a path into \a message. A file that cannot be read is renamed
++// "<name>.broken", so that the next write does not lose it, and
++// B_BAD_DATA is returned; a missing file gives B_ENTRY_NOT_FOUND.
++status_t	Read(const BPath& path, BMessage& message);
++
++// Writes \a message to \a path with the permissions \a mode.
++status_t	Write(const BPath& path, const BMessage& message, mode_t mode);
++
++}
++
++
++#endif	// _BLUETOOTH_SETTINGS_FILE_H_
+-- 
+2.39.5
+

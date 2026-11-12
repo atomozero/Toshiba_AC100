@@ -1,0 +1,431 @@
+From 34c0509462ea058e8872f9f4f878b478f1a7a266 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Wed, 11 Nov 2026 20:53:35 +0100
+Subject: [PATCH 33/42] kernel/arm, tegra_dvfs: change the CPU clock of the
+ Tegra 2
+
+The kernel takes its timer events from the Cortex-A9 private timers,
+which run at a quarter of the CPU clock: a driver that changes that clock
+must tell the new rate. TegraTimer::SetTWDFrequency(), reachable as
+tegra_twd_set_frequency(), takes it for new timeouts and converts the
+event pending on each CPU, through call_all_cpus_sync(), so that it keeps
+its time.
+
+tegra_dvfs now sets the CPU clock when "cclk <MHz>" is written to it, at
+the rates of Linux' Tegra 2 table (216 to 1000 MHz). As Linux does, the
+CPU runs from PLLP (216 MHz) while PLLX is reprogrammed (M = 12, N = the
+rate in MHz, P = 1 below 600 MHz, the firmware's charge pump settings),
+then from PLLX again; at 216 MHz it stays on PLLP and PLLX is switched
+off. For now the CPU supply must be at 1100 mV, which all of these rates
+allow: lowering the voltage with the clock comes with the cpufreq module.
+
+Tested on the Toshiba AC100 with tests/ac100diag/clocktest: 45 changes in
+a row through all rates; the measured speed matches each rate, and
+snooze() of 1, 10 and 100 ms keeps its length at every rate (100.1 ms
+also at 216 MHz, where the private timers run at 54 MHz).
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../drivers/power/tegra_dvfs/tegra_dvfs.cpp   | 195 ++++++++++++++++++
+ src/system/kernel/arch/arm/soc_tegra.cpp      |  88 ++++++++
+ src/system/kernel/arch/arm/soc_tegra.h        |  17 +-
+ 3 files changed, 299 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp b/src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp
+index 85c7b70d18..64301aab20 100644
+--- a/src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp
++++ b/src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp
+@@ -11,6 +11,13 @@
+ 	"core <mV>", "cpu <mV>" or "rtc <mV>" moves a supply in steps of 25 mV,
+ 	within the limits of the AC100 and keeping the core 120 mV above the CPU
+ 	and within 170 mV of the RTC domain, as Linux does.
++
++	Writing "cclk <MHz>" sets the CPU clock: 216 MHz runs it from PLLP and
++	switches PLLX off, the others from PLLX, which is reprogrammed while the
++	CPU runs from PLLP meanwhile, as Linux does. The private timers of the
++	CPUs, which run at a quarter of that clock and give the kernel its timer
++	events, are told the new rate. For now the CPU supply must be at its
++	highest voltage (1100 mV), which every rate allows.
+ */
+ 
+ 
+@@ -67,7 +74,28 @@
+ #define CAR_PLLM_BASE				0x90
+ #define CAR_PLLP_BASE				0xa0
+ #define CAR_PLLX_BASE				0xe0
++#define CAR_PLLX_MISC				0xe4
+ #define CAR_CLK_SOURCE_EMC			0x19c
++
++#define PLL_BASE_BYPASS				(1U << 31)
++#define PLL_BASE_ENABLE				(1U << 30)
++#define PLL_BASE_LOCK				(1U << 27)
++#define PLL_BASE_DIVP_SHIFT			20
++#define PLL_BASE_DIVN_SHIFT			8
++#define PLL_MISC_LOCK_ENABLE		(1U << 18)
++
++// CCLK_BURST_POLICY: the CPU state in bits 31:28, then a 4 bit source for
++// each state (FIQ, IRQ, run, idle); 4 is PLLP_OUT0, 8 PLLX_OUT0
++#define CCLK_STATE_RUN				(2U << 28)
++#define CCLK_ALL_FROM_PLLP			0x4444
++#define CCLK_ALL_FROM_PLLX			0x8888
++#define CCLK_SOURCE_MASK			0xffff
++#define CCLK_RUN_SOURCE(policy)		(((policy) >> 4) & 0xf)
++#define CCLK_SOURCE_PLLP			4
++#define CCLK_SOURCE_PLLX			8
++
++#define PLLP_KHZ					216000
++#define PLLX_LOCK_TIMEOUT			1000	// microseconds
+ #define CAR_CLK_OUT_ENB_H			0x14
+ #define CAR_CLK_ENB_FUSE			(1 << 7)
+ 
+@@ -88,6 +116,8 @@ extern "C" status_t arm_dvc_i2c_read(uint8 address, uint8 reg, uint8* data,
+ 	uint32 length);
+ extern "C" status_t arm_dvc_i2c_write(uint8 address, uint8 reg,
+ 	const uint8* data, uint32 length);
++extern "C" uint32 tegra_twd_frequency(void);
++extern "C" status_t tegra_twd_set_frequency(uint32 frequency);
+ 
+ 
+ static const char* sDeviceNames[] = { "power/tegra_dvfs", NULL };
+@@ -443,6 +473,164 @@ set_supply(int32 index, uint32 target)
+ }
+ 
+ 
++//	#pragma mark - CPU clock
++
++
++// The rates of Linux' Tegra 2 CPU table, which all run at 1100 mV
++static const uint32 kCPUClocksMHz[] = {
++	216, 312, 456, 608, 760, 816, 912, 1000
++};
++
++static uint32 sTWDBaseFrequency;	// the private timer rate at sCPUBaseKHz
++static uint32 sCPUBaseKHz;
++
++
++/*!	The CPU clock in kHz, from the source of its run state. */
++static uint32
++cpu_clock_khz(volatile uint32* car)
++{
++	uint32 policy = car[CAR_CCLK_BURST_POLICY / 4];
++	switch (CCLK_RUN_SOURCE(policy)) {
++		case CCLK_SOURCE_PLLP:
++			return pll_khz(car[CAR_PLLP_BASE / 4]);
++		case CCLK_SOURCE_PLLX:
++			return pll_khz(car[CAR_PLLX_BASE / 4]);
++	}
++	return 0;
++}
++
++
++/*!	Tells the kernel the rate of the private timers for the CPU clock
++	\a khz: a quarter of it, measured against the 1 MHz timer at boot.
++*/
++static status_t
++cpu_clock_changed(uint32 khz)
++{
++	return tegra_twd_set_frequency(
++		(uint64)sTWDBaseFrequency * khz / sCPUBaseKHz);
++}
++
++
++static void
++set_cpu_source(volatile uint32* car, uint32 sources)
++{
++	uint32 policy = car[CAR_CCLK_BURST_POLICY / 4];
++	car[CAR_CCLK_BURST_POLICY / 4] = (policy & ~(0xfU << 28 | CCLK_SOURCE_MASK))
++		| CCLK_STATE_RUN | sources;
++	// the switch is glitch free and takes a few cycles of both clocks
++	car[CAR_CCLK_BURST_POLICY / 4];
++	spin(1);
++}
++
++
++/*!	PLLX from the 12 MHz oscillator: M = 12, so N is the rate in MHz, with a
++	VCO of at least 600 MHz (P = 1 halves it for 456 MHz and below). The
++	charge pump and the other MISC settings stay as the firmware set them
++	for 1 GHz, which suits a comparison frequency of 1 MHz and N >= 600.
++*/
++static status_t
++program_pllx(volatile uint32* car, uint32 mhz)
++{
++	uint32 p = mhz < 600 ? 1 : 0;
++	uint32 n = mhz << p;
++	uint32 base = car[CAR_PLLX_BASE / 4];
++	uint32 m = base & 0x1f;
++	if (m != OSCILLATOR_KHZ / 1000 || n > 1000)
++		return B_NOT_SUPPORTED;
++
++	car[CAR_PLLX_MISC / 4] |= PLL_MISC_LOCK_ENABLE;
++	base &= ~(PLL_BASE_ENABLE | PLL_BASE_BYPASS | (0x7U << PLL_BASE_DIVP_SHIFT)
++		| (0x3ffU << PLL_BASE_DIVN_SHIFT));
++	base |= (p << PLL_BASE_DIVP_SHIFT) | (n << PLL_BASE_DIVN_SHIFT);
++	car[CAR_PLLX_BASE / 4] = base;
++	car[CAR_PLLX_BASE / 4] = base | PLL_BASE_ENABLE;
++
++	bigtime_t timeout = system_time() + PLLX_LOCK_TIMEOUT;
++	while ((car[CAR_PLLX_BASE / 4] & PLL_BASE_LOCK) == 0) {
++		if (system_time() > timeout)
++			return B_TIMED_OUT;
++		spin(10);
++	}
++	// settle, as Linux waits its lock delay
++	spin(300);
++	return B_OK;
++}
++
++
++static status_t
++set_cpu_clock(uint32 mhz)
++{
++	bool known = false;
++	for (size_t i = 0; i < B_COUNT_OF(kCPUClocksMHz); i++)
++		known |= kCPUClocksMHz[i] == mhz;
++	if (!known)
++		return B_BAD_VALUE;
++
++	MutexLocker locker(sLock);
++
++	uint32 cpuMillivolts;
++	status_t status = read_supply(kSupplies[SUPPLY_CPU], &cpuMillivolts);
++	if (status != B_OK)
++		return status;
++	if (cpuMillivolts != CPU_MAX_MV) {
++		TRACE_ALWAYS("cclk: the CPU supply is at %" B_PRIu32 " mV, not %d\n",
++			cpuMillivolts, CPU_MAX_MV);
++		return B_NOT_ALLOWED;
++	}
++
++	void* address;
++	area_id area = map_physical_memory("tegra car", TEGRA20_CAR_BASE,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++	if (area < B_OK)
++		return area;
++	volatile uint32* car = (volatile uint32*)address;
++
++	if (sCPUBaseKHz == 0) {
++		sCPUBaseKHz = cpu_clock_khz(car);
++		sTWDBaseFrequency = tegra_twd_frequency();
++		if (sCPUBaseKHz == 0 || sTWDBaseFrequency == 0) {
++			sCPUBaseKHz = 0;
++			delete_area(area);
++			return B_NOT_SUPPORTED;
++		}
++	}
++
++	uint32 oldKHz = cpu_clock_khz(car);
++	if (oldKHz == mhz * 1000) {
++		delete_area(area);
++		return B_OK;
++	}
++
++	// Away from PLLX first, if it runs from it
++	if (CCLK_RUN_SOURCE(car[CAR_CCLK_BURST_POLICY / 4]) != CCLK_SOURCE_PLLP) {
++		set_cpu_source(car, CCLK_ALL_FROM_PLLP);
++		cpu_clock_changed(PLLP_KHZ);
++	}
++
++	if (mhz * 1000 == PLLP_KHZ) {
++		// PLLX is not needed any more
++		car[CAR_PLLX_BASE / 4] &= ~PLL_BASE_ENABLE;
++	} else {
++		status = program_pllx(car, mhz);
++		if (status != B_OK) {
++			TRACE_ALWAYS("cclk: PLLX at %" B_PRIu32 " MHz: %s, staying at "
++				"216 MHz\n", mhz, strerror(status));
++			delete_area(area);
++			return status;
++		}
++		set_cpu_source(car, CCLK_ALL_FROM_PLLX);
++		cpu_clock_changed(cpu_clock_khz(car));
++	}
++
++	uint32 newKHz = cpu_clock_khz(car);
++	delete_area(area);
++	TRACE_ALWAYS("cclk: %" B_PRIu32 " -> %" B_PRIu32 " kHz, private timers %"
++		B_PRIu32 " Hz\n", oldKHz, newKHz, tegra_twd_frequency());
++	return B_OK;
++}
++
++
+ //	#pragma mark - device hooks
+ 
+ 
+@@ -514,6 +702,13 @@ tegra_dvfs_write(void* cookie, off_t position, const void* buffer,
+ 	}
+ 	*value++ = '\0';
+ 
++	if (strcmp(command, "cclk") == 0) {
++		status_t status = set_cpu_clock(strtoul(value, NULL, 10));
++		if (status != B_OK)
++			*_length = 0;
++		return status;
++	}
++
+ 	for (int32 i = 0; i < SUPPLY_COUNT; i++) {
+ 		if (strcmp(command, kSupplies[i].name) != 0)
+ 			continue;
+diff --git a/src/system/kernel/arch/arm/soc_tegra.cpp b/src/system/kernel/arch/arm/soc_tegra.cpp
+index 1d073293ea..16d5353ab6 100644
+--- a/src/system/kernel/arch/arm/soc_tegra.cpp
++++ b/src/system/kernel/arch/arm/soc_tegra.cpp
+@@ -33,6 +33,7 @@
+ 
+ // Cortex-A9 private timer, offsets in bytes
+ #define TWD_LOAD				0x00
++#define TWD_COUNTER				0x04
+ #define TWD_CONTROL				0x08
+ #define TWD_CONTROL_ENABLE		(1U << 0)
+ #define TWD_CONTROL_IRQ_ENABLE	(1U << 2)
+@@ -53,6 +54,9 @@ write_reg(volatile uint32* regs, uint32 offset, uint32 value)
+ }
+ 
+ 
++TegraTimer* TegraTimer::sTegraTimer = NULL;
++
++
+ TegraTimer::TegraTimer(phys_addr_t regBase, uint32 interrupt,
+ 	phys_addr_t twdBase, uint32 twdInterrupt, uint32 twdFrequency)
+ 	:
+@@ -71,6 +75,8 @@ TegraTimer::TegraTimer(phys_addr_t regBase, uint32 interrupt,
+ 	if (fRegArea < 0)
+ 		panic("Cannot map Tegra timer registers!");
+ 
++	sTegraTimer = this;
++
+ 	// TIMERUS is already running at 1 MHz, set up by the boot firmware
+ 	fLastCount = read_reg(fRegs, TIMERUS_CNTR_1US);
+ 
+@@ -225,3 +231,85 @@ TegraTimer::_HandleWrapInterrupt(void* data)
+ 	timer->Time();
+ 	return B_HANDLED_INTERRUPT;
+ }
++
++
++struct twd_rescale {
++	uint32	oldFrequency;
++	uint32	newFrequency;
++};
++
++
++/*!	Runs on every CPU, with interrupts disabled: the event pending on this
++	CPU's private timer keeps its time, counted in ticks of the new rate.
++*/
++/* static */ void
++TegraTimer::_RescaleTWD(void* data, int cpu)
++{
++	twd_rescale* rescale = (twd_rescale*)data;
++	volatile uint32* twd = sTegraTimer->fTWD;
++
++	uint32 control = read_reg(twd, TWD_CONTROL);
++	if ((control & TWD_CONTROL_ENABLE) == 0)
++		return;
++	uint32 count = read_reg(twd, TWD_COUNTER);
++	if (count == 0)
++		return;
++
++	uint64 ticks = (uint64)count * rescale->newFrequency
++		/ rescale->oldFrequency;
++	if (ticks < 1)
++		ticks = 1;
++	if (ticks > 0xffffffff)
++		ticks = 0xffffffff;
++	write_reg(twd, TWD_CONTROL, 0);
++	write_reg(twd, TWD_LOAD, (uint32)ticks);
++	write_reg(twd, TWD_CONTROL, control);
++}
++
++
++/*!	The CPU clock, and with it the private timers, now runs at a different
++	rate. Call it right after the change, with interrupts enabled: the timers
++	of all CPUs are rescaled at once. Between the change and this call,
++	pending events are off by the ratio of the two rates; the caller keeps
++	that short.
++*/
++status_t
++TegraTimer::SetTWDFrequency(uint32 frequency)
++{
++	if (fTWD == NULL)
++		return B_NOT_SUPPORTED;
++	if (frequency == 0)
++		return B_BAD_VALUE;
++
++	twd_rescale rescale;
++	rescale.oldFrequency = fTWDFrequency;
++	rescale.newFrequency = frequency;
++	if (rescale.oldFrequency == frequency)
++		return B_OK;
++
++	// New timeouts use the new rate from now on, pending ones are converted
++	fTWDFrequency = frequency;
++	call_all_cpus_sync(&_RescaleTWD, &rescale);
++	return B_OK;
++}
++
++
++//	#pragma mark - interface for the CPU clock drivers
++
++
++uint32
++tegra_twd_frequency(void)
++{
++	TegraTimer* timer = TegraTimer::Instance();
++	return timer != NULL ? timer->TWDFrequency() : 0;
++}
++
++
++status_t
++tegra_twd_set_frequency(uint32 frequency)
++{
++	TegraTimer* timer = TegraTimer::Instance();
++	if (timer == NULL)
++		return B_NOT_SUPPORTED;
++	return timer->SetTWDFrequency(frequency);
++}
+diff --git a/src/system/kernel/arch/arm/soc_tegra.h b/src/system/kernel/arch/arm/soc_tegra.h
+index 98aa612fda..84edb56b47 100644
+--- a/src/system/kernel/arch/arm/soc_tegra.h
++++ b/src/system/kernel/arch/arm/soc_tegra.h
+@@ -26,6 +26,12 @@ public:
+ 	void Clear();
+ 	status_t PerCpuInit();
+ 
++	// The private timers run at a quarter of the CPU clock: whoever changes
++	// that clock tells the new rate, see tegra_twd_set_frequency()
++	uint32 TWDFrequency() const { return fTWDFrequency; }
++	status_t SetTWDFrequency(uint32 frequency);
++	static TegraTimer* Instance() { return sTegraTimer; }
++
+ 	static status_t Init(phys_addr_t regBase, uint32 interrupt,
+ 		phys_addr_t twdBase = 0, uint32 twdInterrupt = 0,
+ 		uint32 twdFrequency = 0)
+@@ -47,6 +53,9 @@ private:
+ 	static int32 _HandleEventInterrupt(void* data);
+ 	static int32 _HandleWrapInterrupt(void* data);
+ 	static int32 _HandleTWDInterrupt(void* data);
++	static void _RescaleTWD(void* data, int cpu);
++
++	static TegraTimer* sTegraTimer;
+ 
+ 	area_id fRegArea;
+ 	volatile uint32* fRegs;
+@@ -60,8 +69,14 @@ private:
+ 	area_id fTWDArea;
+ 	volatile uint32* fTWD;		// banked: each CPU sees its own timer
+ 	int32 fTWDInterrupt;
+-	uint32 fTWDFrequency;
++	uint32 volatile fTWDFrequency;
+ };
+ 
+ 
++extern "C" {
++uint32 tegra_twd_frequency(void);
++status_t tegra_twd_set_frequency(uint32 frequency);
++}
++
++
+ #endif /* ARCH_ARM_SOC_TEGRA_H */
+-- 
+2.39.5
+

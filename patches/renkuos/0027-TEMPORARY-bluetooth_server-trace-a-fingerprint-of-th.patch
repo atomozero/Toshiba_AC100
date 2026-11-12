@@ -1,0 +1,82 @@
+From ccdd9ac896082e862dd44c00dce66b7828afd00b Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 10 Nov 2026 07:43:18 +0100
+Subject: [PATCH 27/42] TEMPORARY bluetooth_server: trace a fingerprint of the
+ link keys
+
+A 16-bit fingerprint of a link key, written to the syslog where a key is
+made by a pairing, saved, loaded and given to the controller: it showed
+that the key a Google Home refuses after a disconnection is the one it
+paired with. To be replaced by the "trace keys" setting of the bond
+store; not for upstream.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/servers/bluetooth/LocalDeviceImpl.cpp | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/src/servers/bluetooth/LocalDeviceImpl.cpp b/src/servers/bluetooth/LocalDeviceImpl.cpp
+index 9ba36f941c..0c36d28cb0 100644
+--- a/src/servers/bluetooth/LocalDeviceImpl.cpp
++++ b/src/servers/bluetooth/LocalDeviceImpl.cpp
+@@ -210,6 +210,22 @@ LocalDeviceImpl::Unregister()
+ }
+ 
+ 
++// TEMPORARY (debugging keys that a device refuses after a restart): a
++// 16-bit fingerprint of a link key, the same at every step it goes through,
++// that does not tell the key itself
++static void
++trace_key(const char* step, const bdaddr_t& address, const linkkey_t& key)
++{
++	uint32 hash = 2166136261u;
++	const uint8* bytes = (const uint8*)&key;
++	for (size_t i = 0; i < sizeof(linkkey_t); i++)
++		hash = (hash ^ bytes[i]) * 16777619u;
++	syslog(LOG_INFO, "bluetooth_server: key %s for %s: fingerprint %04x\n",
++		step, bdaddrUtils::ToString(address).String(),
++		(unsigned)((hash >> 16) ^ (hash & 0xffff)));
++}
++
++
+ void
+ LocalDeviceImpl::SaveRemoteDevices()
+ {
+@@ -227,6 +243,9 @@ LocalDeviceImpl::SaveRemoteDevices()
+ 		device.AddData("class_of_device", B_RAW_TYPE, rd->classOfDevice,
+ 			sizeof(rd->classOfDevice));
+ 		device.AddData("link key", B_ANY_TYPE, &link_key, sizeof(linkkey_t));
++		linkkey_t nullKey = LinkKeyUtils::NullKey();
++		if (!LinkKeyUtils::Compare(&link_key, &nullKey))
++			trace_key("saved", bdaddr, link_key);
+ 		device.AddUInt8("key type", rd->key_type);
+ 		for (uint8 j = 0; j < rd->serviceClassCount; j++)
+ 			device.AddUInt16("service class", rd->serviceClasses[j]);
+@@ -289,6 +308,7 @@ LocalDeviceImpl::LoadRemoteDevices()
+ 		if (device.FindData("link key", B_ANY_TYPE, &data, &size) == B_OK
+ 			&& size == sizeof(linkkey_t)) {
+ 			memcpy(&rd->link_key, data, sizeof(linkkey_t));
++			trace_key("loaded", rd->bdaddr, rd->link_key);
+ 		}
+ 		// files written before kept no key type: their "link type" was the
+ 		// kind of the last link (ACL), so the type is not known
+@@ -2325,6 +2345,7 @@ LocalDeviceImpl::LinkKeyNotify(hci_ev_link_key_notify* event,
+ 	rd->link_key = event->link_key;
+ 	rd->key_type = event->key_type;
+ 	rd->paired = true;
++	trace_key("made by the pairing", rd->bdaddr, rd->link_key);
+ 	rd->autoPinTried = false;
+ 
+ 	// keep the key at once: the device needs it to connect again
+@@ -2374,6 +2395,8 @@ LocalDeviceImpl::LinkKeyRequested(struct hci_ev_link_key_req* keyRequested,
+ 
+ 		bdaddrUtils::Copy(linkKeyReply->bdaddr, keyRequested->bdaddr);
+ 		linkKeyReply->link_key = rd->link_key;
++		trace_key("given to the controller", rd->bdaddr,
++			linkKeyReply->link_key);
+ 
+ 		if ((fHCIDelegate)->IssueCommand(linkKeyReply.Data(), linkKeyReply.Size()) == B_ERROR) {
+ 			TRACE_BT("LocalDeviceImpl: Command issued error for reply %s\n", __FUNCTION__);
+-- 
+2.39.5
+

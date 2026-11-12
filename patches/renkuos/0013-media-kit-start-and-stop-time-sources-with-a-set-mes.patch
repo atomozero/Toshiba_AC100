@@ -1,0 +1,44 @@
+From e31a859c90797b36a4e52dd9735dc43d03453a07 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 10 Nov 2026 07:42:22 +0100
+Subject: [PATCH 13/42] media kit: start and stop time sources with a set
+ message
+
+BMediaRoster::StartTimeSource() and StopTimeSource() sent the
+time_source_op_info with its performance time, and the reserved fields,
+left as they were on the stack. A time source that takes the performance
+time given with the start as its own (the Bluetooth audio node did) then
+began anywhere: days ahead of the other clocks of the system.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/kits/media/MediaRoster.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/kits/media/MediaRoster.cpp b/src/kits/media/MediaRoster.cpp
+index 3fef7d87dd..e337aafe99 100644
+--- a/src/kits/media/MediaRoster.cpp
++++ b/src/kits/media/MediaRoster.cpp
+@@ -1419,7 +1419,9 @@ BMediaRoster::StartTimeSource(const media_node& node, bigtime_t atRealTime)
+ 	TRACE("BMediaRoster::StartTimeSource, node %" B_PRId32 ", at real %"
+ 		B_PRId64 "\n", node.node, atRealTime);
+ 
+-	BTimeSource::time_source_op_info msg;
++	// All of it set: the performance time is not given, and a clock that
++	// took it as its start began anywhere (days ahead of the others).
++	BTimeSource::time_source_op_info msg = {};
+ 	msg.op = BTimeSource::B_TIMESOURCE_START;
+ 	msg.real_time = atRealTime;
+ 
+@@ -1456,7 +1458,7 @@ BMediaRoster::StopTimeSource(const media_node& node, bigtime_t atRealTime,
+ 	TRACE("BMediaRoster::StopTimeSource, node %" B_PRId32 ", at real %" B_PRId64
+ 		" %s\n", node.node, atRealTime, immediate ? "NOW" : "");
+ 
+-	BTimeSource::time_source_op_info msg;
++	BTimeSource::time_source_op_info msg = {};
+ 	msg.op = immediate ? BTimeSource::B_TIMESOURCE_STOP_IMMEDIATELY
+ 		: BTimeSource::B_TIMESOURCE_STOP;
+ 	msg.real_time = atRealTime;
+-- 
+2.39.5
+

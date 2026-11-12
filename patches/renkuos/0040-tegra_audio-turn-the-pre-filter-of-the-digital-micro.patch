@@ -1,0 +1,45 @@
+From 033ad0ffc249ab02ed8bbc0d60945e3ed3ad895a Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Thu, 12 Nov 2026 20:54:45 +0100
+Subject: [PATCH 40/42] tegra_audio: turn the pre-filter of the digital
+ microphone on
+
+The built-in microphone of the Toshiba AC100 is a digital (PDM) one on
+the DMICDAT input of the ALC5632. Without the pre-filter of the
+digital microphone (bit 12 of register 0x24) the ADC recorded a level
+stuck near full scale with slow ramps between, the same with sound or
+without: nothing of the microphone. The Android port of the AC100 turns
+it on too ("DMIC PreFilter Capture Switch").
+
+With it, the microphone records: about -48 dBFS of room noise, centred
+on zero, measured with tests/ac100diag/mictest.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp b/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
+index e2488c0af9..d2c21a6b81 100644
+--- a/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
++++ b/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
+@@ -486,9 +486,13 @@ set_input(tegra_audio* audio)
+ 	codec_update(audio, ALC5632_I2S_OUT_CTL, 1U << 5, 0);
+ 
+ 	if (digital) {
+-		// digital microphone on, into both ADC channels (the routing bits
+-		// mute when set), its boost in steps of 6 dB
+-		codec_write(audio, ALC5632_DIGI_BOOST_CTRL, (1U << 15) | boost);
++		// digital microphone on with its pre-filter, into both ADC channels
++		// (the routing bits mute when set), its boost in steps of 6 dB.
++		// Without the pre-filter the ADC gets the raw stream: it records
++		// a level stuck near full scale instead of the microphone (the
++		// Android port of the AC100 turns it on too)
++		codec_write(audio, ALC5632_DIGI_BOOST_CTRL,
++			(1U << 15) | (1U << 12) | boost);
+ 		codec_write(audio, ALC5632_ADC_REC_MIXER, 0x7f7f);
+ 		codec_update(audio, ALC5632_PWR_MANAG_ADD1, 1U << 3, 0);
+ 		codec_update(audio, ALC5632_PWR_MANAG_ADD2, 0x00c3, 0x00c0);
+-- 
+2.39.5
+

@@ -1,0 +1,362 @@
+From 650b8aa1a6090bc83b6b3fea153ca38a04f4c5c0 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 8 Nov 2026 23:13:53 +0100
+Subject: [PATCH 11/42] media_server, bluetooth_audio: another output plays
+ while the speakers are out of reach
+
+An output can now tell the media server that it cannot play for now
+(MEDIA_SERVER_SET_OUTPUT_AVAILABLE, with the node and true or false).
+While the default audio output cannot, the rescan thread moves the mixer
+to another output, marked as a stand-in as for a saved device that is
+absent: the saved preference stays, and the existing return to the saved
+default takes the sound back once it can play again. Outputs that cannot
+play are no candidates for a default.
+
+The Bluetooth audio node says so when there is sound to play and the
+speakers do not answer, and calls them every 30 s meanwhile (the sound
+goes elsewhere, so it no longer waits for them); it says they can play
+again when it connects, or they do.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ headers/private/media/ServerInterface.h       |  5 ++
+ .../bluetooth_audio/BluetoothAudioNode.cpp    | 41 ++++++++++--
+ .../bluetooth_audio/BluetoothAudioNode.h      |  4 ++
+ .../media-add-ons/bluetooth_audio/Jamfile     |  2 +-
+ src/servers/media/DefaultManager.cpp          | 62 +++++++++++++++++++
+ src/servers/media/DefaultManager.h            | 11 ++++
+ src/servers/media/NodeManager.cpp             |  8 +++
+ src/servers/media/NodeManager.h               |  2 +
+ src/servers/media/media_server.cpp            | 11 ++++
+ 9 files changed, 141 insertions(+), 5 deletions(-)
+
+diff --git a/headers/private/media/ServerInterface.h b/headers/private/media/ServerInterface.h
+index 0bd7967ecc..9203d845ff 100644
+--- a/headers/private/media/ServerInterface.h
++++ b/headers/private/media/ServerInterface.h
+@@ -33,6 +33,11 @@ enum {
+ 	// sent to rosters when rescan is completed
+ 	MEDIA_SERVER_ALIVE,
+ 
++	// an output tells it cannot play for now ("node", "available"): a
++	// default output goes over to another one meanwhile, keeping the
++	// preference
++	MEDIA_SERVER_SET_OUTPUT_AVAILABLE,
++
+ 	// media add-on server
+ 	MEDIA_ADD_ON_SERVER_PLAY_MEDIA = '_TRU'
+ };
+diff --git a/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp b/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp
+index 3def4bd791..3aa1cceea3 100644
+--- a/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp
++++ b/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp
+@@ -6,6 +6,9 @@
+ 
+ #include "BluetoothAudioNode.h"
+ 
++#include <Messenger.h>
++#include <ServerInterface.h>
++
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -46,6 +49,9 @@ static const int32 kChunkFrames = 512;
+ static const bigtime_t kSilenceSuspends = 30000000;
+ // how often the speakers are called while sound waits for them
+ static const bigtime_t kCallInterval = 15000000;
++// while the sound plays elsewhere, the speakers are called this often, to
++// take it back when they can be reached again
++static const bigtime_t kRecallInterval = 30000000;
+ // how late speakers play, when they do not tell (A2DP delay reporting)
+ static const bigtime_t kDefaultOutputDelay = 150000;
+ // below this, a sample is silence (16-bit)
+@@ -84,6 +90,7 @@ BluetoothAudioNode::BluetoothAudioNode(BluetoothAudioAddOn* addOn,
+ 	fRealBase(0),
+ 	fQuitting(false),
+ 	fOutputDelay(kDefaultOutputDelay),
++	fAvailable(true),
+ 	fVolume(-1.0f),
+ 	fVolumeChanged(0),
+ 	fVolumeDirty(false)
+@@ -483,6 +490,25 @@ BluetoothAudioNode::_Drop(int32 keepFrames)
+ }
+ 
+ 
++/*!	Tells the media server whether the speakers can play: while they
++	cannot, another output stands in for them, and the preference stays.
++*/
++void
++BluetoothAudioNode::_SetAvailable(bool available)
++{
++	if (available == fAvailable)
++		return;
++	fAvailable = available;
++	TRACE("%s: %s\n", fName.String(), available
++		? "the speakers can play again" : "the speakers cannot be reached, "
++			"the sound goes elsewhere meanwhile");
++	BMessage message(MEDIA_SERVER_SET_OUTPUT_AVAILABLE);
++	message.AddInt32("node", ID());
++	message.AddBool("available", available);
++	BMessenger(B_MEDIA_SERVER_SIGNATURE).SendMessage(&message);
++}
++
++
+ /*!	When the sound began, after a silence. */
+ bigtime_t
+ BluetoothAudioNode::_SoundStarted()
+@@ -621,23 +647,30 @@ BluetoothAudioNode::_Link()
+ 
+ 		if (!source.IsConnected()) {
+ 			_Drop(backlog);
+-			// sound waits: the speakers are called, now and then
+-			if (sound && now - calledAt > kCallInterval) {
++			// sound waits: the speakers are called, now and then; while
++			// the sound plays elsewhere, they are called all the same
++			if ((sound && now - calledAt > kCallInterval)
++				|| (!fAvailable && now - calledAt > kRecallInterval)) {
+ 				calledAt = now;
+-				TRACE("%s: sound to play, calling the speakers\n",
+-					fName.String());
++				TRACE("%s: %s, calling the speakers\n", fName.String(),
++					sound ? "sound to play" : "to take the sound back");
+ 				if (source.Connect(fAddress) == B_OK) {
+ 					TRACE("%s: connected (%" B_PRIu32 " Hz)\n",
+ 						fName.String(), source.SampleRate());
+ 					remotePaused = false;
++					_SetAvailable(true);
+ 					continue;
+ 				}
++				// out of reach: the sound does not wait for them
++				if (sound)
++					_SetAvailable(false);
+ 			}
+ 			// or they connect by themselves
+ 			bdaddr_t from;
+ 			if (source.WaitForSink(500000, &from) == B_OK) {
+ 				TRACE("%s: the speakers connected\n", fName.String());
+ 				remotePaused = false;
++				_SetAvailable(true);
+ 			}
+ 			continue;
+ 		}
+diff --git a/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.h b/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.h
+index aa12a16225..68d1762e00 100644
+--- a/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.h
++++ b/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.h
+@@ -98,6 +98,7 @@ private:
+ 			bool				_SoundSince(bigtime_t time);
+ 			bigtime_t			_SoundStarted();
+ 			void				_ControlPlayer(int32 button);
++			void				_SetAvailable(bool available);
+ 
+ private:
+ 			BluetoothAudioAddOn* fAddOn;
+@@ -128,6 +129,9 @@ private:
+ 			// how late the speakers play what they get: the latency of the
+ 			// output, so that video keeps time with the sound
+ 			bigtime_t			fOutputDelay;
++			bool				fAvailable;
++				// false: told the media server the speakers cannot be
++				// reached, so that the sound goes elsewhere meanwhile
+ 
+ 			float				fVolume;		// of the speakers, 0 to 1
+ 			bigtime_t			fVolumeChanged;
+diff --git a/src/add-ons/media/media-add-ons/bluetooth_audio/Jamfile b/src/add-ons/media/media-add-ons/bluetooth_audio/Jamfile
+index fe8d3651a3..02fe09f2cf 100644
+--- a/src/add-ons/media/media-add-ons/bluetooth_audio/Jamfile
++++ b/src/add-ons/media/media-add-ons/bluetooth_audio/Jamfile
+@@ -1,6 +1,6 @@
+ SubDir HAIKU_TOP src add-ons media media-add-ons bluetooth_audio ;
+ 
+-UsePrivateHeaders bluetooth shared ;
++UsePrivateHeaders bluetooth media shared ;
+ 
+ SubDirC++Flags -D__STDC_CONSTANT_MACROS ;
+ 
+diff --git a/src/servers/media/DefaultManager.cpp b/src/servers/media/DefaultManager.cpp
+index a59f0f47a5..33434543d7 100644
+--- a/src/servers/media/DefaultManager.cpp
++++ b/src/servers/media/DefaultManager.cpp
+@@ -61,6 +61,8 @@ DefaultManager::DefaultManager()
+ 	fRescanThread(-1),
+ 	fRescanRequested(0),
+ 	fRescanLock("rescan default manager"),
++	fUnavailableLock("default manager unavailable outputs"),
++	fUnavailableCount(0),
+ 	fRoster(NULL)
+ {
+ 	strcpy(fPhysicalAudioOutInputName, "default");
+@@ -361,6 +363,45 @@ DefaultManager::Get(media_node_id *nodeid, char *input_name, int32 *inputid,
+ 
+ // this is called by the media_server *after* the initial add-on loading
+ // has been done
++void
++DefaultManager::SetOutputAvailable(media_node_id node, bool available)
++{
++	{
++		BAutolock locker(fUnavailableLock);
++		int32 index = -1;
++		for (int32 i = 0; i < fUnavailableCount; i++) {
++			if (fUnavailable[i] == node)
++				index = i;
++		}
++		if (available == (index < 0))
++			return;
++		if (available)
++			fUnavailable[index] = fUnavailable[--fUnavailableCount];
++		else if (fUnavailableCount < kMaxUnavailable)
++			fUnavailable[fUnavailableCount++] = node;
++		else
++			return;
++	}
++	syslog(LOG_NOTICE, "media_server: output node %" B_PRId32 " %s\n", node,
++		available ? "can play again" : "cannot play for now");
++
++	// the rescan thread goes over to a stand-in, or back
++	Rescan();
++}
++
++
++bool
++DefaultManager::_IsUnavailable(media_node_id node)
++{
++	BAutolock locker(fUnavailableLock);
++	for (int32 i = 0; i < fUnavailableCount; i++) {
++		if (fUnavailable[i] == node)
++			return true;
++	}
++	return false;
++}
++
++
+ status_t
+ DefaultManager::Rescan()
+ {
+@@ -417,6 +458,23 @@ DefaultManager::_RescanThread()
+ 			_FindPhysical(&fPhysicalAudioIn, kMsgTypeAudioIn, true,
+ 				B_MEDIA_RAW_AUDIO);
+ 
++		// The output cannot play for now: another one stands in, as for
++		// a saved device that is absent, and the preference stays.
++		if (fPhysicalAudioOut != -1 && _IsUnavailable(fPhysicalAudioOut)) {
++			media_node_id standIn = -1;
++			_FindPhysical(&standIn, kMsgTypeAudioOut, false,
++				B_MEDIA_RAW_AUDIO);
++			if (standIn != -1 && standIn != fPhysicalAudioOut
++				&& !_IsUnavailable(standIn)) {
++				syslog(LOG_NOTICE, "media_server: the audio output cannot "
++					"play for now, the mixer goes over to another one\n");
++				fPhysicalAudioOut = standIn;
++				fUsingFallback[_TypeIndex(kMsgTypeAudioOut)] = true;
++				fMixerConnected = false;
++				fTimeSource = -1;
++			}
++		}
++
+ 		// A default that only stands in for an absent saved device goes
+ 		// back to that device once it has a node, e.g. a USB sound card
+ 		// plugged in after the media services started. The mixer is
+@@ -578,6 +636,10 @@ DefaultManager::_FindPhysical(volatile media_node_id *id, uint32 default_type,
+ 					continue;
+ 			}
+ 		}
++		// an output that cannot play for now is no candidate
++		if (_IsUnavailable(info[i].node.node))
++			continue;
++
+ 		if (firstReal < 0)
+ 			firstReal = i;
+ 
+diff --git a/src/servers/media/DefaultManager.h b/src/servers/media/DefaultManager.h
+index f619907a91..ea19b35e2a 100644
+--- a/src/servers/media/DefaultManager.h
++++ b/src/servers/media/DefaultManager.h
+@@ -42,6 +42,11 @@ public:
+ 									int32 *input_id, node_type type);
+ 			status_t			Rescan();
+ 
++			// An output that cannot play for now (Bluetooth speakers out of
++			// reach): while it is the default, another output stands in.
++			void				SetOutputAvailable(media_node_id node,
++									bool available);
++
+ 			void				Dump();
+ 
+ 			void 				CleanupTeam(team_id team);
+@@ -63,6 +68,7 @@ private:
+ 			// See _FindPhysical().
+ 			static	int32		_TypeIndex(uint32 defaultType);
+ 			BMessage*			_SavedDefault(uint32 defaultType) const;
++			bool				_IsUnavailable(media_node_id node);
+ 
+ private:
+ 			volatile bool 		fMixerConnected;
+@@ -91,6 +97,11 @@ private:
+ 			thread_id			fRescanThread;
+ 			int32 				fRescanRequested;
+ 			BLocker				fRescanLock;
++
++			static const int32	kMaxUnavailable = 8;
++			BLocker				fUnavailableLock;
++			media_node_id		fUnavailable[kMaxUnavailable];
++			int32				fUnavailableCount;
+ 			BMediaRoster*		fRoster;
+ };
+ 
+diff --git a/src/servers/media/NodeManager.cpp b/src/servers/media/NodeManager.cpp
+index 076545d776..9e729486fd 100644
+--- a/src/servers/media/NodeManager.cpp
++++ b/src/servers/media/NodeManager.cpp
+@@ -93,6 +93,14 @@ NodeManager::~NodeManager()
+ // #pragma mark - Default node management
+ 
+ 
++void
++NodeManager::SetOutputAvailable(media_node_id node, bool available)
++{
++	BAutolock _(this);
++	fDefaultManager->SetOutputAvailable(node, available);
++}
++
++
+ status_t
+ NodeManager::SetDefaultNode(node_type type, const media_node* node,
+ 	const dormant_node_info* info, const media_input* input)
+diff --git a/src/servers/media/NodeManager.h b/src/servers/media/NodeManager.h
+index fab52e4f08..f4d1214529 100644
+--- a/src/servers/media/NodeManager.h
++++ b/src/servers/media/NodeManager.h
+@@ -61,6 +61,8 @@ public:
+ 								~NodeManager();
+ 
+ 	// Management of system wide default nodes
++			void				SetOutputAvailable(media_node_id node,
++									bool available);
+ 			status_t			SetDefaultNode(node_type type,
+ 									const media_node* node,
+ 									const dormant_node_info* info,
+diff --git a/src/servers/media/media_server.cpp b/src/servers/media/media_server.cpp
+index 561eeec68a..c62f65f00c 100644
+--- a/src/servers/media/media_server.cpp
++++ b/src/servers/media/media_server.cpp
+@@ -944,6 +944,17 @@ ServerApp::MessageReceived(BMessage* msg)
+ 			gAppManager->NotifyRosters();
+ 			break;
+ 
++		case MEDIA_SERVER_SET_OUTPUT_AVAILABLE:
++		{
++			int32 node;
++			bool available;
++			if (msg->FindInt32("node", &node) == B_OK
++				&& msg->FindBool("available", &available) == B_OK) {
++				gNodeManager->SetOutputAvailable(node, available);
++			}
++			break;
++		}
++
+ 		case B_SOME_APP_QUIT:
+ 		{
+ 			BString mimeSig;
+-- 
+2.39.5
+

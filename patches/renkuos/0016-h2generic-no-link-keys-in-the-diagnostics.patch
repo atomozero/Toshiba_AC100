@@ -1,0 +1,48 @@
+From 172903e5dbf0ea865ce4d44b04e7389662bfdf26 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 10 Nov 2026 07:42:35 +0100
+Subject: [PATCH 16/42] h2generic: no link keys in the diagnostics
+
+With "diagnostics true", the events of the controller were written to
+the syslog with their first twelve bytes: a Link Key Notification gave
+six bytes of the new key with them. Of the events that carry link keys
+(Link Key Notification, Return Link Keys), only the address is written
+now.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../kernel/drivers/bluetooth/h2/h2generic/h2flow.cpp  | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/drivers/bluetooth/h2/h2generic/h2flow.cpp b/src/add-ons/kernel/drivers/bluetooth/h2/h2generic/h2flow.cpp
+index b6797364bd..ffdc73c2b6 100644
+--- a/src/add-ons/kernel/drivers/bluetooth/h2/h2generic/h2flow.cpp
++++ b/src/add-ons/kernel/drivers/bluetooth/h2/h2generic/h2flow.cpp
+@@ -46,6 +46,9 @@ static const uint8 kEventSimplePairingComplete = 0x36;
+ 
+ static const uint8 kEventConnectionComplete = 0x03;
+ static const uint8 kEventUserPasskeyRequest = 0x34;
++// events that carry link keys: never written to the syslog
++static const uint8 kEventReturnLinkKeys = 0x15;
++static const uint8 kEventLinkKeyNotification = 0x18;
+ 
+ // how long ACL data waits at most for a link to be secured: the controllers
+ // between them answer in a second or two, a person typing a PIN or checking
+@@ -521,7 +524,13 @@ acl_flow_one_event(bt_usb_dev* bdev, const uint8* event)
+ 			char line[64];
+ 			size_t used = 0;
+ 			line[0] = '\0';
+-			for (uint8 i = 0; i < size && i < 12; i++) {
++			// of an event with a key, the address only (the first one)
++			uint8 shown = 12;
++			if (event[0] == kEventLinkKeyNotification)
++				shown = 6;
++			else if (event[0] == kEventReturnLinkKeys)
++				shown = 1;
++			for (uint8 i = 0; i < size && i < shown; i++) {
+ 				used += snprintf(line + used, sizeof(line) - used, " %02x",
+ 					parameters[i]);
+ 			}
+-- 
+2.39.5
+

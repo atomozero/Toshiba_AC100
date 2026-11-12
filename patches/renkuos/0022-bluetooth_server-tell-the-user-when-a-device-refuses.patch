@@ -1,0 +1,86 @@
+From b7e64caf7af6a494adeb299b9cc620ce811df0d5 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 10 Nov 2026 07:43:03 +0100
+Subject: [PATCH 22/42] bluetooth_server: tell the user when a device refuses
+ its key
+
+A refused key is forgotten, and the device has to be paired again; it
+only showed in the syslog. A notification ("Pairing lost") now says so,
+and that the computer should be removed from the device's own list
+first, where it has one.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ data/catalogs/servers/bluetooth/it.catkeys |  4 +++-
+ src/servers/bluetooth/LocalDeviceImpl.cpp  |  1 +
+ src/servers/bluetooth/Notifications.cpp    | 12 ++++++++++++
+ src/servers/bluetooth/Notifications.h      |  2 ++
+ 4 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/data/catalogs/servers/bluetooth/it.catkeys b/data/catalogs/servers/bluetooth/it.catkeys
+index 294c21bafc..5856ea39d6 100644
+--- a/data/catalogs/servers/bluetooth/it.catkeys
++++ b/data/catalogs/servers/bluetooth/it.catkeys
+@@ -1,4 +1,4 @@
+-1	italian	x-vnd.Haiku-bluetooth_server	2483031756
++1	italian	x-vnd.Haiku-bluetooth_server	3365780737
+ Stopping the Bluetooth server failed.	BluetoothReplicant		Arresto del server Bluetooth non riuscito.
+ Bluetooth error	BluetoothReplicant		Errore bluetooth
+ Settings…	BluetoothReplicant		Impostazioni…
+@@ -27,3 +27,5 @@ Bluetooth pairing	Notifications		Associazione Bluetooth
+ Details…	BluetoothReplicant		Dettagli…
+ Use as audio output	BluetoothReplicant		Usa come uscita audio
+ Disconnect	BluetoothReplicant		Disconnetti
++Pairing lost	Notifications		Associazione persa
++%device% no longer accepts this computer. Remove the computer from the device's own list if it has one, then pair it again.	Notifications		%device% non accetta più questo computer. Se il dispositivo ha un suo elenco di dispositivi associati, togli il computer da lì, poi associalo di nuovo.
+diff --git a/src/servers/bluetooth/LocalDeviceImpl.cpp b/src/servers/bluetooth/LocalDeviceImpl.cpp
+index f2b76f9d0e..bfcaecac5a 100644
+--- a/src/servers/bluetooth/LocalDeviceImpl.cpp
++++ b/src/servers/bluetooth/LocalDeviceImpl.cpp
+@@ -2672,6 +2672,7 @@ LocalDeviceImpl::_ForgetRejectedKey(ServerRemoteDevice* rd, uint8 reason)
+ 		BluetoothError(reason));
+ 	rd->link_key = nullKey;
+ 	SaveRemoteDevices();
++	Notifications::KeyRefused(rd);
+ }
+ 
+ 
+diff --git a/src/servers/bluetooth/Notifications.cpp b/src/servers/bluetooth/Notifications.cpp
+index ca2fc31c53..76deddc27f 100644
+--- a/src/servers/bluetooth/Notifications.cpp
++++ b/src/servers/bluetooth/Notifications.cpp
+@@ -99,6 +99,18 @@ Notifications::Paired(const ServerRemoteDevice* device, bool success)
+ }
+ 
+ 
++void
++Notifications::KeyRefused(const ServerRemoteDevice* device)
++{
++	if (device == NULL)
++		return;
++	Send(device, B_ERROR_NOTIFICATION, B_TRANSLATE("Pairing lost"),
++		B_TRANSLATE("%device% no longer accepts this computer. Remove the "
++			"computer from the device's own list if it has one, then pair it "
++			"again."));
++}
++
++
+ namespace {
+ 
+ // the window of the pairing under way, if any: a messenger, as the window
+diff --git a/src/servers/bluetooth/Notifications.h b/src/servers/bluetooth/Notifications.h
+index 3a98ea77ba..3869b97144 100644
+--- a/src/servers/bluetooth/Notifications.h
++++ b/src/servers/bluetooth/Notifications.h
+@@ -25,6 +25,8 @@ namespace Notifications {
+ void	Connected(const ServerRemoteDevice* device);
+ void	Disconnected(const ServerRemoteDevice* device);
+ void	Paired(const ServerRemoteDevice* device, bool success);
++// the device refused the key kept for it: it has to be paired again
++void	KeyRefused(const ServerRemoteDevice* device);
+ 
+ // a pairing that needs the user: the number both devices show, to compare,
+ // or the one to type on a keyboard. Closed when the pairing ends.
+-- 
+2.39.5
+

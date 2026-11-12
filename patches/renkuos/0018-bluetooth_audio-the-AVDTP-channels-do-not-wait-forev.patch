@@ -1,0 +1,182 @@
+From 5c8629762e01f7edccc5111a39c19ea1c3e474e8 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 10 Nov 2026 07:42:35 +0100
+Subject: [PATCH 18/42] bluetooth_audio: the AVDTP channels do not wait forever
+
+The sockets had a receive timeout only. connect() and send() wait as long
+as the send timeout says, which was none: a send() to speakers that took
+nothing more kept the node from noticing until the link itself went, and
+closing the media channel waited 30 s for speakers that were gone.
+
+A connection now waits 10 s at most (the link may be secured first), the
+media channel 2 s for room and for its closing. A2dpSource::SetQuitFlag()
+lets the 20 tries of a connection stop when the node goes.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../bluetooth_audio/A2dpSource.cpp            |  3 +-
+ .../bluetooth_audio/A2dpSource.h              |  4 ++
+ .../bluetooth_audio/AvdtpSession.cpp          | 52 ++++++++++++++-----
+ .../bluetooth_audio/AvdtpSession.h            |  1 +
+ 4 files changed, 46 insertions(+), 14 deletions(-)
+
+diff --git a/src/add-ons/media/media-add-ons/bluetooth_audio/A2dpSource.cpp b/src/add-ons/media/media-add-ons/bluetooth_audio/A2dpSource.cpp
+index e051cf5c4a..ae09f4a75d 100644
+--- a/src/add-ons/media/media-add-ons/bluetooth_audio/A2dpSource.cpp
++++ b/src/add-ons/media/media-add-ons/bluetooth_audio/A2dpSource.cpp
+@@ -62,6 +62,7 @@ A2dpSource::A2dpSource()
+ 	fStreamStartTime(0),
+ 	fTotalSamplesSent(0),
+ 	fPacingEnabled(true),
++	fQuit(NULL),
+ 	fNegSampleRate(44100),
+ 	fNegChannels(2),
+ 	fNegBlocks(16),
+@@ -126,7 +127,7 @@ A2dpSource::_Connect(const bdaddr_t& address, bool page)
+ 		err = fAvdtp->Connect(address);
+ 		if (err == B_OK)
+ 			break;
+-		if (!page)
++		if (!page || (fQuit != NULL && *fQuit))
+ 			break;
+ 		TRACE_A2DP("AVDTP not yet there (try %d), waiting\n", attempt + 1);
+ 		snooze(1000000);
+diff --git a/src/add-ons/media/media-add-ons/bluetooth_audio/A2dpSource.h b/src/add-ons/media/media-add-ons/bluetooth_audio/A2dpSource.h
+index 61b53f5414..31a057e748 100644
+--- a/src/add-ons/media/media-add-ons/bluetooth_audio/A2dpSource.h
++++ b/src/add-ons/media/media-add-ons/bluetooth_audio/A2dpSource.h
+@@ -73,6 +73,9 @@ public:
+ 
+ 	void						SetPacingEnabled(bool enabled)
+ 								    { fPacingEnabled = enabled; }
++	/* Connect() gives up when *quit becomes true (the owner goes) */
++	void						SetQuitFlag(const volatile bool* quit)
++								    { fQuit = quit; }
+ 
+ 	/* Stream info (valid after Connect) */
+ 	uint32						SampleRate() const;
+@@ -112,6 +115,7 @@ private:
+ 	bigtime_t					fStreamStartTime;
+ 	uint64						fTotalSamplesSent;
+ 	bool						fPacingEnabled;
++	const volatile bool*		fQuit;
+ 
+ 	/* Negotiated SBC parameters (set by _NegotiateCodec) */
+ 	uint32						fNegSampleRate;
+diff --git a/src/add-ons/media/media-add-ons/bluetooth_audio/AvdtpSession.cpp b/src/add-ons/media/media-add-ons/bluetooth_audio/AvdtpSession.cpp
+index 25d1dc5085..28bb82791a 100644
+--- a/src/add-ons/media/media-add-ons/bluetooth_audio/AvdtpSession.cpp
++++ b/src/add-ons/media/media-add-ons/bluetooth_audio/AvdtpSession.cpp
+@@ -23,6 +23,26 @@
+ 	fprintf(stderr, "AVDTP: " fmt, ##__VA_ARGS__)
+ 
+ 
++// How long a channel waits for the device to answer a connection: the link
++// may be authenticated and encrypted first. The kernel takes the send
++// timeout for connect() too.
++static const bigtime_t kConnectTimeout = 10000000;
++// How long the media channel may stay full: speakers that take nothing
++// more for that long are gone, or stuck; a send() that waited for them
++// kept the node from noticing until the link itself went
++static const bigtime_t kMediaSendTimeout = 2000000;
++
++
++static void
++set_timeout(int socket, int option, bigtime_t timeout)
++{
++	struct timeval tv;
++	tv.tv_sec = timeout / 1000000;
++	tv.tv_usec = timeout % 1000000;
++	setsockopt(socket, SOL_SOCKET, option, &tv, sizeof(tv));
++}
++
++
+ AvdtpSession::AvdtpSession()
+ 	:
+ 	fListenSocket(-1),
+@@ -65,12 +85,8 @@ AvdtpSession::Connect(const bdaddr_t& remote)
+ 		return B_ERROR;
+ 	}
+ 
+-	/* Set 10-second receive timeout */
+-	struct timeval tv;
+-	tv.tv_sec = 10;
+-	tv.tv_usec = 0;
+-	setsockopt(fSignalingSocket, SOL_SOCKET, SO_RCVTIMEO, &tv,
+-		sizeof(tv));
++	set_timeout(fSignalingSocket, SO_RCVTIMEO, 10000000);
++	set_timeout(fSignalingSocket, SO_SNDTIMEO, kConnectTimeout);
+ 
+ 	/* Connect to remote AVDTP PSM (0x0019) */
+ 	struct sockaddr_l2cap addr;
+@@ -472,11 +488,7 @@ AvdtpSession::OpenMediaChannel(const bdaddr_t& remote)
+ 		return B_ERROR;
+ 	}
+ 
+-	/* Longer timeout for media — 30 seconds */
+-	struct timeval tv;
+-	tv.tv_sec = 30;
+-	tv.tv_usec = 0;
+-	setsockopt(fMediaSocket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++	set_timeout(fMediaSocket, SO_SNDTIMEO, kConnectTimeout);
+ 
+ 	struct sockaddr_l2cap addr;
+ 	memset(&addr, 0, sizeof(addr));
+@@ -495,10 +507,23 @@ AvdtpSession::OpenMediaChannel(const bdaddr_t& remote)
+ 	}
+ 
+ 	TRACE_AVDTP("Media transport channel connected.\n");
++	_SetMediaTimeouts();
+ 	return B_OK;
+ }
+ 
+ 
++/*!	Nothing is read from the media channel: the receive timeout only bounds
++	how long closing it waits for the device to confirm, which speakers that
++	are gone never do.
++*/
++void
++AvdtpSession::_SetMediaTimeouts()
++{
++	set_timeout(fMediaSocket, SO_SNDTIMEO, kMediaSendTimeout);
++	set_timeout(fMediaSocket, SO_RCVTIMEO, kMediaSendTimeout);
++}
++
++
+ /* =========================================================================
+  * Private helpers
+  * ========================================================================= */
+@@ -868,8 +893,8 @@ AvdtpSession::_Accept(int* fd, bigtime_t timeout)
+ 			return B_TIMED_OUT;
+ 	}
+ 	// it may have taken the short timeout of the listening socket
+-	struct timeval tv = { 10, 0 };
+-	setsockopt(*fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++	set_timeout(*fd, SO_RCVTIMEO, 10000000);
++	set_timeout(*fd, SO_SNDTIMEO, kConnectTimeout);
+ 	if (fSignalingSocket < 0)
+ 		memcpy(&fRemoteAddr, &peer.l2cap_bdaddr, sizeof(bdaddr_t));
+ 	return B_OK;
+@@ -944,6 +969,7 @@ AvdtpSession::WaitForStream(bigtime_t timeout, bdaddr_t* remote)
+ 		return status;
+ 	}
+ 	TRACE_AVDTP("The device connected the media channel\n");
++	_SetMediaTimeouts();
+ 	return B_OK;
+ }
+ 
+diff --git a/src/add-ons/media/media-add-ons/bluetooth_audio/AvdtpSession.h b/src/add-ons/media/media-add-ons/bluetooth_audio/AvdtpSession.h
+index b6d2f8ed9b..d3531a2c31 100644
+--- a/src/add-ons/media/media-add-ons/bluetooth_audio/AvdtpSession.h
++++ b/src/add-ons/media/media-add-ons/bluetooth_audio/AvdtpSession.h
+@@ -107,6 +107,7 @@ private:
+ 									size_t paramLen);
+ 
+ 	status_t					_Accept(int* socket, bigtime_t timeout);
++	void						_SetMediaTimeouts();
+ 
+ 	int							fListenSocket;
+ 	int							fSignalingSocket;
+-- 
+2.39.5
+

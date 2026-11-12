@@ -1,0 +1,403 @@
+From 4f24b9f6a738ae009392910af0f476c8d534734c Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Wed, 11 Nov 2026 22:29:14 +0100
+Subject: [PATCH 35/42] tegra20_cpufreq: a governor that follows the load
+
+A kernel thread looks at the load of the CPUs every 50 ms (the busier
+one, as both share the clock) and follows the scheduler's mode:
+- low latency, the default: above 80 % load the highest rate at once,
+  after 150 ms below 30 % one rate down, not below 456 MHz;
+- power saving: one rate up above 80 %, one down after 150 ms below 30 %,
+  down to 216 MHz.
+
+The scheduler calls the cpufreq hooks on every context switch, with
+interrupts disabled, while the thread leaving the CPU is still the
+current one: they now count the userland threads of real time priority.
+When they run often (3 times in 50 ms: audio or video playing, the mouse
+moving), the governor stays at 760 MHz at least (456 MHz in power
+saving) for a second, so that playback does not stutter while the rate
+catches up. A single periodic thread does not count.
+
+"cclk <MHz>" through tegra_dvfs stops the governor at that rate, "cclk
+auto" starts it again; "governor false" in the driver settings keeps the
+CPUs at full speed. Reading tegra_dvfs shows the load, the real time
+runs, the changes and the seconds spent at each rate.
+
+On the Toshiba AC100 the CPUs now idle at 456 MHz and 825 mV instead of
+1 GHz and 1.1 V (about 0.35 W less, measured with the rates fixed), and
+reach 1 GHz within a sample under load.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../drivers/power/tegra_dvfs/tegra_dvfs.cpp   |   3 +-
+ .../tegra20_cpufreq/tegra20_cpufreq.cpp       | 252 +++++++++++++++++-
+ 2 files changed, 244 insertions(+), 11 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp b/src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp
+index e3334d957a..c9304ba2d4 100644
+--- a/src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp
++++ b/src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp
+@@ -14,7 +14,8 @@
+ 
+ 	Writing "cclk <MHz>" asks the cpufreq module (tegra20_cpufreq) for an
+ 	operating point: the CPU clock with the CPU supply the fuses of the chip
+-	allow for it. Reading shows its state too.
++	allow for it, and stops its governor; "cclk auto" starts the governor
++	again. Reading shows its state too.
+ */
+ 
+ 
+diff --git a/src/add-ons/kernel/power/cpufreq/tegra20_cpufreq/tegra20_cpufreq.cpp b/src/add-ons/kernel/power/cpufreq/tegra20_cpufreq/tegra20_cpufreq.cpp
+index 862c8e1be4..b2f64869eb 100644
+--- a/src/add-ons/kernel/power/cpufreq/tegra20_cpufreq/tegra20_cpufreq.cpp
++++ b/src/add-ons/kernel/power/cpufreq/tegra20_cpufreq/tegra20_cpufreq.cpp
+@@ -18,10 +18,25 @@
+ 	The CPU timer events come from the Cortex-A9 private timers, which run at
+ 	a quarter of the CPU clock: every change tells the kernel the new rate.
+ 
+-	For now the rate is only chosen by hand, through tegra_dvfs
+-	("cclk <MHz>"); the kernel's hooks do nothing yet. "disabled true" in
+-	~/config/settings/kernel/drivers/tegra20_cpufreq keeps the module from
+-	loading.
++	A governor thread looks at the load of the CPUs every 50 ms (the busier
++	one counts, as both share the clock) and follows the scheduler's mode,
++	as ProcessController sets it:
++	- low latency (the default): above 80 % load the highest rate at once;
++	  after 150 ms below 30 % one rate down, not below 456 MHz;
++	- power saving: one rate up above 80 %, one down after 150 ms below
++	  30 %, down to 216 MHz.
++	While userland threads of real time priority run often (at least 3 times
++	in 50 ms: playing audio or video, moving the mouse), and for a second
++	after, it stays at 760 MHz at least (456 MHz in power saving). A single
++	periodic thread does not count: a media time source publishing its time
++	every 50 ms runs as long as the output is connected, also in silence. The
++	scheduler's hooks only count the runs, they run with interrupts disabled.
++
++	Writing "cclk <MHz>" to tegra_dvfs chooses a rate by hand and stops the
++	governor, "cclk auto" starts it again. In the driver settings
++	(~/config/settings/kernel/drivers/tegra20_cpufreq), "governor false"
++	leaves the CPUs at full speed until a rate is chosen by hand, and
++	"disabled true" keeps the module from loading.
+ */
+ 
+ 
+@@ -34,6 +49,11 @@
+ #include <lock.h>
+ #include <util/AutoLock.h>
+ 
++#include <cpu.h>
++#include <smp.h>
++#include <team.h>
++#include <thread.h>
++
+ #include <libfdt.h>
+ 
+ #include <tegra20_cpufreq.h>
+@@ -178,6 +198,28 @@ static uint32 sSpeedo;
+ static uint32 sTWDBaseFrequency;	// the private timer rate at sBaseKHz
+ static uint32 sBaseKHz;
+ static enum scheduler_mode sSchedulerMode = SCHEDULER_MODE_LOW_LATENCY;
++static int32 sCurrent;					// index into sPoints
++
++// governor
++#define GOVERNOR_INTERVAL			50000
++#define HIGH_LOAD					80		// percent
++#define LOW_LOAD					30
++#define LOW_LOAD_SAMPLES			3		// before going one rate down
++#define REAL_TIME_HOLD				1000000
++#define REAL_TIME_RUNS				3		// in one interval: media playing
++#define LOW_LATENCY_FLOOR_MHZ		456
++#define POWER_SAVING_FLOOR_MHZ		216
++#define REAL_TIME_FLOOR_MHZ			760
++#define REAL_TIME_POWER_SAVING_MHZ	456
++
++static thread_id sGovernor = -1;
++static volatile bool sGovernorQuit;
++static volatile bool sAutomatic;
++static int32 sRealTimeRuns;			// userland real time threads seen
++static int32 sLastLoad;
++static int32 sLastRealTimeRuns;		// in the last interval
++static bigtime_t sTimeAt[RATE_COUNT];
++static uint32 sChanges;
+ 
+ 
+ //	#pragma mark - fuses
+@@ -270,6 +312,17 @@ choose_operating_points()
+ }
+ 
+ 
++static int32
++find_index(uint32 mhz)
++{
++	for (int32 i = 0; i < sPointCount; i++) {
++		if (sPoints[i].mhz == mhz)
++			return i;
++	}
++	return -1;
++}
++
++
+ static const operating_point*
+ find_point(uint32 mhz)
+ {
+@@ -477,15 +530,14 @@ set_cpu_clock(uint32 mhz)
+ //	#pragma mark - interface
+ 
+ 
++/*!	Moves to the operating point for \a mhz. sLock must be held. */
+ static status_t
+-set_frequency(uint32 mhz)
++set_point_locked(uint32 mhz)
+ {
+ 	const operating_point* point = find_point(mhz);
+ 	if (point == NULL)
+ 		return B_BAD_VALUE;
+ 
+-	MutexLocker locker(sLock);
+-
+ 	uint32 currentMHz = cpu_clock_khz() / 1000;
+ 	const operating_point* current = find_point(currentMHz);
+ 	if (current == NULL) {
+@@ -519,10 +571,31 @@ set_frequency(uint32 mhz)
+ 
+ 	TRACE("%" B_PRIu32 " MHz, %" B_PRIu32 " mV\n", point->mhz,
+ 		point->millivolts);
++	sCurrent = find_index(point->mhz);
++	sChanges++;
+ 	return B_OK;
+ }
+ 
+ 
++/*!	\a mhz = 0 hands the rate to the governor; any other rate of the table
++	is kept until the governor gets it back.
++*/
++static status_t
++set_frequency(uint32 mhz)
++{
++	if (mhz == 0) {
++		sAutomatic = sGovernor >= 0;
++		return sAutomatic ? B_OK : B_NOT_SUPPORTED;
++	}
++
++	MutexLocker locker(sLock);
++	if (find_point(mhz) == NULL)
++		return B_BAD_VALUE;
++	sAutomatic = false;
++	return set_point_locked(mhz);
++}
++
++
+ static uint32
+ frequency()
+ {
+@@ -552,7 +625,18 @@ describe(char* buffer, size_t size)
+ 			sPoints[i].mhz, sPoints[i].millivolts);
+ 	}
+ 	length += snprintf(buffer + min_c(length, size), size - min_c(length, size),
+-		" MHz/mV\n");
++		" MHz/mV\ngovernor: %s, load %" B_PRId32 " %%, real time runs %"
++		B_PRId32 ", %" B_PRIu32 " changes; seconds at each rate:",
++		sGovernor < 0 ? "off"
++			: sAutomatic ? "on" : "stopped (rate chosen by hand)",
++		sLastLoad, sLastRealTimeRuns, sChanges);
++	for (int32 i = 0; i < sPointCount; i++) {
++		length += snprintf(buffer + min_c(length, size),
++			size - min_c(length, size), " %" B_PRIu32 ":%" B_PRId64,
++			sPoints[i].mhz, sTimeAt[i] / 1000000);
++	}
++	length += snprintf(buffer + min_c(length, size), size - min_c(length, size),
++		"\n");
+ 	return min_c(length, size);
+ }
+ 
+@@ -564,12 +648,26 @@ set_scheduler_mode(enum scheduler_mode mode)
+ }
+ 
+ 
+-/*!	Called by the scheduler, with interrupts disabled: nothing may be done
+-	here but noting the request. The governor comes later.
++/*!	The scheduler calls these on every context switch, with interrupts
++	disabled, while the thread leaving the CPU is still the current one: they
++	only note whether it is a userland thread of real time priority (audio,
++	video, input). The governor decides on its own.
+ */
++static inline void
++note_thread()
++{
++	Thread* thread = thread_get_current_thread();
++	if (thread != NULL && thread->priority >= B_REAL_TIME_DISPLAY_PRIORITY
++		&& thread->team != team_get_kernel_team()) {
++		atomic_add(&sRealTimeRuns, 1);
++	}
++}
++
++
+ static status_t
+ increase_performance(int delta)
+ {
++	note_thread();
+ 	return B_OK;
+ }
+ 
+@@ -577,16 +675,148 @@ increase_performance(int delta)
+ static status_t
+ decrease_performance(int delta)
+ {
++	note_thread();
++	return B_OK;
++}
++
++
++//	#pragma mark - governor
++
++
++/*!	The load of the busier CPU since the last call, in percent. */
++static int32
++cpu_load(bigtime_t* lastActive, bigtime_t& lastTime)
++{
++	bigtime_t now = system_time();
++	bigtime_t elapsed = now - lastTime;
++	lastTime = now;
++
++	int32 load = 0;
++	int32 count = min_c(smp_get_num_cpus(), SMP_MAX_CPUS);
++	for (int32 i = 0; i < count; i++) {
++		bigtime_t active = cpu_get_active_time(i);
++		bigtime_t busy = active - lastActive[i];
++		lastActive[i] = active;
++		if (gCPU[i].disabled || elapsed <= 0)
++			continue;
++		int32 cpuLoad = (int32)(busy * 100 / elapsed);
++		if (cpuLoad > load)
++			load = cpuLoad;
++	}
++	return min_c(load, 100);
++}
++
++
++static int32
++index_at_least(uint32 mhz)
++{
++	for (int32 i = 0; i < sPointCount; i++) {
++		if (sPoints[i].mhz >= mhz)
++			return i;
++	}
++	return sPointCount - 1;
++}
++
++
++static status_t
++governor_thread(void*)
++{
++	bigtime_t lastActive[SMP_MAX_CPUS];
++	bigtime_t lastTime = system_time();
++	for (int32 i = 0; i < SMP_MAX_CPUS; i++)
++		lastActive[i] = i < smp_get_num_cpus() ? cpu_get_active_time(i) : 0;
++
++	int32 lowSamples = 0;
++	int32 lastRealTimeRuns = atomic_get(&sRealTimeRuns);
++	bigtime_t realTimeUntil = 0;
++	bigtime_t lastAccount = system_time();
++
++	while (!sGovernorQuit) {
++		snooze(GOVERNOR_INTERVAL);
++
++		int32 load = cpu_load(lastActive, lastTime);
++		sLastLoad = load;
++		bigtime_t now = system_time();
++
++		int32 realTimeRuns = atomic_get(&sRealTimeRuns);
++		sLastRealTimeRuns = realTimeRuns - lastRealTimeRuns;
++		lastRealTimeRuns = realTimeRuns;
++		if (sLastRealTimeRuns >= REAL_TIME_RUNS)
++			realTimeUntil = now + REAL_TIME_HOLD;
++
++		MutexLocker locker(sLock);
++		sTimeAt[sCurrent] += now - lastAccount;
++		lastAccount = now;
++		if (!sAutomatic)
++			continue;
++
++		bool powerSaving = sSchedulerMode == SCHEDULER_MODE_POWER_SAVING;
++		int32 floor = index_at_least(powerSaving
++			? POWER_SAVING_FLOOR_MHZ : LOW_LATENCY_FLOOR_MHZ);
++		if (now < realTimeUntil) {
++			floor = max_c(floor, index_at_least(powerSaving
++				? REAL_TIME_POWER_SAVING_MHZ : REAL_TIME_FLOOR_MHZ));
++		}
++		int32 highest = sPointCount - 1;
++
++		int32 target = sCurrent;
++		if (load > HIGH_LOAD) {
++			lowSamples = 0;
++			target = powerSaving ? sCurrent + 1 : highest;
++		} else if (load < LOW_LOAD) {
++			if (++lowSamples >= LOW_LOAD_SAMPLES) {
++				lowSamples = 0;
++				target = sCurrent - 1;
++			}
++		} else
++			lowSamples = 0;
++
++		target = max_c(floor, min_c(target, highest));
++		if (target != sCurrent)
++			set_point_locked(sPoints[target].mhz);
++	}
+ 	return B_OK;
+ }
+ 
+ 
++static void
++start_governor()
++{
++	void* settings = load_driver_settings("tegra20_cpufreq");
++	bool enabled = get_driver_boolean_parameter(settings, "governor", true,
++		true);
++	unload_driver_settings(settings);
++
++	sGovernorQuit = false;
++	sGovernor = spawn_kernel_thread(&governor_thread, "tegra20 cpufreq",
++		B_REAL_TIME_DISPLAY_PRIORITY, NULL);
++	if (sGovernor < 0)
++		return;
++	sAutomatic = enabled;
++	resume_thread(sGovernor);
++}
++
++
++static void
++stop_governor()
++{
++	if (sGovernor < 0)
++		return;
++	sGovernorQuit = true;
++	status_t result;
++	wait_for_thread(sGovernor, &result);
++	sGovernor = -1;
++	sAutomatic = false;
++}
++
++
+ //	#pragma mark - module
+ 
+ 
+ static void
+ uninit()
+ {
++	stop_governor();
+ 	delete_area(sCARArea);
+ 	sCARArea = -1;
+ 	sCAR = NULL;
+@@ -639,7 +869,9 @@ init()
+ 	}
+ 	sBaseKHz = khz;
+ 	sTWDBaseFrequency = tegra_twd_frequency();
++	sCurrent = find_index(khz / 1000);
+ 	arm_set_cpu_frequency((uint64)khz * 1000);
++	start_governor();
+ 
+ 	TRACE_ALWAYS("CPU at %" B_PRIu32 " MHz, %" B_PRIu32 " mV; %" B_PRId32
+ 		" operating points\n", khz / 1000, millivolts, sPointCount);
+-- 
+2.39.5
+

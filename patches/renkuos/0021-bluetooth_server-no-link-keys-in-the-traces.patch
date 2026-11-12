@@ -1,0 +1,46 @@
+From bee3234941d6f39c78e1b5048986ea593c58b8ce Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 10 Nov 2026 07:43:03 +0100
+Subject: [PATCH 21/42] bluetooth_server: no link keys in the traces
+
+The traces of a Link Key Notification and of Return Link Keys printed the
+keys, and the server's traces are always on: whatever collects its output
+had them. They give the address now, and the key type.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/servers/bluetooth/LocalDeviceImpl.cpp | 11 +++++------
+ 1 file changed, 5 insertions(+), 6 deletions(-)
+
+diff --git a/src/servers/bluetooth/LocalDeviceImpl.cpp b/src/servers/bluetooth/LocalDeviceImpl.cpp
+index 4c90740990..f2b76f9d0e 100644
+--- a/src/servers/bluetooth/LocalDeviceImpl.cpp
++++ b/src/servers/bluetooth/LocalDeviceImpl.cpp
+@@ -2311,9 +2311,9 @@ void
+ LocalDeviceImpl::LinkKeyNotify(hci_ev_link_key_notify* event,
+ 	BMessage* request)
+ {
+-	TRACE_BT("LocalDeviceImpl: %s: Address %s, key=%s, type=%d\n", __FUNCTION__,
+-		bdaddrUtils::ToString(event->bdaddr).String(),
+-		LinkKeyUtils::ToString(event->link_key).String(), event->key_type);
++	// never the key itself: the output of the server may end in a log
++	TRACE_BT("LocalDeviceImpl: %s: Address %s, type=%d\n", __FUNCTION__,
++		bdaddrUtils::ToString(event->bdaddr).String(), event->key_type);
+ 
+ 	if (request != NULL)
+ 		ClearWantedEvent(request);
+@@ -2399,9 +2399,8 @@ LocalDeviceImpl::ReturnLinkKeys(struct hci_ev_return_link_keys* returnedKeys)
+ 
+ 	while (numKeys > 0) {
+ 
+-		TRACE_BT("LocalDeviceImpl: Address=%s key=%s\n",
+-			bdaddrUtils::ToString(linkKeys->bdaddr).String(),
+-			LinkKeyUtils::ToString(linkKeys->link_key).String());
++		TRACE_BT("LocalDeviceImpl: key returned for %s\n",
++			bdaddrUtils::ToString(linkKeys->bdaddr).String());
+ 
+ 		linkKeys++;
+ 		numKeys--;
+-- 
+2.39.5
+

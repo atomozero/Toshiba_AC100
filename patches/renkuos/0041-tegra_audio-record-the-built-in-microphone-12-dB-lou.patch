@@ -1,0 +1,38 @@
+From 797e35a585ced48f7a55309ede0f36e26a28d03c Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Thu, 12 Nov 2026 20:57:54 +0100
+Subject: [PATCH 41/42] tegra_audio: record the built-in microphone 12 dB
+ louder by default
+
+The built-in digital microphone only follows its boost: the record gain
+of the ALC5632 is that of the analog path and barely changes its level
+(measured with tests/ac100diag/mictest: -40 dBFS of room noise at +0 and
+-39 at +13.5 dB of record gain, with the boost at +18 dB). Speech came out
+quiet at the +12 dB it had; it now starts at +24 dB, with the room noise
+around -36 dBFS. The Boost control of the Media preferences still
+changes it.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp b/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
+index d2c21a6b81..a004635089 100644
+--- a/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
++++ b/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
+@@ -2195,7 +2195,10 @@ tegra_audio_init_driver(device_node* node, void** _cookie)
+ 
+ 	// recording: the built-in microphone, 0 dB, no boost
+ 	audio->recordLevel[0] = audio->recordLevel[1] = 11;
+-	audio->micBoost = 2;
++	// The built-in digital microphone only follows the boost (the record
++	// gain is that of the analog path): +24 dB gives speech a good level,
++	// with the room noise around -36 dBFS
++	audio->micBoost = 4;
+ 	audio->inputSource = 0;
+ 	audio->recordInterruptInstalled = install_io_interrupt_handler(
+ 		RECORD_DMA_CHANNEL_IRQ, record_dma_interrupt, audio, 0) == B_OK;
+-- 
+2.39.5
+

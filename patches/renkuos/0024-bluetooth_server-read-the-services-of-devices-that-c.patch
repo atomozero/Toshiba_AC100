@@ -1,0 +1,95 @@
+From 5ad582d601c8593ae516e20ec006513a3232755a Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 10 Nov 2026 07:43:04 +0100
+Subject: [PATCH 24/42] bluetooth_server: read the services of devices that
+ connect to us
+
+The services of a device were read only on links we opened. A speaker
+paired as it connected to us was never known as an Audio Sink, and the
+Deskbar offered no audio output for it. They are now read once on such a
+link too, when they are not known yet; the device opens its channels
+itself, so nothing else is started.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/servers/bluetooth/BluetoothServer.cpp | 23 +++++++++++++++++++++++
+ src/servers/bluetooth/BluetoothServer.h   |  3 +++
+ src/servers/bluetooth/LocalDeviceImpl.cpp |  5 ++++-
+ 3 files changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/src/servers/bluetooth/BluetoothServer.cpp b/src/servers/bluetooth/BluetoothServer.cpp
+index 80e9bd3fc0..0b4acdb76e 100644
+--- a/src/servers/bluetooth/BluetoothServer.cpp
++++ b/src/servers/bluetooth/BluetoothServer.cpp
+@@ -572,6 +572,29 @@ BluetoothServer::StartServices(ServerRemoteDevice* rd)
+ }
+ 
+ 
++/*!	Reads the services of a device that connected to us, which opens its
++	channels itself: what it offers is known all the same. A pair of speakers
++	paired when they connected was not known as such (an Audio Sink), and
++	the Deskbar offered no audio output for it.
++*/
++void
++BluetoothServer::ReadServices(ServerRemoteDevice* rd)
++{
++	thread_id thread = spawn_thread(_ReadServicesThread,
++		"bluetooth services", B_NORMAL_PRIORITY, rd);
++	if (thread >= 0)
++		resume_thread(thread);
++}
++
++
++/*static*/ status_t
++BluetoothServer::_ReadServicesThread(void* data)
++{
++	((BluetoothServer*)be_app)->DiscoverServices((ServerRemoteDevice*)data);
++	return B_OK;
++}
++
++
+ /*static*/ status_t
+ BluetoothServer::_ServicesThread(void* data)
+ {
+diff --git a/src/servers/bluetooth/BluetoothServer.h b/src/servers/bluetooth/BluetoothServer.h
+index aee26d9580..34fb175e74 100644
+--- a/src/servers/bluetooth/BluetoothServer.h
++++ b/src/servers/bluetooth/BluetoothServer.h
+@@ -81,6 +81,8 @@ public:
+ 
+ 	void		NotifyWatchers(BMessage* notice);
+ 	void		StartServices(ServerRemoteDevice* rd);
++	// only reads them, for a device that connected to us
++	void		ReadServices(ServerRemoteDevice* rd);
+ 	void		DiscoverServices(ServerRemoteDevice* rd);
+ 	void		NotifyServices(ServerRemoteDevice* rd);
+ 
+@@ -95,6 +97,7 @@ public:
+ private:
+ 
+ 	static status_t		_ServicesThread(void* data);
++	static status_t		_ReadServicesThread(void* data);
+ 
+ 	void				_AddLocalDevice(const char* path);
+ 	void				_RemoveLocalDevice(LocalDeviceImpl* device);
+diff --git a/src/servers/bluetooth/LocalDeviceImpl.cpp b/src/servers/bluetooth/LocalDeviceImpl.cpp
+index 79460d6e3a..9ba36f941c 100644
+--- a/src/servers/bluetooth/LocalDeviceImpl.cpp
++++ b/src/servers/bluetooth/LocalDeviceImpl.cpp
+@@ -2767,9 +2767,12 @@ LocalDeviceImpl::_LinkSecured(ServerRemoteDevice* rd)
+ 	if (rd->outgoing)
+ 		((BluetoothServer*)be_app)->StartServices(rd);
+ 	else {
+-		// a device that connects to us opens its channels itself
++		// a device that connects to us opens its channels itself; what it
++		// offers is read once, if it is not known yet
+ 		TRACE_BT("LocalDeviceImpl: %s connected to us\n",
+ 			bdaddrUtils::ToString(rd->bdaddr).String());
++		if (rd->serviceClassCount == 0)
++			((BluetoothServer*)be_app)->ReadServices(rd);
+ 	}
+ }
+ 
+-- 
+2.39.5
+

@@ -1,0 +1,169 @@
+# The AC100 commits of hrev60107+736 on RenkuOS main d8089a1293, oldest first.
+# 0001-AC100-tree-at-the-merge-of-RenkuOS-main-d8089a1293.patch holds the ones before
+# the merge of RenkuOS main (44abc33fbb); 0002 to 0042 are the ones after it, one each.
+
+763a639c5f 2026-10-20 ARM: link kernel and loader against the cross-compiler libgcc
+2ac377c2cd 2026-10-20 ARM: link libroot and applications against the cross-compiler libsupc++ and libgcc
+17196fd9da 2026-10-20 libroot/arm: provide __gnu_Unwind_Find_exidx() for C++ exceptions
+f43c443a06 2026-10-20 SupportDefs: use a strong compare-and-swap in atomic_test_and_set()
+d98df80762 2026-10-20 AddOnMonitorHandler: don't treat add-ons from the future as unstable
+81ac40851c 2026-10-20 BMessage: do not print fields from unaligned data in place
+12959271b9 2026-10-20 device_manager: get_next_child_node() continues after the last node
+988b542bbc 2026-10-20 media: do not access unaligned data in place
+3265cec892 2026-10-20 media: copy structures out of messages before using them
+be166ef7bd 2026-10-26 media: no unaligned access to a flattened BParameterWeb
+84523cc0cf 2026-10-26 libicon: no unaligned access to archived matrices
+5ae0dde883 2026-10-20 Cortex: copy media structures out of messages before using them
+503316c39d 2026-10-24 libroot: uname() reports RenkuOS as the system name
+ce559f03eb 2026-10-20 kernel/vfs: wait for the boot device to show up
+85143ce4ee 2026-09-17 freebsd_network: enable on arm64
+2ea77e7f98 2026-10-16 freebsd_network: use generic bus.h and cpufunc.h for all non-x86 architectures
+05625a8afa 2026-10-16 freebsd_network: add missing bpf stub
+38a237fb2d 2026-10-20 docs: record the freebsd_network imports in the ledger
+d9d40db0e2 2026-09-10 arm64: move MIDR definitions to arch_cpu_type.h and sync with FreeBSD
+017e443156 2026-09-10 cpu_type.h: split per arch and add arm64 identification
+6d5ea2909a 2026-09-10 kernel/arm64: read CPU ID and report vendor/model
+8dc0e81c14 2026-10-20 docs: record the ARM CPU identification imports in the ledger
+1a6250f2bf 2026-10-20 Pulse: draw the vendor name in place of a missing logo
+3899be31fc 2026-10-27 ARM: build for the Cortex-A9 and VFPv3-D16 of the NVIDIA Tegra 2
+133e056f51 2026-10-27 libroot/arm: fenv, system_time(), byte swapping and a faster memcpy()
+de16088cd3 2026-10-27 efi/arm: boot the NVIDIA Tegra 2 of the Toshiba AC100
+75eb8cfdb2 2026-10-27 kernel/arm: exceptions, signals, syscalls and debugging
+24f3210765 2026-10-27 kernel/arm: caches, page tables and the PL310 outer cache
+2889764cbc 2026-10-27 ARM: SMP, timers and the NVIDIA Tegra 2
+10b14e0013 2026-10-27 scheduler: rebalance on the load of a core beyond what its CPUs can take
+00997db5ae 2026-10-27 kernel/arm: real time clock and supplies of the Tegra 2 and TPS6586x
+882b17c4ef 2026-10-27 arm: report CPU vendor, model and measured frequency
+d62584e126 2026-10-27 usb, ehci: the USB controllers of the NVIDIA Tegra 2
+df44aea2f7 2026-10-27 usb_raw: accept control requests without a data stage and buffer
+56862285d7 2026-10-27 usb_serial: deselect also when the device has been removed
+697a381c53 2026-10-27 sdhci, mmc: the SD and eMMC controllers of the NVIDIA Tegra 2
+96c2f1a911 2026-10-27 i2c: add a driver for the NVIDIA Tegra 2 I2C master controllers
+7b3694c816 2026-10-27 nvec: driver for the embedded controller of the Toshiba AC100
+0b00e1f055 2026-10-27 adt7461: driver for the temperature sensor of the Toshiba AC100
+faf3a6f6e5 2026-10-27 power: add tegra_dvfs, the supplies and clocks of the AC100
+a0bc68e5ac 2026-10-27 tegra_audio: driver for the Tegra 2 with the ALC5632 codec of the AC100
+e4af407565 2026-10-27 tegra_dc: a display driver and accelerant for the NVIDIA Tegra 2
+22cf769ece 2026-10-27 app_server, BBitmap: let clients reach overlay buffers in their own team
+1e8a7dc34b 2026-10-27 Screen: follow brightness changes, round a single refresh rate
+0b618e45a1 2026-10-27 hdmi.media_addon: the HDMI port as a video output node
+82ec95e51f 2026-10-27 tegra_gr2d: driver for the 2D engine behind host1x
+d4ab205108 2026-10-27 Tracker: don't let the thumbnail stream delete a bitmap on the stack
+ccb11f243f 2026-10-27 PicturePlayer: don't hand out unaligned pointers into the picture data
+e8f8bb6856 2026-10-27 BMenuField: remove the mouse down filter from the window when detached
+30058b58a6 2026-10-27 kernel/network: accept() defaults to blocking sockets, accept4() honors SOCK_NONBLOCK
+0ac1e109a8 2026-10-27 debug_server: registers on ARM, a plain text report without the Debugger
+ba7f9b5012 2026-10-27 build: the AC100 drivers, applications and external libraries in the ARM images
+ac55736958 2026-10-27 tegra_dc_diag: a read-only report of the Tegra 2 display hardware
+d2ad833151 2026-10-27 kernel: copy the syslog to AC100LOG.TXT on the EFI system partition
+560786a58f 2026-10-27 mixer: do not crash on a truncated settings file
+c2cd85d95e 2026-10-27 nvec: restart a transfer the EC left in the middle at once
+1785434e22 2026-10-27 media: align the meta_format buffers without alignas
+b6ae3322c0 2026-10-28 PNGTranslator: use setjmp() for libpng errors instead of exceptions
+dffd403882 2026-10-28 kernel/arm: make executable pages coherent on all CPUs
+86d2ca4f64 2026-10-29 sdhci: bring a device that is out of step back before using it
+a42ca7cae9 2026-10-29 sdhci: use DMA for the self-test reference when PIO reads disagree
+3100c648a2 2026-10-30 Revert "sdhci: use DMA for the self-test reference when PIO reads disagree"
+c923c02403 2026-10-31 bluetooth: HID devices, and a sturdier stack to carry them
+3cdd382c30 2026-11-01 freebsd_network: align struct cv as the ConditionVariable it holds
+29d5b2095c 2026-11-01 freebsd_network: complete an empty bulk transfer instead of queueing it
+a1de19275e 2026-11-01 ehci: refuse a transfer with no data instead of using a NULL descriptor
+cf147a59d9 2026-11-01 MediaPlayer: build the string of an URL item before it is shared
+8340f2edc9 2026-11-01 libdevice: free the data of a joystick opened before when opening it
+8d00bbb67b 2026-11-03 freebsd_network: check the frame of usbd_xfer_set_frame_data() as FreeBSD
+a29337c1b8 2026-11-04 Bluetooth prefs: empty the inquiry list before the inquiry
+952693d450 2026-11-05 freebsd_network: clear a stall before submitting again, as FreeBSD
+1fa984b71c 2026-11-05 h2generic: HCI flow control of the ACL packets, and the races it showed
+6e7c5ed732 2026-11-05 ehci: keep the data toggle of a transfer that failed
+0c09af6a39 2026-11-05 bluetooth: follow the security of the links, tell the room for ACL
+ac144424cf 2026-11-05 h2generic: send the ACL packets through the queue, and its fixes
+23028909f4 2026-11-05 l2cap: wait for room, check the configuration, security mode 4
+6c5162057e 2026-11-05 bluetooth_server: pair with Just Works, check the encryption key size
+b39878185b 2026-11-05 h2generic: never hold the L2CAP signaling of a link being secured
+36d204a499 2026-11-05 l2cap: HID at security level 1, tell the security waits
+8170dc32ec 2026-11-05 libbluetooth: give up a remote name request after 20 s
+d0d27a27e3 2026-11-06 h2generic: HCI command flow control
+c3f7f7ebe3 2026-11-06 bluetooth_server: read the buffer size of the controller at setup
+5098e3f7b8 2026-11-06 bluetooth_server: read the HID descriptor of a device that connects
+9233e6a304 2026-11-06 bluetooth_server: forget a refused key, offer PIN 0000 to keyless devices
+3173b54573 2026-11-06 bluetooth: take an encryption key refresh as an encrypted link
+886db6f8f0 2026-11-06 h2generic: diagnostics only when asked for in the driver settings
+1d2c5a9427 2026-11-06 bluetooth_server: numeric comparison and passkey entry for simple pairing
+15b7ff5893 2026-11-06 bluetooth: reset the controller after a hardware error
+9cd35f7e6d 2026-11-06 h2generic: fixes from a review of the queue and the close
+a723c20074 2026-11-06 l2cap: fixes from a review of security mode 4
+66b801c2d5 2026-11-06 bluetooth: send the fragments of an ACL packet one after the other
+8c49c65902 2026-11-06 bluetooth_server: Italian for the pairing windows
+c60408a61f 2026-11-06 bluetooth: fixes from a second review of the send paths
+2838fffe24 2026-11-06 h2generic: let signaling pass held data, take lost ACL credits back
+1d5185fb52 2026-11-06 bluetooth_server: answer SDP requests, with an A2DP Audio Source record
+2b2fc72932 2026-11-06 h2generic: diagnostics print the first ACL packets, on single lines
+31b0fe51d2 2026-11-06 bluetooth: a second inquiry no longer stops the first one's scan
+e0f79075f2 2026-11-06 bluetooth_server: an A2DP Audio Sink record
+910877c508 2026-11-06 bluetooth_server: AVRCP Target and Controller records
+73ec53656d 2026-11-06 bluetooth: the fixes asked for in the review of the kernel changes
+33a8de0f34 2026-11-06 bluetooth_server: take up a controller that comes back on the bus
+dfcc801e38 2026-11-06 bluetooth_server: keep the type of a link key apart from the link's
+77381012cb 2026-11-06 bluetooth_server: give the controller its class of device at start
+37dcbdeff5 2026-11-06 l2cap: a listening socket is readable while connections wait
+a1f8eb5a23 2026-11-06 bluetooth_server: give the controller its name and inquiry response
+9fea914eb4 2026-11-06 Bluetooth preferences: keep the name given to this computer
+134c102710 2026-11-06 libbluetooth: ask for the connection state of the right controller
+6e8dd854cb 2026-11-06 bluetooth_server: answer the connection state of an unknown device
+434f6404f3 2026-11-07 bluetooth_server: keep the service classes of paired devices
+1056e79007 2026-11-07 media: bluetooth_audio, Bluetooth speakers as audio outputs
+56ac1e55d2 2026-11-07 bluetooth_audio: trace how long the stream takes to start after sound
+1f1caaad4d 2026-11-07 bluetooth_audio: live in a copy that stays, answer pause and volume sooner
+e746b4e4ce 2026-11-07 media_server: go over to the default audio output when it comes
+454ba0b365 2026-11-07 media_server: the clock of the output the mixer goes over to
+19bf4916b5 2026-11-07 bluetooth_audio: the clock keeps running when it is stopped
+7dba14d563 2026-11-07 media_addon_server: do not unload the add-ons when quitting
+7801d54e3c 2026-11-07 bluetooth_server: device details, and a menu per device in the Deskbar
+2d9a9b9f2f 2026-11-07 Bluetooth preferences: a window for each device
+a4b1c364b3 2026-11-07 locale: hash the catalog keys the same where char is unsigned
+b5da23c364 2026-11-07 Bluetooth preferences: speakers without a device class show as audio
+83fcc368ee 2026-11-07 bluetooth_server: the key type of devices paired before is not known
+141c5c3f2d 2026-11-07 kernel/vm: look the next page up again after writing unlocked
+45b6a2ceee 2026-11-08 nvec: recognize the reset of the touchpad again
+82a552c0c7 2026-11-08 nvec: keep a log of the last touchpad bytes
+6fd0f9f2f8 2026-11-08 build: the ARM loader links the soft-float libgcc-boot.a again
+dafd6557fa 2026-11-08 WIP: tegra_gpio module, NVEC and SDHCI on it (test build, not for PRs)
+f3f77fa48f 2026-11-08 WIP: device manager looks for GPIO controllers on the device tree bus
+85a05a0d0e 2026-11-08 Revert "WIP: device manager looks for GPIO controllers on the device tree bus"
+983d790243 2026-11-08 nvec: a key releases the left button the touchpad locked
+88b8bae63d 2026-11-08 gpio_leds, led_server: the Wi-Fi LED of the AC100 shows the link
+627a70f384 2026-11-08 WIP tegra_gpio: registers and interrupts from the device tree
+ff35771f78 2026-11-08 WIP tegra_audio: the jack and HDMI lines wake the jack thread up
+b4411bffa8 2026-11-08 Bluetooth catalogs: the Italian fingerprints after the hash change
+650b8aa1a6 2026-11-08 media_server, bluetooth_audio: another output plays while the speakers are out of reach
+9de978155f 2026-11-08 bluetooth_server: a paired device whose key was forgotten stays paired
+e31a859c90 2026-11-10 media kit: start and stop time sources with a set message
+b8e39110d0 2026-11-10 multi_audio, bluetooth_audio: the audio clocks show the real time
+7314e25b64 2026-11-10 media_server: a default chosen while running is the saved one
+172903e5db 2026-11-10 h2generic: no link keys in the diagnostics
+0295cb509e 2026-11-10 h2generic: do not take the ACL room back on a timer
+5c8629762e 2026-11-10 bluetooth_audio: the AVDTP channels do not wait forever
+2fd6b5530b 2026-11-10 bluetooth_audio: call the speakers back, and keep them when not the output
+f30ca867d6 2026-11-10 bluetooth: tell whether a key is kept for a device
+bee3234941 2026-11-10 bluetooth_server: no link keys in the traces
+b7e64caf7a 2026-11-10 bluetooth_server: tell the user when a device refuses its key
+f10d051cd5 2026-11-10 bluetooth_server: keep the key of a device that refuses our call
+5ad582d601 2026-11-10 bluetooth_server: read the services of devices that connect to us
+951062f82a 2026-11-10 bluetooth_server: "Use as audio output" in the Deskbar switches both ways
+3e0256fa67 2026-11-10 Bluetooth preferences: show the name of a device paired after a search
+ccdd9ac896 2026-11-10 TEMPORARY bluetooth_server: trace a fingerprint of the link keys
+ed529cc2ce 2026-11-10 bluetooth_server: a store for the bonds, their keys and the known devices
+ba2bf4eef0 2026-11-10 tests: the bond store and the device cache of bluetooth_server
+48df0e953a 2026-11-10 bluetooth_server: keep the bonds in the bond store
+9b0eb63fff 2026-11-10 bluetooth_audio: take the speakers from the server, and new ones at once
+b42c9cab73 2026-11-10 tegra_dc: switch the panel off while the screen sleeps
+34c0509462 2026-11-11 kernel/arm, tegra_dvfs: change the CPU clock of the Tegra 2
+79c44155e1 2026-11-11 tegra20_cpufreq: CPU clock and voltage of the Tegra 2 together
+4f24b9f6a7 2026-11-11 tegra20_cpufreq: a governor that follows the load
+8e44485117 2026-11-11 bluetooth_audio: publish the clock twice a second, below real time
+448ea994f9 2026-11-12 kernel/arm: SGIs and PPIs of the GIC are local interrupts
+66807d01fb 2026-11-12 kernel/scheduler: do not try forever to pack an IRQ that stays
+cf574ee082 2026-11-12 kernel/scheduler: check where the IRQ went, not where it is in the list
+033ad0ffc2 2026-11-12 tegra_audio: turn the pre-filter of the digital microphone on
+797e35a585 2026-11-12 tegra_audio: record the built-in microphone 12 dB louder by default
+af64ea55db 2026-11-12 tegra_audio: the room noise of the built-in microphone, as measured

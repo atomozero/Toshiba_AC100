@@ -1,0 +1,39 @@
+From b4411bffa87cccd9c5098a5fc3ccdc7093a1159d Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 8 Nov 2026 23:09:17 +0100
+Subject: [PATCH 10/42] Bluetooth catalogs: the Italian fingerprints after the
+ hash change
+
+The catalog key hash now adds the bytes as signed char on every
+architecture; the fingerprints of catalogs with keys that are not ASCII
+change with it.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ data/catalogs/preferences/bluetooth/it.catkeys | 2 +-
+ data/catalogs/servers/bluetooth/it.catkeys     | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/data/catalogs/preferences/bluetooth/it.catkeys b/data/catalogs/preferences/bluetooth/it.catkeys
+index 313e4909d3..6288b66b45 100644
+--- a/data/catalogs/preferences/bluetooth/it.catkeys
++++ b/data/catalogs/preferences/bluetooth/it.catkeys
+@@ -1,4 +1,4 @@
+-1	italian	x-vnd.Haiku-BluetoothPrefs	2826205708
++1	italian	x-vnd.Haiku-BluetoothPrefs	3244669196
+ Laptop	Settings view		Portatile
+ Only from trusted devices	Settings view		Solo da dispositivi affidabili
+ 15 secs	Settings view		15 secondi
+diff --git a/data/catalogs/servers/bluetooth/it.catkeys b/data/catalogs/servers/bluetooth/it.catkeys
+index 944a6cd5a9..294c21bafc 100644
+--- a/data/catalogs/servers/bluetooth/it.catkeys
++++ b/data/catalogs/servers/bluetooth/it.catkeys
+@@ -1,4 +1,4 @@
+-1	italian	x-vnd.Haiku-bluetooth_server	1130325196
++1	italian	x-vnd.Haiku-bluetooth_server	2483031756
+ Stopping the Bluetooth server failed.	BluetoothReplicant		Arresto del server Bluetooth non riuscito.
+ Bluetooth error	BluetoothReplicant		Errore bluetooth
+ Settings…	BluetoothReplicant		Impostazioni…
+-- 
+2.39.5
+

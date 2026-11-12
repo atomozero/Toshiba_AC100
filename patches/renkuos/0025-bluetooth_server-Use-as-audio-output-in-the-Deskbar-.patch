@@ -1,0 +1,214 @@
+From 951062f82ada8f3a1f8c7f8e3ddd8c71279c8cae Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 10 Nov 2026 07:43:18 +0100
+Subject: [PATCH 25/42] bluetooth_server: "Use as audio output" in the Deskbar
+ switches both ways
+
+The item of a speaker's menu opened the preferences, which made the
+speakers the output. It is now marked while they are the audio output of
+the system, and a click takes the sound to them, or back to the sound
+card (the first output that is not Bluetooth speakers); the speakers stay
+connected. The media server is asked in a thread of its own, as the
+Deskbar waits for nobody.
+
+The item shows for a device the server knows as an Audio Sink, or for
+which the Bluetooth audio add-on made an output; without an output yet,
+the preferences are opened as before. The server links libmedia for it.
+
+Not yet tested on the AC100.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/servers/bluetooth/DeskbarReplicant.cpp | 138 ++++++++++++++++++++-
+ src/servers/bluetooth/Jamfile              |   2 +-
+ 2 files changed, 135 insertions(+), 5 deletions(-)
+
+diff --git a/src/servers/bluetooth/DeskbarReplicant.cpp b/src/servers/bluetooth/DeskbarReplicant.cpp
+index 93cbf75016..94512628ae 100644
+--- a/src/servers/bluetooth/DeskbarReplicant.cpp
++++ b/src/servers/bluetooth/DeskbarReplicant.cpp
+@@ -15,6 +15,7 @@
+ #include <Catalog.h>
+ #include <Deskbar.h>
+ #include <IconUtils.h>
++#include <MediaRoster.h>
+ #include <MenuItem.h>
+ #include <Message.h>
+ #include <MessageRunner.h>
+@@ -48,6 +49,112 @@ const char* kClassName = "DeskbarReplicant";
+ #define B_TRANSLATION_CONTEXT "BluetoothReplicant"
+ 
+ 
++namespace {
++
++
++/*!	The output the Bluetooth audio media add-on made of the device, which it
++	names after it.
++*/
++bool
++bluetooth_audio_output(const char* deviceName, media_node* _node)
++{
++	BMediaRoster* roster = BMediaRoster::Roster();
++	if (roster == NULL)
++		return false;
++
++	BString name;
++	name.SetToFormat("%s (Bluetooth)", deviceName);
++	live_node_info live[32];
++	int32 count = 32;
++	media_format format;
++	format.type = B_MEDIA_RAW_AUDIO;
++	if (roster->GetLiveNodes(live, &count, &format, NULL, NULL,
++			B_BUFFER_CONSUMER | B_PHYSICAL_OUTPUT) != B_OK) {
++		return false;
++	}
++	for (int32 i = 0; i < count; i++) {
++		if (name == live[i].name) {
++			*_node = live[i].node;
++			return true;
++		}
++	}
++	return false;
++}
++
++
++bool
++is_audio_output(const media_node& node)
++{
++	BMediaRoster* roster = BMediaRoster::Roster();
++	media_node current;
++	if (roster == NULL || roster->GetAudioOutput(&current) != B_OK)
++		return false;
++	bool isOutput = current.node == node.node;
++	roster->ReleaseNode(current);
++	return isOutput;
++}
++
++
++/*!	Where the sound goes when the speakers stop being the output: the first
++	output that is not Bluetooth speakers (the sound card), else any other.
++*/
++bool
++other_audio_output(const media_node& node, media_node* _other)
++{
++	BMediaRoster* roster = BMediaRoster::Roster();
++	live_node_info live[32];
++	int32 count = 32;
++	media_format format;
++	format.type = B_MEDIA_RAW_AUDIO;
++	if (roster == NULL || roster->GetLiveNodes(live, &count, &format, NULL,
++			NULL, B_BUFFER_CONSUMER | B_PHYSICAL_OUTPUT) != B_OK) {
++		return false;
++	}
++	int32 found = -1;
++	for (int32 i = 0; i < count; i++) {
++		if (live[i].node.node == node.node)
++			continue;
++		if (!BString(live[i].name).EndsWith(" (Bluetooth)")) {
++			found = i;
++			break;
++		}
++		if (found < 0)
++			found = i;
++	}
++	if (found < 0)
++		return false;
++	*_other = live[found].node;
++	return true;
++}
++
++
++/*!	Makes the speakers the audio output, or no longer: in a thread of its
++	own, as the media server may take a moment and the Deskbar waits for
++	nobody. The speakers stay connected either way.
++*/
++status_t
++toggle_audio_output(void* data)
++{
++	BString* deviceName = (BString*)data;
++	media_node node;
++	if (bluetooth_audio_output(deviceName->String(), &node)) {
++		BMediaRoster* roster = BMediaRoster::Roster();
++		if (!is_audio_output(node))
++			roster->SetAudioOutput(node);
++		else {
++			media_node other;
++			if (other_audio_output(node, &other))
++				roster->SetAudioOutput(other);
++		}
++	}
++	delete deviceName;
++	return B_OK;
++}
++
++
++}	// namespace
++
++
+ //	#pragma mark -
+ 
+ 
+@@ -196,8 +303,21 @@ DeskbarReplicant::MessageReceived(BMessage* msg)
+ 			_AskConnectedDevices();
+ 			break;
+ 
+-		case kMsgDeviceInfo:
+ 		case kMsgDeviceAudioOutput:
++		{
++			media_node node;
++			if (bluetooth_audio_output(msg->GetString("name", ""), &node)) {
++				BString* name = new BString(msg->GetString("name", ""));
++				thread_id thread = spawn_thread(toggle_audio_output,
++					"bluetooth audio output", B_NORMAL_PRIORITY, name);
++				if (thread < 0 || resume_thread(thread) != B_OK)
++					delete name;
++				break;
++			}
++			// no output for it yet: the preferences tell what to do
++		}
++			// fall through
++		case kMsgDeviceInfo:
+ 		{
+ 			// the preferences show the device, and do the action
+ 			BMessage show(BT_MSG_SHOW_DEVICE);
+@@ -281,11 +401,21 @@ DeskbarReplicant::_ShowMenu(BPoint where)
+ 		info->AddString("address", address);
+ 		deviceMenu->AddItem(new BMenuItem(B_TRANSLATE("Details" B_UTF8_ELLIPSIS),
+ 			info));
+-		if (fConnected.GetBool("audio sink", i, false)) {
++		// speakers: by their services, or by the output the Bluetooth audio
++		// add-on made of them (the services of a device that connected by
++		// itself may not be read yet)
++		media_node node;
++		bool hasOutput = bluetooth_audio_output(name, &node);
++		if (hasOutput || fConnected.GetBool("audio sink", i, false)) {
++			// marked while it is the output: a click takes the sound to the
++			// sound card and back, the speakers stay connected
+ 			BMessage* output = new BMessage(kMsgDeviceAudioOutput);
++			output->AddString("name", name);
+ 			output->AddString("address", address);
+-			deviceMenu->AddItem(new BMenuItem(
+-				B_TRANSLATE("Use as audio output"), output));
++			BMenuItem* item = new BMenuItem(
++				B_TRANSLATE("Use as audio output"), output);
++			item->SetMarked(hasOutput && is_audio_output(node));
++			deviceMenu->AddItem(item);
+ 		}
+ 		deviceMenu->AddSeparatorItem();
+ 		BMessage* disconnect = new BMessage(kMsgDeviceDisconnect);
+diff --git a/src/servers/bluetooth/Jamfile b/src/servers/bluetooth/Jamfile
+index 86deb8bbcf..2bb58fb86b 100644
+--- a/src/servers/bluetooth/Jamfile
++++ b/src/servers/bluetooth/Jamfile
+@@ -19,7 +19,7 @@ Application bluetooth_server
+ 	Scripting.cpp
+ 	SDPServer.cpp
+ 	SDPClient.cpp
+-	: be network libbluetooth.so localestub
++	: be media network libbluetooth.so localestub
+ 	[ TargetLibstdc++ ]
+ ;
+ 
+-- 
+2.39.5
+

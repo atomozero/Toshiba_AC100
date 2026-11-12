@@ -1,0 +1,72 @@
+From b8e39110d0ad106d632afa3082a36939236c2726 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 10 Nov 2026 07:42:23 +0100
+Subject: [PATCH 14/42] multi_audio, bluetooth_audio: the audio clocks show the
+ real time
+
+A multi_audio node publishes the real time as its performance time while
+it does not play, and its time computer started from 0 at every start of
+its output: the clock went back by the time since boot. When the mixer
+went over to it from another output, whatever was scheduled in the
+mixer's clock waited that long; MediaPlayer stood still when Bluetooth
+speakers went away and the sound card stood in for them.
+
+Both clocks now start at the real time, as the system clock is, so that
+what is scheduled in one comes at the same time in the other.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp | 5 ++++-
+ .../media/media-add-ons/multi_audio/TimeComputer.cpp     | 9 ++++++++-
+ 2 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp b/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp
+index 3aa1cceea3..eaaec03082 100644
+--- a/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp
++++ b/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp
+@@ -322,6 +322,9 @@ BluetoothAudioNode::FormatChanged(const media_source& producer,
+ 
+ /*!	The clock runs with the real time: the mixer gives the audio as the
+ 	clock goes, and it leaves for the speakers as it comes, which buffer it.
++	It also shows the real time, as the system clock and a sound card's do:
++	when the mixer goes over to another output, what is scheduled in one
++	clock comes at the same time in the other.
+ */
+ status_t
+ BluetoothAudioNode::TimeSourceOp(const time_source_op_info& op,
+@@ -332,7 +335,7 @@ BluetoothAudioNode::TimeSourceOp(const time_source_op_info& op,
+ 		case B_TIMESOURCE_START:
+ 			if (!fClockRunning) {
+ 				fClockRunning = true;
+-				fPerformanceBase = op.performance_time;
++				fPerformanceBase = op.real_time;
+ 				fRealBase = op.real_time;
+ 			}
+ 			PublishTime(fPerformanceBase, fRealBase, 1.0f);
+diff --git a/src/add-ons/media/media-add-ons/multi_audio/TimeComputer.cpp b/src/add-ons/media/media-add-ons/multi_audio/TimeComputer.cpp
+index 0c15ffd24b..1d77ffe631 100644
+--- a/src/add-ons/media/media-add-ons/multi_audio/TimeComputer.cpp
++++ b/src/add-ons/media/media-add-ons/multi_audio/TimeComputer.cpp
+@@ -23,11 +23,18 @@ TimeComputer::TimeComputer()
+ }
+ 
+ 
++/*!	The performance time starts at the real time, as the node publishes it
++	while it does not play: it restarts on every start of the output, and
++	from 0 it went back by the time since boot. Whatever was scheduled in it,
++	or in the clock of the output the mixer came from, then waited that long
++	(MediaPlayer stood still when Bluetooth speakers went and the sound card
++	stood in for them).
++*/
+ void
+ TimeComputer::Init(float frameRate, bigtime_t realBaseTime)
+ {
+ 	fRealTime = realBaseTime;
+-	fPerformanceTime = 0;
++	fPerformanceTime = realBaseTime;
+ 	fDrift = 1;
+ 	fResetTimeBase = true;
+ 	SetFrameRate(frameRate);
+-- 
+2.39.5
+

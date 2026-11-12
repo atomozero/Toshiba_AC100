@@ -1,0 +1,1209 @@
+From dafd6557fa6ce5cb8227c7adc80b01fbc8103e6d Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 8 Nov 2026 17:22:39 +0100
+Subject: [PATCH 03/42] WIP: tegra_gpio module, NVEC and SDHCI on it (test
+ build, not for PRs)
+
+---
+ build/jam/packages/Haiku                      |   5 +
+ headers/private/gpio/tegra.h                  |  84 +++
+ src/add-ons/kernel/busses/Jamfile             |   1 +
+ src/add-ons/kernel/busses/gpio/Jamfile        |   3 +
+ src/add-ons/kernel/busses/gpio/tegra/Jamfile  |  10 +
+ .../kernel/busses/gpio/tegra/tegra_gpio.cpp   | 702 ++++++++++++++++++
+ src/add-ons/kernel/busses/i2c/nvec/Jamfile    |   2 +-
+ src/add-ons/kernel/busses/i2c/nvec/nvec.cpp   |  64 +-
+ src/add-ons/kernel/busses/mmc/Jamfile         |   2 +-
+ src/add-ons/kernel/busses/mmc/sdhci_fdt.cpp   |  64 +-
+ .../drivers/audio/tegra/tegra_audio.cpp       |  16 +-
+ 11 files changed, 890 insertions(+), 63 deletions(-)
+ create mode 100644 headers/private/gpio/tegra.h
+ create mode 100644 src/add-ons/kernel/busses/gpio/Jamfile
+ create mode 100644 src/add-ons/kernel/busses/gpio/tegra/Jamfile
+ create mode 100644 src/add-ons/kernel/busses/gpio/tegra/tegra_gpio.cpp
+
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index dbf95bb68c..580a92c87d 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -46,6 +46,9 @@ AddFilesToPackage add-ons kernel busses ata :
+ 	ide_isa@x86
+ 	;
+ 
++AddFilesToPackage add-ons kernel busses gpio :
++	tegra_gpio@arm
++	;
+ AddFilesToPackage add-ons kernel busses i2c :
+ 	nvec@arm
+ 	tegra_i2c@arm
+@@ -392,6 +395,8 @@ AddBootModuleSymlinksToPackage
+ 	smbios@x86,x86_64
+ 	sdhci
+ 	bcm2711_emmc2@arm64
++	# sdhci powers the Tegra slots through it
++	tegra_gpio@arm
+ 	usb
+ 	usb_disk
+ 	<usb>ehci
+diff --git a/headers/private/gpio/tegra.h b/headers/private/gpio/tegra.h
+new file mode 100644
+index 0000000000..ac08973a28
+--- /dev/null
++++ b/headers/private/gpio/tegra.h
+@@ -0,0 +1,84 @@
++/*
++ * Copyright 2026, Haiku, Inc. All Rights Reserved.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _GPIO_TEGRA_H
++#define _GPIO_TEGRA_H
++
++
++#include <device_manager.h>
++#include <KernelExport.h>
++
++
++/*!	Interface of the GPIO controller of NVIDIA Tegra 2.
++
++	The controller has 224 pins, numbered from 0 to 223 in the same way as
++	the device tree: the first 32 pins are controller 1, ports A to D, and
++	so on. Consumers request a pin, configure it and then read or write it.
++	A pin belongs to one consumer at a time; the owner string is only used
++	to report and to check that the right consumer releases the pin again.
++
++	The pins are configured in GPIO mode (GPIO_CNF set), but the pin mux and
++	the pad tristate are left alone: firmware and the other drivers decide
++	which function a pin has, and changing it here would break consumers
++	that share a pin group.
++*/
++
++#define TEGRA_GPIO_MODULE_NAME	"busses/gpio/tegra_gpio/interface_v1"
++
++// number of pins of the controller
++#define TEGRA_GPIO_PIN_COUNT	224
++
++// the largest owner string that is remembered
++#define TEGRA_GPIO_OWNER_LENGTH	32
++
++// interrupt modes
++#define TEGRA_GPIO_INTERRUPT_LEVEL_HIGH		0
++#define TEGRA_GPIO_INTERRUPT_LEVEL_LOW		1
++#define TEGRA_GPIO_INTERRUPT_RISING			2
++#define TEGRA_GPIO_INTERRUPT_FALLING		3
++#define TEGRA_GPIO_INTERRUPT_ANY_CHANGE		4
++
++
++/*!	Runs in interrupt context: it must not sleep or acquire a mutex.
++	An interrupt on a level (TEGRA_GPIO_INTERRUPT_LEVEL_*) is disabled before
++	the handler runs, as the level would fire again at once: the consumer
++	calls set_interrupt() again once the level is gone or reversed. Edge
++	interrupts stay enabled.
++*/
++typedef void (*tegra_gpio_interrupt_handler)(uint32 pin, void* data);
++
++
++typedef struct tegra_gpio_interface {
++	driver_module_info info;
++
++	//! Claims \a pin for \a owner. Fails if another owner holds the pin.
++	status_t	(*acquire)(uint32 pin, const char* owner);
++
++	//! Releases \a pin, if \a owner still holds it.
++	status_t	(*release)(uint32 pin, const char* owner);
++
++	//! Makes \a pin an output that drives \a level, as an electrical level.
++	status_t	(*configure_output)(uint32 pin, bool level);
++
++	//! Makes \a pin an input.
++	status_t	(*configure_input)(uint32 pin);
++
++	/*!	Drives the output \a pin to \a level, as an electrical level.
++		Takes no lock: it may be called from an interrupt handler. */
++	status_t	(*write)(uint32 pin, bool level);
++
++	/*!	Returns the electrical level of \a pin. Takes no lock either; any
++		pin may be read, also one another consumer owns. */
++	bool		(*read)(uint32 pin);
++
++	//! Makes \a pin an input that calls \a handler when \a mode happens.
++	status_t	(*set_interrupt)(uint32 pin, uint32 mode,
++					tegra_gpio_interrupt_handler handler, void* data);
++
++	//! Disables the interrupt of \a pin and clears its pending event.
++	status_t	(*clear_interrupt)(uint32 pin);
++} tegra_gpio_interface;
++
++
++#endif	// _GPIO_TEGRA_H
+diff --git a/src/add-ons/kernel/busses/Jamfile b/src/add-ons/kernel/busses/Jamfile
+index f3d5bbe374..09af6e9383 100644
+--- a/src/add-ons/kernel/busses/Jamfile
++++ b/src/add-ons/kernel/busses/Jamfile
+@@ -2,6 +2,7 @@ SubDir HAIKU_TOP src add-ons kernel busses ;
+ 
+ SubInclude HAIKU_TOP src add-ons kernel busses ata ;
+ SubInclude HAIKU_TOP src add-ons kernel busses agp_gart ;
++SubInclude HAIKU_TOP src add-ons kernel busses gpio ;
+ SubInclude HAIKU_TOP src add-ons kernel busses i2c ;
+ SubInclude HAIKU_TOP src add-ons kernel busses mmc ;
+ SubInclude HAIKU_TOP src add-ons kernel busses pci ;
+diff --git a/src/add-ons/kernel/busses/gpio/Jamfile b/src/add-ons/kernel/busses/gpio/Jamfile
+new file mode 100644
+index 0000000000..3ba1dde0c8
+--- /dev/null
++++ b/src/add-ons/kernel/busses/gpio/Jamfile
+@@ -0,0 +1,3 @@
++SubDir HAIKU_TOP src add-ons kernel busses gpio ;
++
++SubInclude HAIKU_TOP src add-ons kernel busses gpio tegra ;
+diff --git a/src/add-ons/kernel/busses/gpio/tegra/Jamfile b/src/add-ons/kernel/busses/gpio/tegra/Jamfile
+new file mode 100644
+index 0000000000..f02e704fac
+--- /dev/null
++++ b/src/add-ons/kernel/busses/gpio/tegra/Jamfile
+@@ -0,0 +1,10 @@
++SubDir HAIKU_TOP src add-ons kernel busses gpio tegra ;
++
++SubDirC++Flags -fno-rtti ;
++
++UsePrivateHeaders gpio ;
++UsePrivateKernelHeaders ;
++
++KernelAddon tegra_gpio :
++	tegra_gpio.cpp
++;
+diff --git a/src/add-ons/kernel/busses/gpio/tegra/tegra_gpio.cpp b/src/add-ons/kernel/busses/gpio/tegra/tegra_gpio.cpp
+new file mode 100644
+index 0000000000..17e8477fcc
+--- /dev/null
++++ b/src/add-ons/kernel/busses/gpio/tegra/tegra_gpio.cpp
+@@ -0,0 +1,702 @@
++/*
++ * Copyright 2026, Haiku, Inc. All Rights Reserved.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++/*!	GPIO controller of NVIDIA Tegra 2 (nvidia,tegra20-gpio).
++
++	The controller has 224 pins in seven banks of four ports. It is one
++	device tree node with one register range and one interrupt per bank.
++	The registers are only written with the masked variants, so that
++	changing the direction or the level of a pin does not touch the other
++	pins of its port, and no read-modify-write is needed.
++
++	The interface is exported as a module and is used directly by the
++	other drivers. The driver itself only maps the registers and, later,
++	installs the interrupt handlers.
++*/
++
++
++#include <new>
++#include <string.h>
++
++#include <KernelExport.h>
++#include <bus/FDT.h>
++#include <device_manager.h>
++#include <lock.h>
++#include <util/AutoLock.h>
++
++#include <gpio/tegra.h>
++
++
++#define TEGRA_GPIO_DRIVER_MODULE_NAME	"busses/gpio/tegra_gpio/driver_v1"
++
++#define TRACE_GPIO(x...)	dprintf("tegra_gpio: " x)
++
++
++// controller registers
++#define TEGRA20_GPIO_BASE				0x6000d000
++#define TEGRA_GPIO_BANK_COUNT			7
++#define TEGRA_GPIO_PINS_PER_PORT		8
++#define TEGRA_GPIO_BANK_STRIDE			0x80
++
++#define TEGRA_GPIO_REG(pin, reg)		(((pin) / 32) * TEGRA_GPIO_BANK_STRIDE \
++											+ (((pin) / 8) % 4) * 4 + (reg))
++#define TEGRA_GPIO_CNF					0x00
++#define TEGRA_GPIO_OE					0x10
++#define TEGRA_GPIO_OUT					0x20
++#define TEGRA_GPIO_IN					0x30
++#define TEGRA_GPIO_INT_STA				0x40
++#define TEGRA_GPIO_INT_ENB				0x50
++#define TEGRA_GPIO_INT_LVL				0x60
++#define TEGRA_GPIO_INT_CLR				0x70
++#define TEGRA_GPIO_MASKED_OFFSET		0x800
++
++// a GPIO pin is in GPIO mode when its GPIO_CNF bit is set
++#define TEGRA_GPIO_CNF_GPIO				1
++
++// clock and reset controller (TRM 5.4): the GPIO controller is device 8 of
++// the L bank. The SET/CLR registers change single bits.
++#define TEGRA20_CAR_BASE				0x60006000
++#define TEGRA_CAR_RST_DEVICES_L			0x004
++#define TEGRA_CAR_CLK_OUT_ENB_L			0x010
++#define TEGRA_CAR_RST_DEV_L_CLR			0x304
++#define TEGRA_CAR_CLK_ENB_L_SET			0x320
++#define TEGRA_CAR_GPIO_BIT				(1U << 8)
++
++
++struct tegra_gpio {
++	device_node*		node;
++	area_id				registersArea;
++	volatile uint8*		registers;
++	mutex				lock;
++	char				owners[TEGRA_GPIO_PIN_COUNT][TEGRA_GPIO_OWNER_LENGTH];
++
++	uint32				irqs[TEGRA_GPIO_BANK_COUNT];
++	bool				interruptsInstalled[TEGRA_GPIO_BANK_COUNT];
++	spinlock			interruptLock;
++	tegra_gpio_interrupt_handler handlers[TEGRA_GPIO_PIN_COUNT];
++	void*				handlerData[TEGRA_GPIO_PIN_COUNT];
++};
++
++// The GIC interrupt of each bank, as in the device tree (GIC_SPI 32, 33, 34,
++// 35, 55, 87 and 89). The driver replaces these with the values of the
++// device tree when it initializes, but the interface may be used before.
++static const uint32 kDefaultBankIRQs[TEGRA_GPIO_BANK_COUNT] = {
++	64, 65, 66, 67, 87, 119, 121
++};
++
++
++static device_manager_info* gDeviceManager;
++static tegra_gpio* sGPIO;
++static mutex sInitLock = MUTEX_INITIALIZER("tegra gpio init");
++
++
++//	#pragma mark - register access
++
++
++static inline uint32
++pin_register(uint32 pin, uint32 reg)
++{
++	return TEGRA_GPIO_REG(pin, reg);
++}
++
++
++static inline uint32
++read_register(tegra_gpio* gpio, uint32 pin, uint32 reg)
++{
++	return *(volatile uint32*)(gpio->registers + pin_register(pin, reg));
++}
++
++
++/*!	Writes a single pin of a port through the masked variant of \a reg:
++	the upper byte of the value selects the pins that change, the lower
++	byte their new level. The other pins of the port are left untouched.
++*/
++static inline void
++write_masked(tegra_gpio* gpio, uint32 pin, uint32 reg, bool set)
++{
++	uint32 bit = 1U << (pin % TEGRA_GPIO_PINS_PER_PORT);
++	uint32 value = set ? bit : 0;
++
++	*(volatile uint32*)(gpio->registers
++		+ pin_register(pin, reg + TEGRA_GPIO_MASKED_OFFSET))
++		= (bit << 8) | value;
++}
++
++
++static inline bool
++is_owner(tegra_gpio* gpio, uint32 pin, const char* owner)
++{
++	return owner != NULL && strcmp(gpio->owners[pin], owner) == 0;
++}
++
++
++/*!	Disables the interrupt of \a pin, drops a pending event and forgets the
++	handler. Called with the controller lock held.
++*/
++static void
++disable_pin_interrupt(tegra_gpio* gpio, uint32 pin)
++{
++	write_masked(gpio, pin, TEGRA_GPIO_INT_ENB, false);
++	*(volatile uint32*)(gpio->registers
++		+ pin_register(pin, TEGRA_GPIO_INT_CLR))
++		= 1U << (pin % TEGRA_GPIO_PINS_PER_PORT);
++
++	// the interrupt handler takes this lock too: interrupts off
++	InterruptsSpinLocker handlerLocker(gpio->interruptLock);
++	gpio->handlers[pin] = NULL;
++	gpio->handlerData[pin] = NULL;
++}
++
++
++//	#pragma mark - controller
++
++
++/*!	The firmware leaves the controller running, and the pins it set up
++	(Wi-Fi power, the panel, the ULPI PHY reset) depend on that. Should the
++	clock be off or the controller held in reset, it is started; it is never
++	put into reset, as that would drop the state of all pins.
++*/
++static void
++start_clock()
++{
++	void* address;
++	area_id area = map_physical_memory("tegra car", TEGRA20_CAR_BASE,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++	if (area < B_OK) {
++		dprintf("tegra_gpio: cannot map the clock controller: %s\n",
++			strerror(area));
++		return;
++	}
++	volatile uint8* car = (volatile uint8*)address;
++
++	if ((*(volatile uint32*)(car + TEGRA_CAR_CLK_OUT_ENB_L)
++			& TEGRA_CAR_GPIO_BIT) == 0) {
++		TRACE_GPIO("the clock was off, starting it\n");
++		*(volatile uint32*)(car + TEGRA_CAR_CLK_ENB_L_SET) = TEGRA_CAR_GPIO_BIT;
++		spin(2);
++	}
++	if ((*(volatile uint32*)(car + TEGRA_CAR_RST_DEVICES_L)
++			& TEGRA_CAR_GPIO_BIT) != 0) {
++		TRACE_GPIO("the controller was in reset, releasing it\n");
++		*(volatile uint32*)(car + TEGRA_CAR_RST_DEV_L_CLR) = TEGRA_CAR_GPIO_BIT;
++	}
++
++	delete_area(area);
++}
++
++
++/*!	Maps the controller registers. Called with \a sInitLock held. */
++static status_t
++create_controller(phys_addr_t base, size_t size)
++{
++	if (sGPIO != NULL)
++		return B_OK;
++
++	tegra_gpio* gpio = new(std::nothrow) tegra_gpio;
++	if (gpio == NULL)
++		return B_NO_MEMORY;
++	memset((void*)gpio, 0, sizeof(*gpio));
++	gpio->registersArea = -1;
++	mutex_init(&gpio->lock, "tegra gpio");
++	B_INITIALIZE_SPINLOCK(&gpio->interruptLock);
++	memcpy(gpio->irqs, kDefaultBankIRQs, sizeof(gpio->irqs));
++
++	if (base == 0)
++		base = TEGRA20_GPIO_BASE;
++	if (size == 0)
++		size = B_PAGE_SIZE;
++
++	void* address;
++	area_id area = map_physical_memory("tegra gpio",
++		base & ~(phys_addr_t)(B_PAGE_SIZE - 1),
++		(size + (base & (B_PAGE_SIZE - 1)) + B_PAGE_SIZE - 1)
++			& ~(size_t)(B_PAGE_SIZE - 1),
++		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++		&address);
++	if (area < B_OK) {
++		mutex_destroy(&gpio->lock);
++		delete gpio;
++		return area;
++	}
++
++	gpio->registersArea = area;
++	gpio->registers = (volatile uint8*)address
++		+ (base & (B_PAGE_SIZE - 1));
++	start_clock();
++
++	// ensure_controller() looks at sGPIO without the lock: the controller
++	// has to be complete before it can be seen there
++	memory_write_barrier();
++	sGPIO = gpio;
++	return B_OK;
++}
++
++
++static status_t
++ensure_controller()
++{
++	if (sGPIO != NULL) {
++		memory_read_barrier();
++		return B_OK;
++	}
++
++	MutexLocker locker(sInitLock);
++	return create_controller(0, 0);
++}
++
++
++//	#pragma mark - interface
++
++
++static status_t
++tegra_gpio_acquire(uint32 pin, const char* owner)
++{
++	if (pin >= TEGRA_GPIO_PIN_COUNT || owner == NULL || owner[0] == '\0')
++		return B_BAD_VALUE;
++
++	status_t status = ensure_controller();
++	if (status != B_OK)
++		return status;
++
++	tegra_gpio* gpio = sGPIO;
++	MutexLocker locker(gpio->lock);
++
++	if (gpio->owners[pin][0] != '\0') {
++		// the same consumer may ask for the pin more than once
++		if (is_owner(gpio, pin, owner))
++			return B_OK;
++		return B_BUSY;
++	}
++
++	strlcpy(gpio->owners[pin], owner, TEGRA_GPIO_OWNER_LENGTH);
++	return B_OK;
++}
++
++
++static status_t
++tegra_gpio_release(uint32 pin, const char* owner)
++{
++	if (pin >= TEGRA_GPIO_PIN_COUNT)
++		return B_BAD_VALUE;
++
++	status_t status = ensure_controller();
++	if (status != B_OK)
++		return status;
++
++	tegra_gpio* gpio = sGPIO;
++	MutexLocker locker(gpio->lock);
++
++	if (!is_owner(gpio, pin, owner))
++		return B_BAD_VALUE;
++
++	// a consumer that goes away must not leave an interrupt behind
++	disable_pin_interrupt(gpio, pin);
++
++	gpio->owners[pin][0] = '\0';
++	return B_OK;
++}
++
++
++static status_t
++tegra_gpio_configure_output(uint32 pin, bool level)
++{
++	if (pin >= TEGRA_GPIO_PIN_COUNT)
++		return B_BAD_VALUE;
++
++	status_t status = ensure_controller();
++	if (status != B_OK)
++		return status;
++
++	tegra_gpio* gpio = sGPIO;
++	MutexLocker locker(gpio->lock);
++
++	if (gpio->owners[pin][0] == '\0')
++		return B_BAD_VALUE;
++
++	// set the level while the pin is still an input, so it does not glitch
++	write_masked(gpio, pin, TEGRA_GPIO_OUT, level);
++	write_masked(gpio, pin, TEGRA_GPIO_CNF, TEGRA_GPIO_CNF_GPIO);
++	write_masked(gpio, pin, TEGRA_GPIO_OE, true);
++	return B_OK;
++}
++
++
++static status_t
++tegra_gpio_configure_input(uint32 pin)
++{
++	if (pin >= TEGRA_GPIO_PIN_COUNT)
++		return B_BAD_VALUE;
++
++	status_t status = ensure_controller();
++	if (status != B_OK)
++		return status;
++
++	tegra_gpio* gpio = sGPIO;
++	MutexLocker locker(gpio->lock);
++
++	if (gpio->owners[pin][0] == '\0')
++		return B_BAD_VALUE;
++
++	write_masked(gpio, pin, TEGRA_GPIO_OE, false);
++	write_masked(gpio, pin, TEGRA_GPIO_CNF, TEGRA_GPIO_CNF_GPIO);
++	return B_OK;
++}
++
++
++/*!	Safe in interrupt context: the masked register changes the one pin in a
++	single store, so no lock is needed. The pin must have been acquired, and
++	thereby the controller created, before.
++*/
++static status_t
++tegra_gpio_write(uint32 pin, bool level)
++{
++	tegra_gpio* gpio = sGPIO;
++	if (pin >= TEGRA_GPIO_PIN_COUNT || gpio == NULL)
++		return B_BAD_VALUE;
++	memory_read_barrier();
++
++	if (gpio->owners[pin][0] == '\0')
++		return B_BAD_VALUE;
++
++	write_masked(gpio, pin, TEGRA_GPIO_OUT, level);
++	return B_OK;
++}
++
++
++/*!	Safe in interrupt context, as write(). */
++static bool
++tegra_gpio_read(uint32 pin)
++{
++	tegra_gpio* gpio = sGPIO;
++	if (pin >= TEGRA_GPIO_PIN_COUNT || gpio == NULL)
++		return false;
++	memory_read_barrier();
++
++	// reading a pin that belongs to another consumer is harmless, and some
++	// drivers only observe a line that another driver configured
++	return (read_register(gpio, pin, TEGRA_GPIO_IN)
++		& (1U << (pin % TEGRA_GPIO_PINS_PER_PORT))) != 0;
++}
++
++
++//	#pragma mark - interrupts
++
++
++/*!	One interrupt line per bank. Reads the status of the four ports, clears
++	the events and calls the handler of each pin that fired.
++*/
++static int32
++tegra_gpio_interrupt(void* data)
++{
++	uint32 bank = (uint32)(addr_t)data;
++	tegra_gpio* gpio = sGPIO;
++	if (gpio == NULL || bank >= TEGRA_GPIO_BANK_COUNT)
++		return B_UNHANDLED_INTERRUPT;
++
++	bool handled = false;
++	volatile uint8* bankRegisters = gpio->registers
++		+ bank * TEGRA_GPIO_BANK_STRIDE;
++
++	for (uint32 port = 0; port < 4; port++) {
++		volatile uint8* portRegisters = bankRegisters + port * 4;
++		// the status of a pin is only meaningful while its interrupt is
++		// enabled
++		uint32 pending = *(volatile uint32*)(portRegisters + TEGRA_GPIO_INT_STA)
++			& *(volatile uint32*)(portRegisters + TEGRA_GPIO_INT_ENB) & 0xff;
++		if (pending == 0)
++			continue;
++
++		for (uint32 bit = 0; bit < TEGRA_GPIO_PINS_PER_PORT; bit++) {
++			if ((pending & (1U << bit)) == 0)
++				continue;
++
++			uint32 pin = bank * 32 + port * TEGRA_GPIO_PINS_PER_PORT + bit;
++
++			// A level stays active until something changes it, and would
++			// fire again at once: its interrupt goes off until the consumer
++			// calls set_interrupt() again.
++			uint32 level = *(volatile uint32*)(portRegisters
++				+ TEGRA_GPIO_INT_LVL);
++			if ((level & (1U << (8 + bit))) == 0) {
++				*(volatile uint32*)(portRegisters + TEGRA_GPIO_INT_ENB
++					+ TEGRA_GPIO_MASKED_OFFSET) = 1U << (8 + bit);
++			}
++
++			// clear first: the handler may change the trigger level
++			*(volatile uint32*)(portRegisters + TEGRA_GPIO_INT_CLR)
++				= 1U << bit;
++
++			acquire_spinlock(&gpio->interruptLock);
++			tegra_gpio_interrupt_handler handler = gpio->handlers[pin];
++			void* handlerData = gpio->handlerData[pin];
++			release_spinlock(&gpio->interruptLock);
++
++			if (handler != NULL)
++				handler(pin, handlerData);
++			handled = true;
++		}
++	}
++
++	return handled ? B_HANDLED_INTERRUPT : B_UNHANDLED_INTERRUPT;
++}
++
++
++/*!	Installs the shared interrupt handler of \a bank, once. Called with the
++	controller lock held.
++*/
++static status_t
++install_bank_interrupt(tegra_gpio* gpio, uint32 bank)
++{
++	if (gpio->interruptsInstalled[bank])
++		return B_OK;
++
++	status_t status = install_io_interrupt_handler(gpio->irqs[bank],
++		tegra_gpio_interrupt, (void*)(addr_t)bank, 0);
++	if (status == B_OK)
++		gpio->interruptsInstalled[bank] = true;
++	else
++		dprintf("tegra_gpio: cannot install interrupt for bank %" B_PRIu32
++			": %s\n", bank, strerror(status));
++
++	return status;
++}
++
++
++static status_t
++tegra_gpio_set_interrupt(uint32 pin, uint32 mode,
++	tegra_gpio_interrupt_handler handler, void* data)
++{
++	if (pin >= TEGRA_GPIO_PIN_COUNT || handler == NULL
++		|| mode > TEGRA_GPIO_INTERRUPT_ANY_CHANGE)
++		return B_BAD_VALUE;
++
++	status_t status = ensure_controller();
++	if (status != B_OK)
++		return status;
++
++	tegra_gpio* gpio = sGPIO;
++	MutexLocker locker(gpio->lock);
++
++	if (gpio->owners[pin][0] == '\0')
++		return B_BAD_VALUE;
++
++	status = install_bank_interrupt(gpio, pin / 32);
++	if (status != B_OK)
++		return status;
++
++	// no events while the trigger changes
++	write_masked(gpio, pin, TEGRA_GPIO_INT_ENB, false);
++
++	// the pin has to be an input in GPIO mode
++	write_masked(gpio, pin, TEGRA_GPIO_OE, false);
++	write_masked(gpio, pin, TEGRA_GPIO_CNF, TEGRA_GPIO_CNF_GPIO);
++
++	// The masked variant of INT_LVL only reaches the polarity bits [0:7]:
++	// the EDGE and DELTA fields [8:23] need a write of the whole port
++	// register. The controller lock protects the other pins of the port.
++	uint32 shift = pin % TEGRA_GPIO_PINS_PER_PORT;
++	uint32 fieldMask = (1U << shift) | (1U << (8 + shift))
++		| (1U << (16 + shift));
++	volatile uint32* level = (volatile uint32*)(gpio->registers
++		+ pin_register(pin, TEGRA_GPIO_INT_LVL));
++	uint32 value = *level & ~fieldMask;
++
++	switch (mode) {
++		case TEGRA_GPIO_INTERRUPT_LEVEL_HIGH:
++			value |= 1U << shift;
++			break;
++		case TEGRA_GPIO_INTERRUPT_LEVEL_LOW:
++			break;
++		case TEGRA_GPIO_INTERRUPT_RISING:
++			value |= (1U << shift) | (1U << (8 + shift));
++			break;
++		case TEGRA_GPIO_INTERRUPT_FALLING:
++			value |= 1U << (8 + shift);
++			break;
++		case TEGRA_GPIO_INTERRUPT_ANY_CHANGE:
++			value |= (1U << (8 + shift)) | (1U << (16 + shift));
++			break;
++	}
++	*level = value;
++
++	// drop a stale event, remember the handler, then enable the pin
++	*(volatile uint32*)(gpio->registers
++		+ pin_register(pin, TEGRA_GPIO_INT_CLR))
++		= 1U << shift;
++
++	{
++		// the interrupt handler takes this lock too: interrupts off
++		InterruptsSpinLocker handlerLocker(gpio->interruptLock);
++		gpio->handlers[pin] = handler;
++		gpio->handlerData[pin] = data;
++	}
++
++	write_masked(gpio, pin, TEGRA_GPIO_INT_ENB, true);
++	return B_OK;
++}
++
++
++static status_t
++tegra_gpio_clear_interrupt(uint32 pin)
++{
++	if (pin >= TEGRA_GPIO_PIN_COUNT)
++		return B_BAD_VALUE;
++
++	status_t status = ensure_controller();
++	if (status != B_OK)
++		return status;
++
++	tegra_gpio* gpio = sGPIO;
++	MutexLocker locker(gpio->lock);
++
++	if (gpio->owners[pin][0] == '\0')
++		return B_BAD_VALUE;
++
++	disable_pin_interrupt(gpio, pin);
++	return B_OK;
++}
++
++
++static tegra_gpio_interface sInterface = {
++	{
++		{
++			TEGRA_GPIO_MODULE_NAME,
++			0,
++			NULL
++		},
++		NULL
++	},
++
++	tegra_gpio_acquire,
++	tegra_gpio_release,
++	tegra_gpio_configure_output,
++	tegra_gpio_configure_input,
++	tegra_gpio_write,
++	tegra_gpio_read,
++	tegra_gpio_set_interrupt,
++	tegra_gpio_clear_interrupt
++};
++
++
++//	#pragma mark - driver
++
++
++static float
++tegra_gpio_supports_device(device_node* parent)
++{
++	const char* bus;
++	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
++			!= B_OK || strcmp(bus, "fdt") != 0) {
++		return 0.0f;
++	}
++
++	const char* compatible;
++	if (gDeviceManager->get_attr_string(parent, "fdt/compatible", &compatible,
++			false) != B_OK || strcmp(compatible, "nvidia,tegra20-gpio") != 0) {
++		return 0.0f;
++	}
++
++	return 1.0f;
++}
++
++
++static status_t
++tegra_gpio_register_device(device_node* parent)
++{
++	device_attr attrs[] = {
++		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
++			{ .string = "NVIDIA Tegra GPIO Controller" }},
++		{}
++	};
++
++	return gDeviceManager->register_node(parent, TEGRA_GPIO_DRIVER_MODULE_NAME,
++		attrs, NULL, NULL);
++}
++
++
++static status_t
++tegra_gpio_init_driver(device_node* node, void** _cookie)
++{
++	device_node* parent = gDeviceManager->get_parent_node(node);
++	fdt_device_module_info* fdt;
++	fdt_device* fdtDevice;
++	status_t status = gDeviceManager->get_driver(parent,
++		(driver_module_info**)&fdt, (void**)&fdtDevice);
++	gDeviceManager->put_node(parent);
++	if (status != B_OK)
++		return status;
++
++	uint64 registers, size;
++	if (!fdt->get_reg(fdtDevice, 0, &registers, &size))
++		return B_ERROR;
++
++	MutexLocker locker(sInitLock);
++	status = create_controller(registers, size);
++	if (status != B_OK)
++		return status;
++
++	tegra_gpio* gpio = sGPIO;
++	if (gpio->node != NULL && gpio->node != node)
++		return B_BUSY;
++	gpio->node = node;
++
++	// take the interrupt numbers from the device tree when they are there
++	for (uint32 i = 0; i < TEGRA_GPIO_BANK_COUNT; i++) {
++		uint64 irq;
++		if (fdt->get_interrupt(fdtDevice, i, NULL, &irq))
++			gpio->irqs[i] = (uint32)irq;
++	}
++
++	TRACE_GPIO("controller at %#" B_PRIx64 ", %" B_PRIu64 " bytes\n",
++		registers, size);
++	*_cookie = gpio;
++	return B_OK;
++}
++
++
++static void
++tegra_gpio_uninit_driver(void* cookie)
++{
++	tegra_gpio* gpio = (tegra_gpio*)cookie;
++
++	MutexLocker locker(sInitLock);
++	if (gpio != NULL && gpio->node != NULL)
++		gpio->node = NULL;
++
++	// The registers stay mapped: consumers of the interface may still be
++	// running, and they keep this image loaded.
++}
++
++
++static driver_module_info sDriver = {
++	{
++		TEGRA_GPIO_DRIVER_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	tegra_gpio_supports_device,
++	tegra_gpio_register_device,
++	tegra_gpio_init_driver,
++	tegra_gpio_uninit_driver,
++	NULL,	// register_child_devices
++	NULL,	// rescan
++	NULL,	// device_removed
++};
++
++
++module_dependency module_dependencies[] = {
++	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&gDeviceManager },
++	{}
++};
++
++
++module_info* modules[] = {
++	(module_info*)&sDriver,
++	(module_info*)&sInterface,
++	NULL
++};
+diff --git a/src/add-ons/kernel/busses/i2c/nvec/Jamfile b/src/add-ons/kernel/busses/i2c/nvec/Jamfile
+index ffc5236d48..0a03d6c0ce 100644
+--- a/src/add-ons/kernel/busses/i2c/nvec/Jamfile
++++ b/src/add-ons/kernel/busses/i2c/nvec/Jamfile
+@@ -1,7 +1,7 @@
+ SubDir HAIKU_TOP src add-ons kernel busses i2c nvec ;
+ 
+ UsePrivateKernelHeaders ;
+-UsePrivateHeaders device drivers input ;
++UsePrivateHeaders device drivers gpio input ;
+ 
+ KernelAddon nvec :
+ 	nvec.cpp
+diff --git a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+index c9b4f9a769..02f9ac0bad 100644
+--- a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
++++ b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+@@ -28,6 +28,7 @@
+ #include <bus/FDT.h>
+ 
+ #include <fs/select_sync_pool.h>
++#include <gpio/tegra.h>
+ #include <kernel.h>
+ #include <lock.h>
+ #include <util/AutoLock.h>
+@@ -78,19 +79,12 @@
+ #define TEGRA20_APB_MISC_BASE		0x70000000
+ #define TEGRA_PINMUX_TRI_DTF		0x20	// tristate register, bit 12
+ #define TEGRA_PINMUX_MUX_DTF		0x98	// mux register, bits 30-31
+-#define TEGRA20_GPIO_BASE			0x6000d000
+ #define TEGRA20_PWM_BASE			0x7000a000	// channel 0: backlight
+ #define TEGRA20_CLK_PWM				17
+ #define TEGRA_PWM_ENABLE			(1U << 31)
+ #define TEGRA_PWM_DUTY_SHIFT		16
+ #define TEGRA_PWM_DUTY_MASK			(0x1ffU << 16)	// 0 - 256
+ #define BACKLIGHT_LEVELS			16
+-#define TEGRA_GPIO_REG(gpio, reg)	(((gpio) / 32) * 0x80 \
+-										+ (((gpio) / 8) % 4) * 4 + (reg))
+-#define TEGRA_GPIO_CNF				0x00
+-#define TEGRA_GPIO_OE				0x10
+-#define TEGRA_GPIO_MSK_OUT			0x820
+-	// masked write: bit n + 8 selects bit n
+ 
+ // message types
+ enum {
+@@ -198,15 +192,14 @@ struct nvec_device {
+ 
+ 	area_id				registersArea;
+ 	volatile uint8*		registers;
+-	area_id				gpioArea;
+ 	area_id				pwmArea;
+ 	volatile uint32*	pwm;			// backlight, if its clock runs
+ 	int32				backlightLevel;	// 1 - BACKLIGHT_LEVELS
+ 	bool				lidClosed;		// the backlight is off meanwhile
+ 	uint32				lidPwm;			// the PWM setting before the lid closed
+-	volatile uint8*		gpio;
+ 	uint32				requestGPIO;
+ 	bool				requestActiveLow;
++	bool				requestGPIOAcquired;
+ 	uint32				slaveAddress;
+ 	uint64				irq;
+ 
+@@ -333,6 +326,7 @@ struct nvec_handle {
+ 
+ static device_manager_info* gDeviceManager;
+ static nvec_device* sPowerOffDevice;
++static tegra_gpio_interface* sTegraGPIO;
+ 
+ extern "C" void (*gArmPowerOffHook)(void);
+ 
+@@ -363,10 +357,21 @@ set_request(nvec_device* device, bool asserted)
+ 	bool level = asserted != device->requestActiveLow;
+ 	// the EC is asked to read when the line goes low
+ 	level = !level;
+-	uint32 bit = 1 << (device->requestGPIO % 8);
+-	*(volatile uint32*)(device->gpio
+-			+ TEGRA_GPIO_REG(device->requestGPIO, TEGRA_GPIO_MSK_OUT))
+-		= (bit << 8) | (level ? bit : 0);
++	if (sTegraGPIO != NULL)
++		sTegraGPIO->write(device->requestGPIO, level);
++}
++
++
++static void
++release_request_gpio(nvec_device* device)
++{
++	if (sTegraGPIO == NULL)
++		return;
++	if (device->requestGPIOAcquired)
++		sTegraGPIO->release(device->requestGPIO, "nvec");
++	device->requestGPIOAcquired = false;
++	put_module(TEGRA_GPIO_MODULE_NAME);
++	sTegraGPIO = NULL;
+ }
+ 
+ 
+@@ -444,16 +449,27 @@ setup_hardware(nvec_device* device)
+ 	*tristate &= ~(1U << 12);
+ 	delete_area(area);
+ 
+-	status = map_registers("tegra gpio", TEGRA20_GPIO_BASE, &device->gpioArea,
+-		&device->gpio);
++	// the request line, not asserted: the EC is asked to read when it
++	// goes low
++	// (setup_hardware() runs again when the controller is restarted)
++	if (sTegraGPIO == NULL) {
++		status = get_module(TEGRA_GPIO_MODULE_NAME,
++			(module_info**)&sTegraGPIO);
++		if (status != B_OK) {
++			sTegraGPIO = NULL;
++			return status;
++		}
++	}
++	if (!device->requestGPIOAcquired) {
++		status = sTegraGPIO->acquire(device->requestGPIO, "nvec");
++		if (status != B_OK)
++			return status;
++		device->requestGPIOAcquired = true;
++	}
++	status = sTegraGPIO->configure_output(device->requestGPIO,
++		!device->requestActiveLow);
+ 	if (status != B_OK)
+ 		return status;
+-	set_request(device, false);
+-	uint32 gpioBit = 1U << (device->requestGPIO % 8);
+-	*(volatile uint32*)(device->gpio
+-		+ TEGRA_GPIO_REG(device->requestGPIO, TEGRA_GPIO_CNF)) |= gpioBit;
+-	*(volatile uint32*)(device->gpio
+-		+ TEGRA_GPIO_REG(device->requestGPIO, TEGRA_GPIO_OE)) |= gpioBit;
+ 
+ 
+ 	setup_slave(device);
+@@ -1927,7 +1943,7 @@ nvec_init_driver(device_node* node, void** _cookie)
+ 	mutex_init(&device->diagLock, "nvec diag");
+ 	device->diagSem = -1;
+ 	device->diagClass = -1;
+-	device->registersArea = device->gpioArea = device->pwmArea = -1;
++	device->registersArea = device->pwmArea = -1;
+ 	device->rxSem = device->txSem = device->transferSem = device->keySem
+ 		= device->mouseSem = -1;
+ 	device->repeatDelay = 300000;
+@@ -2022,8 +2038,8 @@ err:
+ 	delete_sem(device->keySem);
+ 	delete_sem(device->mouseSem);
+ 	delete_area(device->registersArea);
+-	delete_area(device->gpioArea);
+ 	delete_area(device->pwmArea);
++	release_request_gpio(device);
+ 	delete device;
+ 	return status;
+ }
+@@ -2050,8 +2066,8 @@ nvec_uninit_driver(void* cookie)
+ 	wait_for_thread(device->txThread, &result);
+ 	wait_for_thread(device->pollThread, &result);
+ 	delete_area(device->registersArea);
+-	delete_area(device->gpioArea);
+ 	delete_area(device->pwmArea);
++	release_request_gpio(device);
+ 	delete device;
+ }
+ 
+diff --git a/src/add-ons/kernel/busses/mmc/Jamfile b/src/add-ons/kernel/busses/mmc/Jamfile
+index 421cf70b2c..54134f24c4 100644
+--- a/src/add-ons/kernel/busses/mmc/Jamfile
++++ b/src/add-ons/kernel/busses/mmc/Jamfile
+@@ -3,7 +3,7 @@ SubDir HAIKU_TOP src add-ons kernel busses mmc ;
+ SubDirC++Flags -fno-rtti ;
+ 
+ UsePrivateKernelHeaders ;
+-UsePrivateHeaders drivers ;
++UsePrivateHeaders drivers gpio ;
+ SubDirHdrs $(HAIKU_TOP) src system kernel device_manager ;
+ SubDirHdrs $(HAIKU_TOP) src add-ons kernel bus_managers acpi acpica include ;
+ SubDirHdrs $(HAIKU_TOP) src add-ons kernel bus_managers acpi acpica include platform ;
+diff --git a/src/add-ons/kernel/busses/mmc/sdhci_fdt.cpp b/src/add-ons/kernel/busses/mmc/sdhci_fdt.cpp
+index f8c21164e2..c04bf16d4c 100644
+--- a/src/add-ons/kernel/busses/mmc/sdhci_fdt.cpp
++++ b/src/add-ons/kernel/busses/mmc/sdhci_fdt.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <bus/FDT.h>
+ #include <ByteOrder.h>
++#include <gpio/tegra.h>
+ #include <KernelExport.h>
+ 
+ #include "mmc.h"
+@@ -44,13 +45,6 @@
+ #define TEGRA_CAR_DIVIDER_MASK			0xff
+ 
+ // Tegra 2's PLLP always runs at 216 MHz
+-#define TEGRA20_GPIO_BASE				0x6000d000
+-#define TEGRA_GPIO_REG(gpio, reg)		(((gpio) / 32) * 0x80 \
+-											+ (((gpio) / 8) % 4) * 4 + (reg))
+-#define TEGRA_GPIO_CNF					0x00
+-#define TEGRA_GPIO_OE					0x10
+-#define TEGRA_GPIO_OUT					0x20
+-#define TEGRA_GPIO_IN					0x30
+ #define GPIO_ACTIVE_LOW					1
+ 
+ #define TEGRA20_PLLP_KHZ				216000
+@@ -170,6 +164,25 @@ tegra20_setup_clock(fdt_device_module_info* module, fdt_device* dev,
+ }
+ 
+ 
++static tegra_gpio_interface* gTegraGPIO;
++
++
++static status_t
++get_tegra_gpio()
++{
++	if (gTegraGPIO != NULL)
++		return B_OK;
++
++	status_t status = get_module(TEGRA_GPIO_MODULE_NAME,
++		(module_info**)&gTegraGPIO);
++	if (status != B_OK) {
++		gTegraGPIO = NULL;
++		ERROR("no Tegra GPIO controller: %s\n", strerror(status));
++	}
++	return status;
++}
++
++
+ /*!	Accesses the GPIO named by the device tree property \a name. If \a output
+ 	is true, the GPIO is driven to \a value, else it is made an input. Returns
+ 	the logical (active level corrected) state of the line.
+@@ -183,37 +196,26 @@ tegra20_gpio(fdt_device_module_info* module, fdt_device* dev,
+ 	if (cells == NULL || length < 12)
+ 		return B_ENTRY_NOT_FOUND;
+ 
+-	uint32 phandle = B_BENDIAN_TO_HOST_INT32(cells[0]);
+ 	uint32 gpio = B_BENDIAN_TO_HOST_INT32(cells[1]);
+ 	bool activeLow = (B_BENDIAN_TO_HOST_INT32(cells[2]) & GPIO_ACTIVE_LOW) != 0;
+ 
+-	uint64 base, size;
+-	if (!fdt_get_phandle_reg(module, dev, phandle, &base, &size))
+-		base = TEGRA20_GPIO_BASE;
++	status_t status = get_tegra_gpio();
++	if (status != B_OK)
++		return status;
+ 
+-	volatile uint32* regs;
+-	area_id area = map_physical_memory("tegra gpio", base, B_PAGE_SIZE,
+-		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
+-		(void**)&regs);
+-	if (area < B_OK)
+-		return area;
+-
+-	uint32 bit = 1U << (gpio % 8);
+-	regs[TEGRA_GPIO_REG(gpio, TEGRA_GPIO_CNF) / 4] |= bit;
+-	if (output) {
+-		if (value != activeLow)
+-			regs[TEGRA_GPIO_REG(gpio, TEGRA_GPIO_OUT) / 4] |= bit;
+-		else
+-			regs[TEGRA_GPIO_REG(gpio, TEGRA_GPIO_OUT) / 4] &= ~bit;
+-		regs[TEGRA_GPIO_REG(gpio, TEGRA_GPIO_OE) / 4] |= bit;
+-	} else
+-		regs[TEGRA_GPIO_REG(gpio, TEGRA_GPIO_OE) / 4] &= ~bit;
++	status = gTegraGPIO->acquire(gpio, "sdhci");
++	if (status != B_OK)
++		return status;
+ 
+-	bool level = (regs[TEGRA_GPIO_REG(gpio, TEGRA_GPIO_IN) / 4] & bit) != 0;
+-	delete_area(area);
++	if (output)
++		status = gTegraGPIO->configure_output(gpio, value != activeLow);
++	else
++		status = gTegraGPIO->configure_input(gpio);
++	if (status != B_OK)
++		return status;
+ 
+ 	if (_active != NULL)
+-		*_active = level != activeLow;
++		*_active = gTegraGPIO->read(gpio) != activeLow;
+ 	return B_OK;
+ }
+ 
+diff --git a/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp b/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
+index a262237f08..415c5dc286 100644
+--- a/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
++++ b/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
+@@ -34,13 +34,15 @@
+ #include <KernelExport.h>
+ #include <device_manager.h>
+ #include <driver_settings.h>
+-#include <hmulti_audio.h>
+ #include <i2c.h>
+ #include <kernel.h>
+ #include <lock.h>
+ #include <util/AutoLock.h>
+ #include <vm/vm.h>
+ 
++// after the kernel headers: its <Debug.h> keeps their ASSERT
++#include <hmulti_audio.h>
++
+ 
+ #define TRACE_ALWAYS(x...)	dprintf("tegra_audio: " x)
+ 
+@@ -187,6 +189,8 @@ struct tegra_audio_diag {
+ #define GPIO_CNF					0x00
+ #define GPIO_OE						0x10
+ #define GPIO_IN						0x30
++#define GPIO_MSK_CNF				0x800
++#define GPIO_MSK_OE					0x810
+ #define GPIO_PORT_W					22
+ #define HP_DETECT_BIT				(1U << 2)
+ // the HDMI hot plug line, GPIO N7 (the tegra_dc driver makes it a GPIO)
+@@ -554,11 +558,11 @@ start_jack_detection(tegra_audio* audio)
+ 	audio->hdmiPort = audio->gpioPort + GPIO_PORT_OFFSET(GPIO_PORT_N);
+ 	audio->gpioPort += GPIO_PORT_OFFSET(GPIO_PORT_W);
+ 
+-	// a GPIO, as an input
+-	write32(audio->gpioPort, GPIO_OE,
+-		read32(audio->gpioPort, GPIO_OE) & ~HP_DETECT_BIT);
+-	write32(audio->gpioPort, GPIO_CNF,
+-		read32(audio->gpioPort, GPIO_CNF) | HP_DETECT_BIT);
++	// a GPIO, as an input; the masked writes leave the other pins of
++	// port W alone
++	write32(audio->gpioPort, GPIO_MSK_OE, (HP_DETECT_BIT << 8));
++	write32(audio->gpioPort, GPIO_MSK_CNF,
++		(HP_DETECT_BIT << 8) | HP_DETECT_BIT);
+ 
+ 	audio->headphones = -1;
+ 	audio->hdmi = -1;
+-- 
+2.39.5
+

@@ -1,0 +1,71 @@
+From 8e444851170dd0692a78fb9d9a9e96b1a61fa262 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Wed, 11 Nov 2026 23:00:25 +0100
+Subject: [PATCH 36/42] bluetooth_audio: publish the clock twice a second,
+ below real time
+
+A thread published the time of the Bluetooth output every 50 ms at
+urgent priority (110), also while nothing played. It now does so every
+500 ms at B_URGENT_DISPLAY_PRIORITY: publishing the time is no audio
+work.
+
+The clock runs at the real time, which BTimeSource extrapolates, so the
+publishing looked useless; but without it the node received no buffers
+from the mixer (on the AC100 it never saw sound to play and never called
+the speakers), why is not understood yet. Twice a second keeps that
+working.
+
+On the Toshiba AC100 the thread woke the CPU 20 times a second and,
+being of real time priority, kept the cpufreq governor at a high rate.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../bluetooth_audio/BluetoothAudioNode.cpp          | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp b/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp
+index f94443600c..aa3aa2175a 100644
+--- a/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp
++++ b/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp
+@@ -57,6 +57,8 @@ static const bigtime_t kRecallInterval = 30000000;
+ static const bigtime_t kDefaultOutputDelay = 150000;
+ // below this, a sample is silence (16-bit)
+ static const int16 kSilence = 16;
++// the time of the running clock is published again this often
++static const bigtime_t kClockInterval = 500000;
+ 
+ enum {
+ 	kParameterVolume = 1
+@@ -159,7 +161,7 @@ BluetoothAudioNode::NodeRegistered()
+ 	if (fLinkThread >= 0)
+ 		resume_thread(fLinkThread);
+ 	fClockThread = spawn_thread(_ClockThread, "bluetooth audio clock",
+-		B_URGENT_PRIORITY, this);
++		B_URGENT_DISPLAY_PRIORITY, this);
+ 	if (fClockThread >= 0)
+ 		resume_thread(fClockThread);
+ }
+@@ -376,12 +378,19 @@ BluetoothAudioNode::SetRunMode(run_mode mode)
+ }
+ 
+ 
++/*!	Publishes the time of the running clock again now and then. It runs at
++	the real time, which BTimeSource extrapolates, but without publishing it
++	again the node received no buffers from the mixer (seen on the AC100;
++	why is not understood yet). Twice a second is enough, and a priority
++	below real time: it is no audio work, and a thread of real time priority
++	that wakes up all the time keeps a cpufreq governor at a high rate.
++*/
+ status_t
+ BluetoothAudioNode::_ClockThread(void* self)
+ {
+ 	BluetoothAudioNode* node = (BluetoothAudioNode*)self;
+ 	while (!node->fQuitting) {
+-		snooze(50000);
++		snooze(kClockInterval);
+ 		BAutolock _(node->fClockLock);
+ 		if (!node->fClockRunning)
+ 			continue;
+-- 
+2.39.5
+

@@ -1,0 +1,147 @@
+From 2fd6b5530ba366402c53d46252168582268187ae Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 10 Nov 2026 07:42:52 +0100
+Subject: [PATCH 19/42] bluetooth_audio: call the speakers back, and keep them
+ when not the output
+
+Once the speakers could not be reached, the media server moved the mixer
+to another output, and the node, no longer the output, left the radio
+alone: the calls every 30 s meant to take the sound back were never made,
+and the speakers stayed unavailable until the media services restarted.
+
+While unavailable and not the output, the node now calls the speakers
+every 30 s (counted from the end of a call, which pages for a while) and
+listens for them to connect by themselves; it says they can play again
+when either works. When a stream breaks, or the speakers close it while
+there is sound, the sound goes elsewhere at once, before the channels
+are closed, which may take a while with speakers that are gone.
+
+A node that stops being the output (another one was chosen) suspends the
+stream and keeps the speakers connected, so that the sound comes back at
+once when it is the output again.
+
+Tested on the AC100 with a Google Home: the sound moves to the internal
+speakers within a second when the speakers go.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../bluetooth_audio/BluetoothAudioNode.cpp    | 57 ++++++++++++++++---
+ 1 file changed, 48 insertions(+), 9 deletions(-)
+
+diff --git a/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp b/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp
+index eaaec03082..f94443600c 100644
+--- a/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp
++++ b/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp
+@@ -50,7 +50,8 @@ static const bigtime_t kSilenceSuspends = 30000000;
+ // how often the speakers are called while sound waits for them
+ static const bigtime_t kCallInterval = 15000000;
+ // while the sound plays elsewhere, the speakers are called this often, to
+-// take it back when they can be reached again
++// take it back when they can be reached again: counted from the end of a
++// call, which pages for a while, so that the radio is not paging all along
+ static const bigtime_t kRecallInterval = 30000000;
+ // how late speakers play, when they do not tell (A2DP delay reporting)
+ static const bigtime_t kDefaultOutputDelay = 150000;
+@@ -582,6 +583,7 @@ BluetoothAudioNode::_Link()
+ 	A2dpSource source;
+ 	source.SetPacingEnabled(false);
+ 		// the mixer gives the audio as it plays
++	source.SetQuitFlag(&fQuitting);
+ 	AvrcpTarget remote;
+ 	bool remoteListening = false;
+ 	remote.SetTrack(fName.String(), "RenkuOS", "", -1);
+@@ -593,13 +595,44 @@ BluetoothAudioNode::_Link()
+ 	int32 lastRemoteVolume = -1;
+ 
+ 	while (!fQuitting) {
+-		// a node that is not the output of the mixer leaves the radio alone
++		bigtime_t now = system_time();
++
++		if (fInput.source == media_source::null && !fAvailable) {
++			// out of reach before, the sound plays elsewhere meanwhile:
++			// the speakers are called back now and then, and taken back
++			// when they connect by themselves
++			_Drop(0);
++			if (!remoteListening)
++				remoteListening = remote.Listen() == B_OK;
++			bdaddr_t from;
++			if (now - calledAt > kRecallInterval) {
++				TRACE("%s: calling the speakers back\n", fName.String());
++				status_t status = source.Connect(fAddress);
++				calledAt = system_time();
++				if (status == B_OK) {
++					remotePaused = false;
++					_SetAvailable(true);
++				}
++			} else if (source.WaitForSink(500000, &from) == B_OK) {
++				TRACE("%s: the speakers connected\n", fName.String());
++				remotePaused = false;
++				_SetAvailable(true);
++			} else if (system_time() - now < 100000) {
++				// nothing to wait on (the channel may be taken): no
++				// turning round in a loop
++				acquire_sem_etc(fDataSem, 1, B_RELATIVE_TIMEOUT, 500000);
++			}
++			continue;
++		}
++
++		// a node that is not the output of the mixer sends nothing: the
++		// stream is suspended, the speakers stay connected, so that the
++		// sound comes back at once when the node is the output again (and
++		// the mixer comes in a moment, after speakers were called back)
+ 		if (fInput.source == media_source::null) {
+-			if (source.IsConnected()) {
++			if (source.IsStreaming()) {
+ 				TRACE("%s: no longer the audio output\n", fName.String());
+-				if (source.IsStreaming())
+-					source.StopStream();
+-				source.Disconnect();
++				source.StopStream();
+ 				remote.SetStatus(false, 0);
+ 			}
+ 			_Drop(0);
+@@ -619,7 +652,6 @@ BluetoothAudioNode::_Link()
+ 				remotePaused = false;
+ 		}
+ 
+-		bigtime_t now = system_time();
+ 		bool sound = _SoundSince(now - 2000000);
+ 
+ 		// the delay the speakers told: the latency the mixer plans with
+@@ -654,10 +686,11 @@ BluetoothAudioNode::_Link()
+ 			// the sound plays elsewhere, they are called all the same
+ 			if ((sound && now - calledAt > kCallInterval)
+ 				|| (!fAvailable && now - calledAt > kRecallInterval)) {
+-				calledAt = now;
+ 				TRACE("%s: %s, calling the speakers\n", fName.String(),
+ 					sound ? "sound to play" : "to take the sound back");
+-				if (source.Connect(fAddress) == B_OK) {
++				status_t status = source.Connect(fAddress);
++				calledAt = system_time();
++				if (status == B_OK) {
+ 					TRACE("%s: connected (%" B_PRIu32 " Hz)\n",
+ 						fName.String(), source.SampleRate());
+ 					remotePaused = false;
+@@ -681,6 +714,9 @@ BluetoothAudioNode::_Link()
+ 		if (!source.IsStreaming()) {
+ 			if (!source.CheckStream()) {
+ 				TRACE("%s: the speakers closed the stream\n", fName.String());
++				// they play something else now: the sound goes elsewhere
++				if (sound)
++					_SetAvailable(false);
+ 				source.Disconnect();
+ 				remote.SetStatus(false, 0);
+ 				continue;
+@@ -735,6 +771,9 @@ BluetoothAudioNode::_Link()
+ 		} else {
+ 			TRACE("%s: the link went (%s)\n", fName.String(),
+ 				strerror(status));
++			// the sound goes elsewhere at once, before the channels are
++			// closed, which may take a while with speakers that are gone
++			_SetAvailable(false);
+ 			source.Disconnect();
+ 			remote.SetStatus(false, 0);
+ 			calledAt = system_time();
+-- 
+2.39.5
+

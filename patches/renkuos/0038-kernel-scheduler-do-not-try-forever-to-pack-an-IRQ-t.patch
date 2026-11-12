@@ -1,0 +1,50 @@
+From 66807d01fb77faccbdc9a52e7cb4379a92fe7fef Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Thu, 12 Nov 2026 08:08:49 +0100
+Subject: [PATCH 38/42] kernel/scheduler: do not try forever to pack an IRQ
+ that stays
+
+In power saving mode, a CPU going idle moves its interrupts to the core
+that takes the small tasks, one at a time, until its list is empty. When
+the architecture keeps an interrupt where it is (one that belongs to
+that CPU, or any interrupt when they are not spread at all), it stays
+the first of the list and the loop never ends, with the scheduler lock
+held.
+
+On a Toshiba AC100 (Tegra 2, ARM), switching to power saving mode froze
+the machine within a second: the private timer interrupt of CPU 0 could
+not be moved. pack_irqs() now stops when the interrupt it tried to move
+is still the first one of the list, and when the target is this CPU.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/system/kernel/scheduler/power_saving.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/system/kernel/scheduler/power_saving.cpp b/src/system/kernel/scheduler/power_saving.cpp
+index 600c1cd471..0fbb3c4ea5 100644
+--- a/src/system/kernel/scheduler/power_saving.cpp
++++ b/src/system/kernel/scheduler/power_saving.cpp
+@@ -212,11 +212,17 @@ pack_irqs()
+ 		locker.Unlock();
+ 
+ 		int32 newCPU = smallTaskCore->CPUHeap()->PeekRoot()->ID();
++		if (newCPU == cpu->cpu_num)
++			return;
+ 
+-		if (newCPU != cpu->cpu_num)
+-			assign_io_interrupt_to_cpu(irq->irq, newCPU);
++		assign_io_interrupt_to_cpu(irq->irq, newCPU);
+ 
++		// The architecture may keep an interrupt where it is (one that
++		// belongs to this CPU, or none moved at all): it is still the first
++		// one then, and trying again would never end.
+ 		locker.Lock();
++		if (cpu->irqs.First() == irq)
++			return;
+ 	}
+ }
+ 
+-- 
+2.39.5
+

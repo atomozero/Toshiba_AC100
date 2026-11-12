@@ -1,0 +1,138 @@
+From 7314e25b64a5ac88a8bda62dab598bd8e9a19dd8 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 10 Nov 2026 07:42:23 +0100
+Subject: [PATCH 15/42] media_server: a default chosen while running is the
+ saved one
+
+The saved defaults were read once, at start, and SaveState() wrote the
+file without keeping what it wrote. After an output was chosen in Media
+(or for Bluetooth speakers), the rescan still took the one saved at start
+for the preference: an output standing in for the chosen one was taken
+for the saved one "present again", and the chosen one was never gone
+back to.
+
+SaveState() now keeps what it wrote as the saved defaults. The list is
+guarded by a lock of its own and read as a copy, as the rescan thread
+reads it while a change of default replaces it.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/servers/media/DefaultManager.cpp | 40 ++++++++++++++++++++--------
+ src/servers/media/DefaultManager.h   |  4 ++-
+ 2 files changed, 32 insertions(+), 12 deletions(-)
+
+diff --git a/src/servers/media/DefaultManager.cpp b/src/servers/media/DefaultManager.cpp
+index 33434543d7..4414640220 100644
+--- a/src/servers/media/DefaultManager.cpp
++++ b/src/servers/media/DefaultManager.cpp
+@@ -58,6 +58,7 @@ DefaultManager::DefaultManager()
+ 	fTimeSource(-1),
+ 	fAudioMixer(-1),
+ 	fPhysicalAudioOutInputID(0),
++	fMsgListLock("default manager saved defaults"),
+ 	fRescanThread(-1),
+ 	fRescanRequested(0),
+ 	fRescanLock("rescan default manager"),
+@@ -171,10 +172,11 @@ DefaultManager::SaveState(NodeManager *node_manager)
+ 		// boot without the device forgets it for good -- and neither must
+ 		// having found no node at all, which this used to skip. Write back
+ 		// what was loaded instead.
+-		BMessage* saved = _SavedDefault(default_types[i]);
+-		if (saved != NULL && (media_node_ids[i] == -1
++		BMessage saved;
++		if (_SavedDefault(default_types[i], &saved)
++			&& (media_node_ids[i] == -1
+ 				|| fUsingFallback[_TypeIndex(default_types[i])])) {
+-			list.AddItem(new BMessage(*saved));
++			list.AddItem(new BMessage(saved));
+ 			continue;
+ 		}
+ 
+@@ -229,11 +231,21 @@ DefaultManager::SaveState(NodeManager *node_manager)
+ 			return B_ERROR;
+ 		if (settings->Flatten(&file) < B_OK)
+ 			return B_ERROR;
+-		delete settings;
+ 	}
+ 	if (file.Write(fEndHeader, sizeof(uint32)*3) < (int32)sizeof(uint32)*3)
+ 		return B_ERROR;
+ 
++	// What was written is the preference from now on. It was only read at
++	// start, so a default chosen later (in Media, or for Bluetooth
++	// speakers) was not known as saved: an output standing in for it was
++	// then taken for the saved one "present again", and the chosen one was
++	// never gone back to.
++	BAutolock locker(fMsgListLock);
++	for (int32 i = 0; i < fMsgList.CountItems(); i++)
++		delete (BMessage*)fMsgList.ItemAt(i);
++	fMsgList.MakeEmpty();
++	fMsgList.AddList(&list);
++
+ 	return B_OK;
+ }
+ 
+@@ -558,7 +570,8 @@ DefaultManager::_FindPhysical(volatile media_node_id *id, uint32 default_type,
+ 	// broke out only on a type match, so with no entry saved for THIS type it
+ 	// was left pointing at another type's entry, with msgDninfo never filled
+ 	// in -- and the uninitialised name then matched no device at all.
+-	BMessage *msg = _SavedDefault(default_type);
++	BMessage savedMsg;
++	BMessage *msg = _SavedDefault(default_type, &savedMsg) ? &savedMsg : NULL;
+ 	if (msg != NULL) {
+ 		const char *name = NULL;
+ 		const char *path = NULL;
+@@ -733,18 +746,23 @@ DefaultManager::_TypeIndex(uint32 defaultType)
+ }
+ 
+ 
+-/*!	The saved default of \a defaultType as loaded at start, or NULL. */
+-BMessage*
+-DefaultManager::_SavedDefault(uint32 defaultType) const
++/*!	Copies the saved default of \a defaultType into \a _saved: a copy, as
++	SaveState() replaces the list while a rescan reads it.
++*/
++bool
++DefaultManager::_SavedDefault(uint32 defaultType, BMessage* _saved) const
+ {
++	BAutolock locker(fMsgListLock);
+ 	for (int32 i = 0; i < fMsgList.CountItems(); i++) {
+ 		BMessage* msg = (BMessage*)fMsgList.ItemAt(i);
+ 		int32 msgType;
+ 		if (msg->FindInt32(kDefaultManagerType, &msgType) == B_OK
+-			&& (uint32)msgType == defaultType)
+-			return msg;
++			&& (uint32)msgType == defaultType) {
++			*_saved = *msg;
++			return true;
++		}
+ 	}
+-	return NULL;
++	return false;
+ }
+ 
+ 
+diff --git a/src/servers/media/DefaultManager.h b/src/servers/media/DefaultManager.h
+index ea19b35e2a..ce86a60642 100644
+--- a/src/servers/media/DefaultManager.h
++++ b/src/servers/media/DefaultManager.h
+@@ -67,7 +67,8 @@ private:
+ 
+ 			// See _FindPhysical().
+ 			static	int32		_TypeIndex(uint32 defaultType);
+-			BMessage*			_SavedDefault(uint32 defaultType) const;
++			bool				_SavedDefault(uint32 defaultType,
++									BMessage* _saved) const;
+ 			bool				_IsUnavailable(media_node_id node);
+ 
+ private:
+@@ -86,6 +87,7 @@ private:
+ 			media_input 		fPhysicalAudioOutFromMixer;
+ 
+ 			BList				fMsgList;
++			mutable BLocker		fMsgListLock;
+ 
+ 			// Per default type (_TypeIndex()), whether the current
+ 			// default is only standing in because the saved one was absent at
+-- 
+2.39.5
+

@@ -1,0 +1,299 @@
+From b42c9cab73b37345a07c14ee57053ae6a92ac56c Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 10 Nov 2026 23:06:16 +0100
+Subject: [PATCH 32/42] tegra_dc: switch the panel off while the screen sleeps
+
+DPMS only switched the backlight off. The panel itself stayed powered and
+window A kept reading the frame buffer: on the Toshiba AC100 about 1 W
+went to a dark screen.
+
+Every mode but on now also stops window A reading the frame buffer and,
+after a frame, switches the panel's supply off: the GPIO of the fixed
+regulator the panel's "power-supply" names in the device tree (GPIO A4,
+"+3VS,vdd_pnl", on the AC100), through the tegra_gpio module. Waking up
+powers the panel, waits 50 ms, enables window A and waits two frames
+more before the backlight goes on. The display controller keeps its
+timing, so the vertical blank interrupt and the retrace semaphore go on
+while the screen sleeps. Closing the device wakes the panel again, for
+the frame buffer console.
+
+"panel_power_off false" in the tegra_dc driver settings keeps the panel
+powered.
+
+Measured on the AC100 on battery (tests/ac100diag/ac100power dpms):
+4.65 W with the screen on, 3.14 W with it asleep (1.51 W saved; 0.55 W
+with the backlight alone). Going to sleep takes 37 ms, waking up 104 ms.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../kernel/drivers/graphics/tegra_dc/Jamfile  |   1 +
+ .../drivers/graphics/tegra_dc/tegra_dc.cpp    | 185 +++++++++++++++++-
+ 2 files changed, 183 insertions(+), 3 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/Jamfile b/src/add-ons/kernel/drivers/graphics/tegra_dc/Jamfile
+index ff28148c1a..800eb47ae1 100644
+--- a/src/add-ons/kernel/drivers/graphics/tegra_dc/Jamfile
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/Jamfile
+@@ -2,6 +2,7 @@ SubDir HAIKU_TOP src add-ons kernel drivers graphics tegra_dc ;
+ 
+ UsePrivateHeaders [ FDirName graphics common ] ;
+ UsePrivateHeaders [ FDirName graphics tegra_dc ] ;
++UsePrivateHeaders gpio ;
+ UsePrivateKernelHeaders ;
+ UseLibraryHeaders [ FDirName libfdt ] ;
+ 
+diff --git a/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp b/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
+index 409e1fd80a..c0f8fb94bd 100644
+--- a/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
++++ b/src/add-ons/kernel/drivers/graphics/tegra_dc/tegra_dc.cpp
+@@ -16,6 +16,14 @@
+ 
+ 	The driver only publishes its device when it finds this state. Otherwise
+ 	app_server keeps using the generic frame buffer driver.
++
++	While the screen sleeps (any DPMS mode but on), the backlight is off,
++	window A stops reading the frame buffer and, if the device tree names the
++	GPIO that switches the panel's supply, the panel is switched off too
++	(about 0.9 W on the AC100). The display controller keeps running, so the
++	vertical blank interrupt and the retrace semaphore go on. The setting
++	"panel_power_off false" in ~/config/settings/kernel/drivers/tegra_dc
++	keeps the panel powered.
+ */
+ 
+ 
+@@ -25,12 +33,14 @@
+ #include <KernelExport.h>
+ #include <OS.h>
+ #include <boot_item.h>
++#include <driver_settings.h>
+ #include <frame_buffer_console.h>
+ #include <graphic_driver.h>
+ #include <lock.h>
+ #include <util/AutoLock.h>
+ #include <vm/vm.h>
+ 
++#include <gpio/tegra.h>
+ #include <libfdt.h>
+ 
+ #include "hdmi.h"
+@@ -204,6 +214,12 @@ struct tegra_dc_device {
+ 	volatile uint32*	pwm;
+ 	uint32				saved_pwm;		// while the screen sleeps
+ 
++	// the GPIO switching the panel's supply, if the device tree names one
++	tegra_gpio_interface* gpio;
++	int32				panel_power_pin;
++	bool				panel_power_high;	// level that switches it on
++	bool				panel_asleep;		// window A parked, panel off
++
+ 	// hardware cursor, on window C
+ 	bool				cursor_ready;	// window C and blending set up
+ 	bool				cursor_shown;
+@@ -451,8 +467,157 @@ set_backlight_duty(uint32 duty)
+ }
+ 
+ 
+-/*!	The panel has no power saving modes of its own here: all of them switch
+-	the backlight off, and on again as it was.
++//	#pragma mark - panel power
++
++
++/*!	Finds the GPIO of the regulator the panel's "power-supply" names, as in
++	the AC100's device tree: a "regulator-fixed" with "gpio" on the Tegra
++	GPIO controller ("+3VS,vdd_pnl", GPIO A4). Returns the pin, or -1.
++*/
++static int32
++find_panel_power_pin(bool& activeHigh)
++{
++	if (gFDT == NULL)
++		return -1;
++
++	int panel = fdt_path_offset(gFDT, "/panel");
++	if (panel < 0)
++		return -1;
++	int length;
++	const fdt32_t* supply = (const fdt32_t*)fdt_getprop(gFDT, panel,
++		"power-supply", &length);
++	if (supply == NULL || length < (int)sizeof(fdt32_t))
++		return -1;
++	int regulator = fdt_node_offset_by_phandle(gFDT, fdt32_to_cpu(*supply));
++	if (regulator < 0
++		|| fdt_node_check_compatible(gFDT, regulator, "regulator-fixed") != 0)
++		return -1;
++
++	// <&gpio pin flags>
++	const fdt32_t* gpio = (const fdt32_t*)fdt_getprop(gFDT, regulator, "gpio",
++		&length);
++	if (gpio == NULL || length < 3 * (int)sizeof(fdt32_t))
++		return -1;
++	int controller = fdt_node_offset_by_phandle(gFDT, fdt32_to_cpu(gpio[0]));
++	if (controller < 0 || fdt_node_check_compatible(gFDT, controller,
++			"nvidia,tegra20-gpio") != 0) {
++		return -1;
++	}
++	uint32 pin = fdt32_to_cpu(gpio[1]);
++	if (pin >= TEGRA_GPIO_PIN_COUNT)
++		return -1;
++
++	// a fixed regulator is active low unless it says otherwise
++	activeHigh = fdt_getprop(gFDT, regulator, "enable-active-high", NULL)
++		!= NULL;
++	return pin;
++}
++
++
++/*!	Takes the GPIO of the panel's supply, if there is one and switching the
++	panel off is not disabled. It stays on, as the firmware left it.
++*/
++static void
++init_panel_power()
++{
++	sDevice.panel_power_pin = -1;
++	sDevice.panel_asleep = false;
++
++	void* settings = load_driver_settings("tegra_dc");
++	bool enabled = get_driver_boolean_parameter(settings, "panel_power_off",
++		true, true);
++	unload_driver_settings(settings);
++	if (!enabled)
++		return;
++
++	bool activeHigh;
++	int32 pin = find_panel_power_pin(activeHigh);
++	if (pin < 0)
++		return;
++	if (get_module(TEGRA_GPIO_MODULE_NAME, (module_info**)&sDevice.gpio)
++			!= B_OK) {
++		sDevice.gpio = NULL;
++		return;
++	}
++	if (sDevice.gpio->acquire(pin, "tegra_dc") != B_OK
++		|| sDevice.gpio->configure_output(pin, activeHigh) != B_OK) {
++		ERROR("cannot take the panel power GPIO %" B_PRId32 "\n", pin);
++		sDevice.gpio->release(pin, "tegra_dc");
++		put_module(TEGRA_GPIO_MODULE_NAME);
++		sDevice.gpio = NULL;
++		return;
++	}
++	sDevice.panel_power_pin = pin;
++	sDevice.panel_power_high = activeHigh;
++}
++
++
++static void
++uninit_panel_power()
++{
++	if (sDevice.gpio == NULL)
++		return;
++	if (sDevice.panel_power_pin >= 0)
++		sDevice.gpio->release(sDevice.panel_power_pin, "tegra_dc");
++	put_module(TEGRA_GPIO_MODULE_NAME);
++	sDevice.gpio = NULL;
++	sDevice.panel_power_pin = -1;
++}
++
++
++/*!	Stops window A reading the frame buffer, then switches the panel's supply
++	off. The backlight must be off already. The display controller keeps its
++	timing, and with it the vertical blank interrupt.
++*/
++static void
++panel_sleep()
++{
++	if (sDevice.panel_asleep)
++		return;
++
++	select_window(WINDOW_A_SELECT);
++	write_dc(WIN_OPTIONS, read_dc(WIN_OPTIONS) & ~WIN_OPTIONS_ENABLE);
++	commit_window_a();
++
++	// the controller sends the background color from the next frame on
++	snooze(20000);
++	if (sDevice.panel_power_pin >= 0) {
++		sDevice.gpio->write(sDevice.panel_power_pin,
++			!sDevice.panel_power_high);
++	}
++	sDevice.panel_asleep = true;
++}
++
++
++/*!	Powers the panel, gives it valid frames again, and waits until it shows
++	them, before the backlight goes on.
++*/
++static void
++panel_wake()
++{
++	if (!sDevice.panel_asleep)
++		return;
++
++	if (sDevice.panel_power_pin >= 0) {
++		sDevice.gpio->write(sDevice.panel_power_pin,
++			sDevice.panel_power_high);
++		// the supply rises and the panel starts up
++		snooze(50000);
++	}
++
++	select_window(WINDOW_A_SELECT);
++	write_dc(WIN_OPTIONS, read_dc(WIN_OPTIONS) | WIN_OPTIONS_ENABLE);
++	commit_window_a();
++
++	// a few frames, so that the backlight does not show the panel starting
++	snooze(50000);
++	sDevice.panel_asleep = false;
++}
++
++
++/*!	The panel has no power saving modes of its own: all of them switch the
++	backlight off, stop window A and the panel (see panel_sleep()), and on
++	again as it was.
+ */
+ static status_t
+ set_screen_power(uint32 mode)
+@@ -468,8 +633,11 @@ set_screen_power(uint32 mode)
+ 	if (current == B_DPMS_ON) {
+ 		sDevice.saved_pwm = *sDevice.pwm;
+ 		*sDevice.pwm &= ~(PWM_DUTY_MASK | PWM_ENABLE);
+-	} else if (mode == B_DPMS_ON)
++		panel_sleep();
++	} else if (mode == B_DPMS_ON) {
++		panel_wake();
+ 		*sDevice.pwm = sDevice.saved_pwm;
++	}
+ 
+ 	current = mode;
+ 	return B_OK;
+@@ -1014,6 +1182,15 @@ enable_vblank_interrupt(bool enable)
+ static void
+ uninit_device()
+ {
++	// leave the screen on, for the frame buffer console and whoever comes
++	// next
++	if (sDevice.panel_asleep) {
++		panel_wake();
++		if (sDevice.pwm != NULL)
++			*sDevice.pwm = sDevice.saved_pwm;
++	}
++	uninit_panel_power();
++
+ 	hdmi_stop();
+ 
+ 	if (sDevice.overlay_ready) {
+@@ -1090,6 +1267,7 @@ init_device()
+ 			B_PAGE_SIZE, &sDevice.pwm_area);
+ 		info.has_backlight = sDevice.pwm != NULL;
+ 	}
++	init_panel_power();
+ 
+ 	// The mode the firmware left
+ 	select_window(WINDOW_A_SELECT);
+@@ -1440,6 +1618,7 @@ init_driver(void)
+ 	memset(&sDevice, 0, sizeof(sDevice));
+ 	sDevice.registers_area = sDevice.scanout_area = sDevice.shared_area = -1;
+ 	sDevice.pwm_area = -1;
++	sDevice.panel_power_pin = -1;
+ 	for (int32 i = 0; i < MAX_OVERLAY_BUFFERS; i++)
+ 		sDevice.overlay_buffers[i].area = sDevice.overlay_buffers[i].memory = -1;
+ 	mutex_init(&sDevice.lock, "tegra_dc");
+-- 
+2.39.5
+

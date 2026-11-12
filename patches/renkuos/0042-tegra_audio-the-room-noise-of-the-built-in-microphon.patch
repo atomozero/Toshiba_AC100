@@ -1,0 +1,29 @@
+From af64ea55db11c84b0ed4240087c62219d3837232 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Thu, 12 Nov 2026 20:58:02 +0100
+Subject: [PATCH 42/42] tegra_audio: the room noise of the built-in microphone,
+ as measured
+
+At +24 dB of boost the room noise measured -33 dBFS, not -36.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp b/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
+index a004635089..071cff51e7 100644
+--- a/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
++++ b/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
+@@ -2197,7 +2197,7 @@ tegra_audio_init_driver(device_node* node, void** _cookie)
+ 	audio->recordLevel[0] = audio->recordLevel[1] = 11;
+ 	// The built-in digital microphone only follows the boost (the record
+ 	// gain is that of the analog path): +24 dB gives speech a good level,
+-	// with the room noise around -36 dBFS
++	// with the room noise around -33 dBFS
+ 	audio->micBoost = 4;
+ 	audio->inputSource = 0;
+ 	audio->recordInterruptInstalled = install_io_interrupt_handler(
+-- 
+2.39.5
+

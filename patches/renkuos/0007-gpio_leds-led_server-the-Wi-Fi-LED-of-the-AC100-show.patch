@@ -1,0 +1,718 @@
+From 88b8bae63d2949d9f2a90270880275bdab11c3a9 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 8 Nov 2026 22:00:28 +0100
+Subject: [PATCH 07/42] gpio_leds, led_server: the Wi-Fi LED of the AC100 shows
+ the link
+
+gpio_leds is a driver for the LEDs a device tree describes as children of
+a gpio-leds node: each one is published as /dev/misc/led/<label>, read
+gives 0 or 1, writing 0 or 1 switches it off or on. It drives the pins
+through the Tegra GPIO module and honours default-state.
+
+led_server decides what the LEDs show: an LED named for Wi-Fi is on
+while a wireless interface has a link, following the network
+notifications. It quits at once on a machine without such LEDs, and is
+started only where it is installed (ARM for now).
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ build/jam/images/definitions/minimum          |   1 +
+ build/jam/packages/Haiku                      |   3 +
+ data/launch/system                            |   7 +
+ src/add-ons/kernel/drivers/misc/Jamfile       |   1 +
+ .../kernel/drivers/misc/gpio_leds/Jamfile     |   8 +
+ .../drivers/misc/gpio_leds/gpio_leds.cpp      | 386 ++++++++++++++++++
+ src/servers/Jamfile                           |   1 +
+ src/servers/led/Jamfile                       |   8 +
+ src/servers/led/LEDServer.cpp                 | 168 ++++++++
+ src/servers/led/led_server.rdef               |  15 +
+ 10 files changed, 598 insertions(+)
+ create mode 100644 src/add-ons/kernel/drivers/misc/gpio_leds/Jamfile
+ create mode 100644 src/add-ons/kernel/drivers/misc/gpio_leds/gpio_leds.cpp
+ create mode 100644 src/servers/led/Jamfile
+ create mode 100644 src/servers/led/LEDServer.cpp
+ create mode 100644 src/servers/led/led_server.rdef
+
+diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
+index a13031a48a..05482d316a 100644
+--- a/build/jam/images/definitions/minimum
++++ b/build/jam/images/definitions/minimum
+@@ -249,6 +249,7 @@ SYSTEM_SERVERS = [ FFilterByBuildFeatures
+ 	input_server
+ 	keystore_server
+ 	launch_daemon
++	led_server@arm
+ 	mount_server
+ 	net_server
+ 	notification_server
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index 580a92c87d..6369994b35 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -152,6 +152,9 @@ AddNewDriversToPackage disk virtual :
+ AddNewDriversToPackage gpio :
+ 	baytrail_gpio@x86,x86_64
+ 	;
++AddNewDriversToPackage misc :
++	gpio_leds@arm
++	;
+ AddNewDriversToPackage graphics :
+ 	virtio_gpu
+ 	;
+diff --git a/data/launch/system b/data/launch/system
+index d98c711fce..975d072cff 100644
+--- a/data/launch/system
++++ b/data/launch/system
+@@ -37,6 +37,13 @@ service x-vnd.Haiku-midi_server {
+ 	on_demand
+ }
+ 
++service x-vnd.RenkuOS-led_server {
++	# the LEDs of the machine (gpio_leds driver); quits without any
++	launch /system/servers/led_server
++	if file_exists /system/servers/led_server
++	no_safemode
++}
++
+ service x-vnd.Haiku-net_server {
+ 	launch /system/servers/net_server
+ 	no_safemode
+diff --git a/src/add-ons/kernel/drivers/misc/Jamfile b/src/add-ons/kernel/drivers/misc/Jamfile
+index 4e7c6dd916..201e6169b4 100644
+--- a/src/add-ons/kernel/drivers/misc/Jamfile
++++ b/src/add-ons/kernel/drivers/misc/Jamfile
+@@ -20,3 +20,4 @@ KernelAddon <driver>test :
+ 	;
+ SubInclude HAIKU_TOP src add-ons kernel drivers misc tegra_dc_diag ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers misc tegra_gr2d ;
++SubInclude HAIKU_TOP src add-ons kernel drivers misc gpio_leds ;
+diff --git a/src/add-ons/kernel/drivers/misc/gpio_leds/Jamfile b/src/add-ons/kernel/drivers/misc/gpio_leds/Jamfile
+new file mode 100644
+index 0000000000..c28dedaeb8
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/misc/gpio_leds/Jamfile
+@@ -0,0 +1,8 @@
++SubDir HAIKU_TOP src add-ons kernel drivers misc gpio_leds ;
++
++UsePrivateKernelHeaders ;
++UsePrivateHeaders gpio ;
++
++KernelAddon gpio_leds :
++	gpio_leds.cpp
++	;
+diff --git a/src/add-ons/kernel/drivers/misc/gpio_leds/gpio_leds.cpp b/src/add-ons/kernel/drivers/misc/gpio_leds/gpio_leds.cpp
+new file mode 100644
+index 0000000000..cd74c27807
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/misc/gpio_leds/gpio_leds.cpp
+@@ -0,0 +1,386 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++/*!	LEDs on GPIOs, as the device tree describes them ("gpio-leds"): each
++	child node of a gpio-leds node is one LED, with its pin in "gpios", its
++	name in "label" and its state at start in "default-state".
++
++	Each LED is published as /dev/misc/led/<label>. Reading it gives "0" or
++	"1"; writing "0" or "1" switches it off or on. What an LED shows (the
++	Wi-Fi link, the disk...) is decided in userland, by the LED's name.
++
++	The pins are driven through the Tegra GPIO module; LEDs on another GPIO
++	controller are not supported yet.
++*/
++
++
++#include <new>
++#include <stdio.h>
++#include <string.h>
++
++#include <ByteOrder.h>
++#include <KernelExport.h>
++#include <bus/FDT.h>
++#include <device_manager.h>
++#include <kernel.h>
++
++#include <gpio/tegra.h>
++
++
++#define GPIO_LEDS_DRIVER_MODULE_NAME	"drivers/misc/gpio_leds/driver_v1"
++#define GPIO_LEDS_DEVICE_MODULE_NAME	"drivers/misc/gpio_leds/device_v1"
++
++#define TRACE_LEDS(x...)	dprintf("gpio_leds: " x)
++
++// the flags cell of a GPIO specifier
++#define GPIO_ACTIVE_LOW		1
++
++#define LED_NAME_LENGTH		32
++
++
++struct gpio_led {
++	device_node*	node;
++	uint32			pin;
++	bool			activeLow;
++	bool			on;
++	char			name[LED_NAME_LENGTH];
++};
++
++
++static device_manager_info* sDeviceManager;
++static tegra_gpio_interface* sTegraGPIO;
++
++
++static status_t
++set_led(gpio_led* led, bool on)
++{
++	status_t status = sTegraGPIO->write(led->pin, on != led->activeLow);
++	if (status == B_OK)
++		led->on = on;
++	return status;
++}
++
++
++/*!	The LED's name, usable in a path: "label", or else the node's name. */
++static void
++led_name(fdt_device_module_info* fdt, fdt_device* device, char* name)
++{
++	int length;
++	const char* label = (const char*)fdt->get_prop(device, "label", &length);
++	if (label == NULL || length <= 1)
++		label = fdt->get_name(device);
++	strlcpy(name, label != NULL ? label : "led", LED_NAME_LENGTH);
++	for (char* c = name; *c != '\0'; c++) {
++		if (*c == '/' || *c == ' ')
++			*c = '-';
++	}
++}
++
++
++/*!	Whether the controller the phandle names is a Tegra GPIO controller. */
++static bool
++is_tegra_gpio(fdt_device_module_info* fdt, fdt_device* device,
++	uint32 phandle)
++{
++	device_node* busNode = fdt->get_bus(device);
++	fdt_bus_module_info* busModule;
++	fdt_bus* bus;
++	if (sDeviceManager->get_driver(busNode, (driver_module_info**)&busModule,
++			(void**)&bus) != B_OK) {
++		return false;
++	}
++	device_node* controller = busModule->node_by_phandle(bus, phandle);
++	if (controller == NULL)
++		return false;
++
++	const char* compatible;
++	return sDeviceManager->get_attr_string(controller, "fdt/compatible",
++			&compatible, false) == B_OK
++		&& strcmp(compatible, "nvidia,tegra20-gpio") == 0;
++}
++
++
++//	#pragma mark - driver
++
++
++/*!	\a parent is a device tree node; it is an LED if its own parent is a
++	gpio-leds node.
++*/
++static float
++gpio_leds_supports_device(device_node* parent)
++{
++	const char* bus;
++	if (sDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
++			!= B_OK || strcmp(bus, "fdt") != 0) {
++		return 0.0f;
++	}
++
++	device_node* leds = sDeviceManager->get_parent_node(parent);
++	if (leds == NULL)
++		return 0.0f;
++	const char* compatible;
++	bool isLed = sDeviceManager->get_attr_string(leds, "fdt/compatible",
++			&compatible, false) == B_OK
++		&& strcmp(compatible, "gpio-leds") == 0;
++	sDeviceManager->put_node(leds);
++
++	return isLed ? 1.0f : 0.0f;
++}
++
++
++static status_t
++gpio_leds_register_device(device_node* parent)
++{
++	device_attr attrs[] = {
++		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE, { .string = "GPIO LED" }},
++		{}
++	};
++
++	return sDeviceManager->register_node(parent, GPIO_LEDS_DRIVER_MODULE_NAME,
++		attrs, NULL, NULL);
++}
++
++
++static status_t
++gpio_leds_init_driver(device_node* node, void** _cookie)
++{
++	device_node* parent = sDeviceManager->get_parent_node(node);
++	fdt_device_module_info* fdt;
++	fdt_device* device;
++	status_t status = sDeviceManager->get_driver(parent,
++		(driver_module_info**)&fdt, (void**)&device);
++	sDeviceManager->put_node(parent);
++	if (status != B_OK)
++		return status;
++
++	// <phandle pin flags>
++	int length;
++	const uint32* cells = (const uint32*)fdt->get_prop(device, "gpios",
++		&length);
++	if (cells == NULL || length < 12)
++		return B_ENTRY_NOT_FOUND;
++	uint32 phandle = B_BENDIAN_TO_HOST_INT32(cells[0]);
++	if (!is_tegra_gpio(fdt, device, phandle)) {
++		TRACE_LEDS("%s: not on a Tegra GPIO controller\n",
++			fdt->get_name(device));
++		return B_NOT_SUPPORTED;
++	}
++
++	if (sTegraGPIO == NULL) {
++		status = get_module(TEGRA_GPIO_MODULE_NAME,
++			(module_info**)&sTegraGPIO);
++		if (status != B_OK)
++			return status;
++	}
++
++	gpio_led* led = new(std::nothrow) gpio_led;
++	if (led == NULL)
++		return B_NO_MEMORY;
++	led->node = node;
++	led->pin = B_BENDIAN_TO_HOST_INT32(cells[1]);
++	led->activeLow
++		= (B_BENDIAN_TO_HOST_INT32(cells[2]) & GPIO_ACTIVE_LOW) != 0;
++	led_name(fdt, device, led->name);
++
++	status = sTegraGPIO->acquire(led->pin, "gpio-leds");
++	if (status != B_OK) {
++		TRACE_LEDS("%s: pin %" B_PRIu32 " is taken\n", led->name, led->pin);
++		delete led;
++		return status;
++	}
++
++	// "on", or "keep" (as the firmware left it), else off
++	const char* state = (const char*)fdt->get_prop(device, "default-state",
++		&length);
++	bool on = false;
++	if (state != NULL && strcmp(state, "on") == 0)
++		on = true;
++	else if (state != NULL && strcmp(state, "keep") == 0)
++		on = sTegraGPIO->read(led->pin) != led->activeLow;
++	status = sTegraGPIO->configure_output(led->pin, on != led->activeLow);
++	if (status != B_OK) {
++		sTegraGPIO->release(led->pin, "gpio-leds");
++		delete led;
++		return status;
++	}
++	led->on = on;
++
++	// what the LED is meant to show: userland decides, by its name
++	const char* trigger = (const char*)fdt->get_prop(device,
++		"linux,default-trigger", &length);
++
++	TRACE_LEDS("%s on pin %" B_PRIu32 "%s, %s%s%s\n", led->name, led->pin,
++		led->activeLow ? " (active low)" : "", on ? "on" : "off",
++		trigger != NULL ? ", meant for " : "", trigger != NULL ? trigger : "");
++	*_cookie = led;
++	return B_OK;
++}
++
++
++static void
++gpio_leds_uninit_driver(void* cookie)
++{
++	gpio_led* led = (gpio_led*)cookie;
++	set_led(led, false);
++	sTegraGPIO->release(led->pin, "gpio-leds");
++	delete led;
++}
++
++
++static status_t
++gpio_leds_register_child_devices(void* cookie)
++{
++	gpio_led* led = (gpio_led*)cookie;
++	char path[64];
++	snprintf(path, sizeof(path), "misc/led/%s", led->name);
++	return sDeviceManager->publish_device(led->node, path,
++		GPIO_LEDS_DEVICE_MODULE_NAME);
++}
++
++
++//	#pragma mark - device
++
++
++static status_t
++gpio_leds_init_device(void* driverCookie, void** _deviceCookie)
++{
++	*_deviceCookie = driverCookie;
++	return B_OK;
++}
++
++
++static void
++gpio_leds_uninit_device(void* deviceCookie)
++{
++}
++
++
++static status_t
++gpio_leds_open(void* deviceCookie, const char* path, int openMode,
++	void** _cookie)
++{
++	*_cookie = deviceCookie;
++	return B_OK;
++}
++
++
++static status_t
++gpio_leds_close(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++gpio_leds_free(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++gpio_leds_read(void* cookie, off_t position, void* buffer, size_t* _length)
++{
++	gpio_led* led = (gpio_led*)cookie;
++	char state[3] = { led->on ? '1' : '0', '\n', '\0' };
++	if (position >= 2) {
++		*_length = 0;
++		return B_OK;
++	}
++	size_t length = 2 - position;
++	if (length > *_length)
++		length = *_length;
++	if (!IS_USER_ADDRESS(buffer)
++		|| user_memcpy(buffer, state + position, length) != B_OK) {
++		return B_BAD_ADDRESS;
++	}
++	*_length = length;
++	return B_OK;
++}
++
++
++static status_t
++gpio_leds_write(void* cookie, off_t position, const void* buffer,
++	size_t* _length)
++{
++	gpio_led* led = (gpio_led*)cookie;
++	char value;
++	if (*_length == 0)
++		return B_OK;
++	if (!IS_USER_ADDRESS(buffer)
++		|| user_memcpy(&value, buffer, 1) != B_OK) {
++		return B_BAD_ADDRESS;
++	}
++	if (value != '0' && value != '1')
++		return B_BAD_VALUE;
++
++	status_t status = set_led(led, value == '1');
++	if (status != B_OK)
++		return status;
++	// the rest ("\n" and so on) is taken as read
++	return B_OK;
++}
++
++
++static status_t
++gpio_leds_control(void* cookie, uint32 op, void* buffer, size_t length)
++{
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++static driver_module_info sGpioLedsDriver = {
++	{
++		GPIO_LEDS_DRIVER_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	gpio_leds_supports_device,
++	gpio_leds_register_device,
++	gpio_leds_init_driver,
++	gpio_leds_uninit_driver,
++	gpio_leds_register_child_devices,
++	NULL,	// rescan
++	NULL,	// device_removed
++};
++
++
++static device_module_info sGpioLedsDevice = {
++	{
++		GPIO_LEDS_DEVICE_MODULE_NAME,
++		0,
++		NULL
++	},
++
++	gpio_leds_init_device,
++	gpio_leds_uninit_device,
++	NULL,	// device_removed
++
++	gpio_leds_open,
++	gpio_leds_close,
++	gpio_leds_free,
++	gpio_leds_read,
++	gpio_leds_write,
++	NULL,	// io
++	gpio_leds_control,
++
++	NULL,	// select
++	NULL,	// deselect
++};
++
++
++module_dependency module_dependencies[] = {
++	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&sDeviceManager },
++	{}
++};
++
++
++module_info* modules[] = {
++	(module_info*)&sGpioLedsDriver,
++	(module_info*)&sGpioLedsDevice,
++	NULL
++};
+diff --git a/src/servers/Jamfile b/src/servers/Jamfile
+index 327d0c2ff6..530d470c28 100644
+--- a/src/servers/Jamfile
++++ b/src/servers/Jamfile
+@@ -7,6 +7,7 @@ SubInclude HAIKU_TOP src servers index ;
+ SubInclude HAIKU_TOP src servers input ;
+ SubInclude HAIKU_TOP src servers keystore ;
+ SubInclude HAIKU_TOP src servers launch ;
++SubInclude HAIKU_TOP src servers led ;
+ SubInclude HAIKU_TOP src servers mail ;
+ SubInclude HAIKU_TOP src servers media ;
+ SubInclude HAIKU_TOP src servers media_addon ;
+diff --git a/src/servers/led/Jamfile b/src/servers/led/Jamfile
+new file mode 100644
+index 0000000000..938a69bc67
+--- /dev/null
++++ b/src/servers/led/Jamfile
+@@ -0,0 +1,8 @@
++SubDir HAIKU_TOP src servers led ;
++
++AddResources led_server : led_server.rdef ;
++
++Application led_server :
++	LEDServer.cpp
++	: be bnetapi network [ TargetLibsupc++ ]
++	;
+diff --git a/src/servers/led/LEDServer.cpp b/src/servers/led/LEDServer.cpp
+new file mode 100644
+index 0000000000..f4bafa5efa
+--- /dev/null
++++ b/src/servers/led/LEDServer.cpp
+@@ -0,0 +1,168 @@
++/*
++ * Copyright 2026, Andrea Bernardi
++ * SPDX-License-Identifier: MIT
++ */
++
++
++/*!	led_server: what the LEDs of the machine show. The gpio_leds driver
++	publishes them in /dev/misc/led/<name>, writing "1" or "0" switches one
++	on or off. For now there is one rule: an LED named for Wi-Fi ("wifi",
++	"wlan") is on while a wireless interface is connected to a network.
++	Without such LEDs the server quits at once.
++*/
++
++
++#include <stdio.h>
++#include <string.h>
++#include <strings.h>
++
++#include <Application.h>
++#include <Directory.h>
++#include <Entry.h>
++#include <NetworkDevice.h>
++#include <NetworkInterface.h>
++#include <NetworkNotifications.h>
++#include <NetworkRoster.h>
++#include <ObjectList.h>
++#include <Path.h>
++#include <String.h>
++
++#include <errno.h>
++#include <fcntl.h>
++#include <syslog.h>
++#include <unistd.h>
++
++
++static const char* kSignature = "application/x-vnd.RenkuOS-led_server";
++static const char* kLEDDirectory = "/dev/misc/led";
++
++
++class LEDServer : public BApplication {
++public:
++								LEDServer();
++
++	virtual	void				ReadyToRun();
++	virtual	void				MessageReceived(BMessage* message);
++
++private:
++			void				_Update();
++			bool				_WirelessConnected();
++			void				_Set(const char* path, bool on);
++
++			BObjectList<BString, true> fWifiLEDs;
++			int32				fWifiState;
++				// -1 not set yet
++};
++
++
++LEDServer::LEDServer()
++	:
++	BApplication(kSignature),
++	fWifiState(-1)
++{
++}
++
++
++void
++LEDServer::ReadyToRun()
++{
++	// listing the directory also has the device manager look for LEDs
++	BDirectory directory(kLEDDirectory);
++	BEntry entry;
++	while (directory.GetNextEntry(&entry) == B_OK) {
++		BPath path;
++		if (entry.GetPath(&path) != B_OK)
++			continue;
++		const char* name = path.Leaf();
++		if (strcasestr(name, "wifi") != NULL
++			|| strcasestr(name, "wlan") != NULL) {
++			fWifiLEDs.AddItem(new BString(path.Path()));
++		}
++	}
++
++	if (fWifiLEDs.IsEmpty()) {
++		// nothing to drive on this machine
++		Quit();
++		return;
++	}
++
++	start_watching_network(B_WATCH_NETWORK_INTERFACE_CHANGES
++		| B_WATCH_NETWORK_LINK_CHANGES | B_WATCH_NETWORK_WLAN_CHANGES, this);
++	_Update();
++}
++
++
++void
++LEDServer::MessageReceived(BMessage* message)
++{
++	switch (message->what) {
++		case B_NETWORK_MONITOR:
++			_Update();
++			break;
++
++		default:
++			BApplication::MessageReceived(message);
++			break;
++	}
++}
++
++
++void
++LEDServer::_Update()
++{
++	bool connected = _WirelessConnected();
++	if ((int32)connected == fWifiState)
++		return;
++	fWifiState = connected;
++
++	for (int32 i = 0; i < fWifiLEDs.CountItems(); i++)
++		_Set(fWifiLEDs.ItemAt(i)->String(), connected);
++}
++
++
++/*!	A wireless interface that is up and has a link is joined to a network.
++	An interface the user disabled is down, while its card may still report
++	the link for a while.
++*/
++bool
++LEDServer::_WirelessConnected()
++{
++	BNetworkRoster& roster = BNetworkRoster::Default();
++	BNetworkInterface interface;
++	uint32 cookie = 0;
++	while (roster.GetNextInterface(&cookie, interface) == B_OK) {
++		uint32 flags = interface.Flags();
++		if ((flags & IFF_LOOPBACK) != 0 || (flags & IFF_UP) == 0)
++			continue;
++		BNetworkDevice device(interface.Name());
++		if (device.IsWireless() && device.HasLink())
++			return true;
++	}
++	return false;
++}
++
++
++void
++LEDServer::_Set(const char* path, bool on)
++{
++	int fd = open(path, O_WRONLY);
++	if (fd < 0) {
++		syslog(LOG_WARNING, "led_server: cannot open %s: %s\n", path,
++			strerror(errno));
++		return;
++	}
++	if (write(fd, on ? "1" : "0", 1) != 1) {
++		syslog(LOG_WARNING, "led_server: cannot set %s: %s\n", path,
++			strerror(errno));
++	}
++	close(fd);
++}
++
++
++int
++main()
++{
++	LEDServer server;
++	server.Run();
++	return 0;
++}
+diff --git a/src/servers/led/led_server.rdef b/src/servers/led/led_server.rdef
+new file mode 100644
+index 0000000000..886d058ad0
+--- /dev/null
++++ b/src/servers/led/led_server.rdef
+@@ -0,0 +1,15 @@
++resource app_signature "application/x-vnd.RenkuOS-led_server";
++
++resource app_flags B_EXCLUSIVE_LAUNCH | B_BACKGROUND_APP;
++
++resource app_version {
++	major  = 1,
++	middle = 0,
++	minor  = 0,
++
++	variety = B_APPV_FINAL,
++	internal = 0,
++
++	short_info = "led_server",
++	long_info = "led_server ©2026 Andrea Bernardi"
++};
+-- 
+2.39.5
+

@@ -1,0 +1,26 @@
+From f3f77fa48f098ecc07b6d12efd1ccb82b5ce0f0b Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 8 Nov 2026 17:28:18 +0100
+Subject: [PATCH 04/42] WIP: device manager looks for GPIO controllers on the
+ device tree bus
+
+---
+ src/system/kernel/device_manager/device_manager.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/system/kernel/device_manager/device_manager.cpp b/src/system/kernel/device_manager/device_manager.cpp
+index 7ee457dcc4..8597167d2e 100644
+--- a/src/system/kernel/device_manager/device_manager.cpp
++++ b/src/system/kernel/device_manager/device_manager.cpp
+@@ -1739,6 +1739,8 @@ device_node::_GetNextDriverPath(void*& cookie, KPath& _path)
+ 							_AddPath(*stack, "busses/scsi");
+ 					}
+ 					_AddPath(*stack, "drivers", sGenericContextPath);
++					// GPIO controllers on a device tree bus
++					_AddPath(*stack, "busses/gpio");
+ 					_AddPath(*stack, "busses/i2c");
+ 					_AddPath(*stack, "busses/random");
+ 					_AddPath(*stack, "busses/virtio");
+-- 
+2.39.5
+

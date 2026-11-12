@@ -1,0 +1,107 @@
+From 3e0256fa67d2ba7a5678c82331e76528bc1377dd Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Tue, 10 Nov 2026 07:43:18 +0100
+Subject: [PATCH 26/42] Bluetooth preferences: show the name of a device paired
+ after a search
+
+The search asks the names of the devices it finds, and may get one after
+it made the row; the row added to the paired devices then showed the
+kind of the device ("Audio") until the preferences started again. The
+name was asked again after the connection only when the device itself
+had none, which it had.
+
+The row now takes the name the search learnt when it is added, and again
+when the connection completes, asking the device only when neither knows
+it.
+
+Not yet tested on the AC100.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/preferences/bluetooth/DeviceListItem.cpp    | 15 +++++++++++++++
+ src/preferences/bluetooth/DeviceListItem.h      |  4 ++++
+ src/preferences/bluetooth/RemoteDevicesView.cpp | 17 ++++++++++++-----
+ 3 files changed, 31 insertions(+), 5 deletions(-)
+
+diff --git a/src/preferences/bluetooth/DeviceListItem.cpp b/src/preferences/bluetooth/DeviceListItem.cpp
+index 4790bd625e..baafc83dd5 100644
+--- a/src/preferences/bluetooth/DeviceListItem.cpp
++++ b/src/preferences/bluetooth/DeviceListItem.cpp
+@@ -53,6 +53,21 @@ DeviceListItem::SetDevice(RemoteDevice* bDevice)
+ }
+ 
+ 
++bool
++DeviceListItem::UpdateName()
++{
++	if (fDevice == NULL)
++		return false;
++	BString name = fDevice->GetCachedFriendlyName();
++	if (name.IsEmpty() || name == fName
++		|| name == bdaddrUtils::ToString(fAddress)) {
++		return false;
++	}
++	fName = name;
++	return true;
++}
++
++
+ /*!	The kind of the device, from its class; a device whose class says nothing
+ 	(speakers often have none) goes by the services it offers.
+ */
+diff --git a/src/preferences/bluetooth/DeviceListItem.h b/src/preferences/bluetooth/DeviceListItem.h
+index b749ed70e3..42aeb3a4fd 100644
+--- a/src/preferences/bluetooth/DeviceListItem.h
++++ b/src/preferences/bluetooth/DeviceListItem.h
+@@ -30,6 +30,10 @@ class DeviceListItem : public BListItem
+ 		static int 		Compare(const void* firstArg, const void* secondArg);
+ 		void 			SetDevice(RemoteDevice* bDevice);
+ 		RemoteDevice* 	Device() const;
++		// whether the device told its name; UpdateName() takes the one it
++		// told meanwhile (to a search, say), without asking it again
++		bool			HasName() const { return !fName.IsEmpty(); }
++		bool			UpdateName();
+ 
+ 		void 			SetConnectionState(RemoteDevice::ConnectionState connectionState);
+ 		void			SetShowAddress(bool showAddress)
+diff --git a/src/preferences/bluetooth/RemoteDevicesView.cpp b/src/preferences/bluetooth/RemoteDevicesView.cpp
+index 62e4e2f670..4feb8720f1 100644
+--- a/src/preferences/bluetooth/RemoteDevicesView.cpp
++++ b/src/preferences/bluetooth/RemoteDevicesView.cpp
+@@ -257,6 +257,8 @@ RemoteDevicesView::MessageReceived(BMessage* message)
+ 			}
+ 
+ 			if (!isDuplicate) {
++				// the search may have learnt the name after making the row
++				device->UpdateName();
+ 				fDeviceList->AddItem((BListItem*)device);
+ 				fDeviceList->Invalidate();
+ 			} else {
+@@ -305,14 +307,19 @@ RemoteDevicesView::MessageReceived(BMessage* message)
+ 			if (status == BT_OK) {
+ 				fConnectingDeviceItem->SetConnectionState(RemoteDevice::CONNECTED);
+ 
+-				// a device paired right after the inquiry has no name yet;
+-				// with the connection up asking for it is quick
++				// A device paired right after the inquiry may show no name
++				// yet: the search may have learnt it since (the row was made
++				// before), else it is asked, quick with the connection up.
++				// The row was looked at before: the device's own may have
++				// a name the row never took, and showed "Audio" until the
++				// preferences started again.
+ 				RemoteDevice* remote = fConnectingDeviceItem->Device();
+-				if (remote != NULL && remote->GetCachedFriendlyName().IsEmpty()) {
++				if (!fConnectingDeviceItem->UpdateName()
++					&& !fConnectingDeviceItem->HasName() && remote != NULL) {
+ 					fConnectingDeviceItem->SetDevice(remote);
+-					fDeviceList->InvalidateItem(
+-						fDeviceList->IndexOf(fConnectingDeviceItem));
+ 				}
++				fDeviceList->InvalidateItem(
++					fDeviceList->IndexOf(fConnectingDeviceItem));
+ 			} else
+ 				fConnectingDeviceItem->SetConnectionState(RemoteDevice::DISCONNECTED);
+ 
+-- 
+2.39.5
+

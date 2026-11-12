@@ -1,0 +1,133 @@
+From 983d790243a5c333d335434c07a8d15b72cb2ee7 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 8 Nov 2026 17:52:26 +0100
+Subject: [PATCH 06/42] nvec: a key releases the left button the touchpad
+ locked
+
+The Elantech touchpad of the AC100 works as a PS/2 mouse, and its
+firmware locks the left button after a tap and a half, until the next
+tap. Touched by mistake while typing, the text fields then selected each
+letter typed, and the next one replaced it; clicks seemed lost too.
+
+A key that is no modifier, typed while the left button is held, now
+releases it; the touchpad's "still pressed" is ignored until it reports
+the button released (the next tap unlocks it). The touchpad log notes
+it.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/add-ons/kernel/busses/i2c/nvec/nvec.cpp | 63 ++++++++++++++++++++-
+ 1 file changed, 62 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+index 02f9ac0bad..708d5b317c 100644
+--- a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
++++ b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+@@ -169,6 +169,8 @@ enum {
+ 	NVEC_MOUSE_LOG_QUEUE_FULL	= 0x20,	// the movement queue was full
+ 	NVEC_MOUSE_LOG_REENABLED	= 0x40,	// no byte: the input was enabled
+ 										// again after 30 s without events
++	NVEC_MOUSE_LOG_KEY_RELEASE	= 0x80,	// no byte: a key released the left
++										// button the touchpad held
+ };
+ 
+ struct nvec_mouse_log_entry {
+@@ -270,6 +272,8 @@ struct nvec_device {
+ 	uint32				packetPosition;
+ 	bool				selfTestByte;	// an 0xaa came instead of a packet
+ 	uint32				buttons;
++	bool				leftMasked;	// the left button of the touchpad is
++									// ignored until it reports it released
+ 	bigtime_t			lastMouseByte;
+ 	int32				clicks;
+ 	bigtime_t			lastClick;
+@@ -913,6 +917,39 @@ power_button_pressed(nvec_device* device)
+ }
+ 
+ 
++/*!	Typing while the left button is held means it was locked by the
++	touchpad (a tap and a half), not pressed on purpose: the key releases
++	it. The modifiers (shift, control, alt, the Windows keys, caps lock)
++	go with clicks and leave it alone. Called from the receive thread, as
++	the touchpad bytes are.
++*/
++static void log_mouse(nvec_device* device, uint8 byte, uint8 flags,
++	uint8 position);
++static void queue_movement(nvec_device* device, uint32 buttons,
++	int32 xdelta, int32 ydelta, bigtime_t now);
++
++
++static void
++release_locked_button(nvec_device* device, uint32 scancode)
++{
++	switch (scancode) {
++		case 0x2a: case 0x36:	// shift
++		case 0x1d: case 0x9d:	// control
++		case 0x38: case 0xb8:	// alt
++		case 0xdb: case 0xdc: case 0xdd:	// Windows and menu keys
++		case 0x3a:				// caps lock
++			return;
++	}
++	if ((device->buttons & 1) == 0)
++		return;
++
++	device->buttons &= ~1U;
++	device->leftMasked = true;
++	log_mouse(device, 0, NVEC_MOUSE_LOG_KEY_RELEASE, device->packetPosition);
++	queue_movement(device, device->buttons, 0, 0, system_time());
++}
++
++
+ /*!	Handles one byte of PS/2 scan code set 1; extended codes come with an
+ 	0xe0 prefix.
+ */
+@@ -945,6 +982,8 @@ handle_scan_code(nvec_device* device, uint8 code)
+ 		return;
+ 	}
+ 
++	if (down)
++		release_locked_button(device, scancode);
+ 	put_key(device, kATKeycodeMap[scancode - 1], down);
+ }
+ 
+@@ -1043,6 +1082,17 @@ handle_mouse_byte(nvec_device* device, uint8 byte)
+ 		xdelta = (packet[0] & 0x10) ? -255 : 255;
+ 	if ((packet[0] & 0x80) != 0)
+ 		ydelta = (packet[0] & 0x20) ? -255 : 255;
++	// A tap and a half "locks" the left button in the touchpad, until the
++	// next tap; typing then selects what is typed. A key released it (see
++	// release_locked_button()): the touchpad still reports it pressed,
++	// which is ignored until it reports it released.
++	if (device->leftMasked) {
++		if ((buttons & 1) == 0)
++			device->leftMasked = false;
++		else
++			buttons &= ~1U;
++	}
++
+ 	if (buttons != 0 && device->buttons == 0) {
+ 		if (device->lastClick + device->clickSpeed > now)
+ 			device->clicks++;
+@@ -1057,7 +1107,18 @@ handle_mouse_byte(nvec_device* device, uint8 byte)
+ 	log_mouse(device, byte,
+ 		flags | (full ? NVEC_MOUSE_LOG_QUEUE_FULL : 0), position);
+ 
+-	full = false;
++	queue_movement(device, buttons, xdelta, ydelta, now);
++}
++
++
++/*!	Adds a movement for the input server; a full queue keeps the button
++	changes, the movements of the newest entry add up.
++*/
++static void
++queue_movement(nvec_device* device, uint32 buttons, int32 xdelta,
++	int32 ydelta, bigtime_t now)
++{
++	bool full = false;
+ 	InterruptsSpinLocker locker(device->mouseLock);
+ 	if (device->movementHead - device->movementTail >= NVEC_MOUSE_COUNT) {
+ 		// Full: a button change must not get lost. The movement goes into
+-- 
+2.39.5
+

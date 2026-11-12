@@ -1,0 +1,38 @@
+From 6fd0f9f2f8d84fbd286b6b88dc7d4f5405f9bd98 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 8 Nov 2026 13:44:12 +0100
+Subject: [PATCH 02/42] build: the ARM loader links the soft-float
+ libgcc-boot.a again
+
+The merge brought in the first version of the ARM libgcc change, which
+links the boot loader against the cross-compiler's libgcc. That one
+passes arguments in VFP registers and the loader does not: the EFI
+loader no longer linked. libgcc-boot.a, built for the loader, is used
+again.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ build/jam/SystemLibraryRules | 6 ++----
+ 1 file changed, 2 insertions(+), 4 deletions(-)
+
+diff --git a/build/jam/SystemLibraryRules b/build/jam/SystemLibraryRules
+index b7c379ca42..54fd6dccf9 100644
+--- a/build/jam/SystemLibraryRules
++++ b/build/jam/SystemLibraryRules
+@@ -285,11 +285,9 @@ rule TargetBootLibgcc architecture : asPath
+ 		if $(asPath) = true {
+ 			flags += path ;
+ 		}
+-		if $(architecture) = arm && $(TARGET_BOOT_LIBGCC) {
+-			# see TargetKernelLibgcc
+-			return $(TARGET_BOOT_LIBGCC) ;
+-		}
+ 		if $(architecture) = arm {
++			# the loader is built for soft-float calls, unlike the
++			# cross-compiler's libgcc
+ 			return [
+ 				BuildFeatureAttribute QUALIFIED $(architecture):gcc_syslibs_devel
+ 					: libgcc-boot.a : $(flags)
+-- 
+2.39.5
+

@@ -1,0 +1,41 @@
+From 448ea994f9870cb6bb37ef20d6cf89d218511cae Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Thu, 12 Nov 2026 08:08:48 +0100
+Subject: [PATCH 37/42] kernel/arm: SGIs and PPIs of the GIC are local
+ interrupts
+
+The GIC driver reserved all its interrupts as I/O interrupts, also the
+SGIs and PPIs (0 - 31), which belong to each CPU and cannot be routed,
+like the private timers of the Cortex-A9. The scheduler then counted them
+as interrupts it may move between CPUs; AssignToCpu() refuses (it leaves
+them on CPU 0), so they stayed on the CPU the scheduler tried to take
+them from.
+
+They are now INTERRUPT_TYPE_LOCAL_IRQ, as the local APIC timer is on
+x86; only the SPIs are I/O interrupts.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/system/kernel/arch/arm/arch_int_gicv2.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/system/kernel/arch/arm/arch_int_gicv2.cpp b/src/system/kernel/arch/arm/arch_int_gicv2.cpp
+index e3a86bc47a..9a6a292af3 100644
+--- a/src/system/kernel/arch/arm/arch_int_gicv2.cpp
++++ b/src/system/kernel/arch/arm/arch_int_gicv2.cpp
+@@ -49,7 +49,11 @@ GICv2InterruptController::GICv2InterruptController(phys_addr_t gicd_addr, phys_a
+ 	// how many registers cover all IRQs?
+ 	uint32 typer = fGicdRegs[GICD_REG_TYPER];
+ 	uint32 lineRegs = (typer & 0x1f) + 1;
+-	reserve_io_interrupt_vectors(32 * lineRegs, 0, INTERRUPT_TYPE_IRQ);
++	// SGIs and PPIs (0 - 31) belong to each CPU, as the private timers do: they
++	// cannot be routed, so the scheduler must not try to move them, as on x86
++	// the local APIC timer. Only the SPIs are I/O interrupts.
++	reserve_io_interrupt_vectors(32, 0, INTERRUPT_TYPE_LOCAL_IRQ);
++	reserve_io_interrupt_vectors(32 * (lineRegs - 1), 32, INTERRUPT_TYPE_IRQ);
+ 
+ 	for (uint32 i = 1; i < lineRegs; i++) { // 1 bit per IRQ
+ 		// mask and clear state before enabling
+-- 
+2.39.5
+

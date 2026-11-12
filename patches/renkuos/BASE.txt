@@ -1,2 +1,3 @@
-base: aae7d9f7be7c430ac0fcb52f8239ad72e1207021 (RenkuOS/Source main, Merge pull request #156 from linkslice/pi400/usb-xhci-noncoherent)
-apply: git checkout -b ac100 aae7d9f7be && git am patches/renkuos/*.patch
+base: d8089a1293011471dcc71f2b8b0d03f430ecf339 (RenkuOS/Source main, Merge pull request #252 from atomozero/bt-kernel)
+apply: git checkout -b ac100 d8089a1293 && git apply --index patches/renkuos/0001-*.patch && git commit -m "AC100 tree at the merge of RenkuOS main" && git am $(ls patches/renkuos/0*.patch | tail -n +2)
+result: identical to the tree of the AC100 branch af64ea55db11c84b0ed4240087c62219d3837232, from which hrev60107+736 was built
