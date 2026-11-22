@@ -8,7 +8,7 @@
 # package name per line, # for comments) and everything they need, found in
 # the package folders (the first folder wins, then the newest version).
 # What the packages in <base packages> (the system of the image) provide is
-# not added again. Prints the package files to add, one per line; stops when
+# not added again, but what they require is. Prints the package files to add, one per line; stops when
 # a requirement cannot be met.
 #
 # The package tool of the Haiku build is taken from $PACKAGE_TOOL.
@@ -57,10 +57,16 @@ def main():
 			wanted.append(line)
 
 	provided = set()
+	baseRequires = []
 	for path in base:
 		info = package_info(path)
 		provided.add(info["name"])
 		provided.update(info["provides"])
+		# The system packages' needs are met by the image they come from;
+		# the replacements put in by the image script (bash, coreutils, ...)
+		# may need more.
+		if not info["name"].startswith(("haiku", "noto")):
+			baseRequires.extend(info["requires"])
 
 	# every package of the folders, by name: the first folder, then the
 	# newest version
@@ -83,7 +89,10 @@ def main():
 			providers.setdefault(item, name)
 
 	chosen = []
-	todo = list(wanted)
+	# What the base packages need too: the full bash replacing the
+	# bootstrap one needs readline and gettext, which nothing else asked
+	# for (the +736 image shipped a bash that could not start).
+	todo = list(wanted) + baseRequires
 	missing = []
 	while todo:
 		item = todo.pop(0)

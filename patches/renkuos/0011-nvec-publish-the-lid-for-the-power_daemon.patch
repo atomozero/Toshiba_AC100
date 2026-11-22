@@ -1,0 +1,155 @@
+From d605b84a8d7f90eba886768ae84c1efc6a12f440 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Thu, 19 Nov 2026 21:19:25 +0100
+Subject: [PATCH 11/32] nvec: publish the lid for the power_daemon
+
+The lid switch only turned the backlight off. It is now also
+power/nvec_lid/0, read and selected like the ACPI lid: one byte, 1 while
+the lid is open and 0 while it is closed, readable when it changed.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/add-ons/kernel/busses/i2c/nvec/nvec.cpp | 57 +++++++++++++++++----
+ 1 file changed, 47 insertions(+), 10 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+index 16edfa3b89..0c602cbe07 100644
+--- a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
++++ b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+@@ -258,6 +258,10 @@ struct nvec_device {
+ 	mutex				powerButtonLock;
+ 	uint8				powerButtonPressed;
+ 	select_sync_pool*	powerButtonSelectPool;
++	// the lid, watched by the power_daemon as an ACPI lid: protected by
++	// powerButtonLock too
++	bool				lidChanged;		// not read since it changed
++	select_sync_pool*	lidSelectPool;
+ 
+ 	// touchpad
+ 	spinlock			mouseLock;
+@@ -302,6 +306,7 @@ enum nvec_device_kind {
+ 	NVEC_MOUSE,
+ 	NVEC_BATTERY,
+ 	NVEC_POWER_BUTTON,
++	NVEC_LID,
+ 	NVEC_DIAG,
+ };
+ 
+@@ -856,6 +861,14 @@ set_lid_closed(nvec_device* device, bool closed)
+ 	device->lidClosed = closed;
+ 	TRACE_ALWAYS("lid %s\n", closed ? "closed" : "open");
+ 
++	{
++		// tell the power_daemon
++		MutexLocker locker(device->powerButtonLock);
++		device->lidChanged = true;
++		if (device->lidSelectPool != NULL)
++			notify_select_event_pool(device->lidSelectPool, B_SELECT_READ);
++	}
++
+ 	if (device->pwm == NULL)
+ 		return;
+ 	// Only the enable bit: the duty belongs to the display driver, which sets
+@@ -1561,6 +1574,8 @@ nvec_open(void* cookie, const char* path, int openMode, void** _cookie)
+ 		handle->kind = NVEC_MOUSE;
+ 	else if (strstr(path, "button") != NULL)
+ 		handle->kind = NVEC_POWER_BUTTON;
++	else if (strstr(path, "lid") != NULL)
++		handle->kind = NVEC_LID;
+ 	else if (strcmp(path, NVEC_DIAG_PATH) == 0)
+ 		handle->kind = NVEC_DIAG;
+ 	else
+@@ -1589,16 +1604,24 @@ static status_t
+ nvec_read(void* cookie, off_t position, void* buffer, size_t* _length)
+ {
+ 	nvec_handle* handle = (nvec_handle*)cookie;
+-	if (handle->kind != NVEC_POWER_BUTTON || *_length < 1) {
++	if ((handle->kind != NVEC_POWER_BUTTON && handle->kind != NVEC_LID)
++		|| *_length < 1) {
+ 		*_length = 0;
+ 		return B_NOT_ALLOWED;
+ 	}
+ 
+-	// 1 if the button was pressed since the last read
++	// the button: 1 if it was pressed since the last read; the lid: 1 when
++	// it is open, 0 when it is closed, as the ACPI lid
+ 	nvec_device* device = handle->device;
+ 	MutexLocker locker(device->powerButtonLock);
+-	uint8 pressed = device->powerButtonPressed;
+-	device->powerButtonPressed = 0;
++	uint8 pressed;
++	if (handle->kind == NVEC_LID) {
++		pressed = device->lidClosed ? 0 : 1;
++		device->lidChanged = false;
++	} else {
++		pressed = device->powerButtonPressed;
++		device->powerButtonPressed = 0;
++	}
+ 	locker.Unlock();
+ 
+ 	if (!IS_USER_ADDRESS(buffer)
+@@ -1614,14 +1637,19 @@ static status_t
+ nvec_select(void* cookie, uint8 event, selectsync* sync)
+ {
+ 	nvec_handle* handle = (nvec_handle*)cookie;
+-	if (handle->kind != NVEC_POWER_BUTTON || event != B_SELECT_READ)
++	if ((handle->kind != NVEC_POWER_BUTTON && handle->kind != NVEC_LID)
++		|| event != B_SELECT_READ) {
+ 		return B_BAD_VALUE;
++	}
+ 
+ 	nvec_device* device = handle->device;
++	bool lid = handle->kind == NVEC_LID;
+ 	MutexLocker locker(device->powerButtonLock);
+-	status_t status = add_select_sync_pool_entry(
+-		&device->powerButtonSelectPool, sync, event);
+-	if (status == B_OK && device->powerButtonPressed != 0)
++	status_t status = add_select_sync_pool_entry(lid
++		? &device->lidSelectPool : &device->powerButtonSelectPool, sync,
++		event);
++	if (status == B_OK
++		&& (lid ? device->lidChanged : device->powerButtonPressed != 0))
+ 		notify_select_event(sync, event);
+ 	return status;
+ }
+@@ -1631,12 +1659,15 @@ static status_t
+ nvec_deselect(void* cookie, uint8 event, selectsync* sync)
+ {
+ 	nvec_handle* handle = (nvec_handle*)cookie;
+-	if (handle->kind != NVEC_POWER_BUTTON || event != B_SELECT_READ)
++	if ((handle->kind != NVEC_POWER_BUTTON && handle->kind != NVEC_LID)
++		|| event != B_SELECT_READ) {
+ 		return B_BAD_VALUE;
++	}
+ 
+ 	nvec_device* device = handle->device;
+ 	MutexLocker locker(device->powerButtonLock);
+-	return remove_select_sync_pool_entry(&device->powerButtonSelectPool, sync,
++	return remove_select_sync_pool_entry(handle->kind == NVEC_LID
++		? &device->lidSelectPool : &device->powerButtonSelectPool, sync,
+ 		event);
+ }
+ 
+@@ -2003,6 +2034,8 @@ nvec_init_driver(device_node* node, void** _cookie)
+ 	device->mouseLock = B_SPINLOCK_INITIALIZER;
+ 	device->batteryLock = B_SPINLOCK_INITIALIZER;
+ 	mutex_init(&device->powerButtonLock, "nvec power button");
++	device->lidChanged = true;
++		// the power_daemon reads the state of the lid when it starts
+ 	mutex_init(&device->diagLock, "nvec diag");
+ 	device->diagSem = -1;
+ 	device->diagClass = -1;
+@@ -2154,6 +2187,10 @@ nvec_register_child_devices(void* cookie)
+ 		status = gDeviceManager->publish_device(device->node,
+ 			"power/button/power_nvec", NVEC_DEVICE_MODULE_NAME);
+ 	}
++	if (status == B_OK) {
++		status = gDeviceManager->publish_device(device->node,
++			"power/nvec_lid/0", NVEC_DEVICE_MODULE_NAME);
++	}
+ 	if (status == B_OK) {
+ 		gDeviceManager->publish_device(device->node, NVEC_DIAG_PATH,
+ 			NVEC_DEVICE_MODULE_NAME);
+-- 
+2.39.5
+

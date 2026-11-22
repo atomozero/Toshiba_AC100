@@ -1,0 +1,104 @@
+From 3e29a2d977d037999b687eddfb0620f4c84328f0 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Thu, 19 Nov 2026 20:22:36 +0100
+Subject: [PATCH 07/32] bluetooth_server: tell where the start stops when it
+ takes long
+
+Once, started again after a stop, the server stayed with two threads,
+its main thread and the event listener, and answered nothing; it could
+not be made to do it again. The steps of ReadyToRun() are now logged
+when they take more than 2 s, and a watchdog logs the step that has not
+ended after 10 s.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/servers/bluetooth/BluetoothServer.cpp | 53 +++++++++++++++++++++++
+ 1 file changed, 53 insertions(+)
+
+diff --git a/src/servers/bluetooth/BluetoothServer.cpp b/src/servers/bluetooth/BluetoothServer.cpp
+index 6467c0ccf0..55ccf2d252 100644
+--- a/src/servers/bluetooth/BluetoothServer.cpp
++++ b/src/servers/bluetooth/BluetoothServer.cpp
+@@ -154,26 +154,79 @@ void BluetoothServer::ArgvReceived(int32 argc, char **argv)
+ }
+ 
+ 
++/*!	The server once stayed with two threads and answered nothing after it
++	was started again, and could not be made to do it again. The steps of
++	the start are logged when they take long, and a watchdog tells which
++	one has not ended after 10 s.
++*/
++static const char* volatile sStartStep = NULL;
++
++
++static status_t
++start_watchdog(void*)
++{
++	snooze(10000000);
++	const char* step = sStartStep;
++	if (step != NULL) {
++		syslog(LOG_WARNING, "bluetooth_server: starting, still in %s after "
++			"10 s\n", step);
++	}
++	return B_OK;
++}
++
++
++static void
++log_slow_step(const char* step, bigtime_t start)
++{
++	bigtime_t duration = system_time() - start;
++	if (duration > 2000000) {
++		syslog(LOG_WARNING, "bluetooth_server: starting, %s took %" B_PRId64
++			" ms\n", step, duration / 1000);
++	}
++}
++
++
+ void BluetoothServer::ReadyToRun(void)
+ {
++	thread_id watchdog = spawn_thread(start_watchdog,
++		"bluetooth start watchdog", B_LOW_PRIORITY, NULL);
++	if (watchdog >= 0)
++		resume_thread(watchdog);
++
++	sStartStep = "watching the devices";
++	bigtime_t start = system_time();
+ 	fDeviceManager->StartMonitoringDevice("bluetooth/h2");
+ 	fDeviceManager->StartMonitoringDevice("bluetooth/h3");
+ 	fDeviceManager->StartMonitoringDevice("bluetooth/h4");
+ 	fDeviceManager->StartMonitoringDevice("bluetooth/h5");
++	log_slow_step("watching the devices", start);
+ 
++	sStartStep = "the event listener";
++	start = system_time();
+ 	if (fEventListener2->Launch() != B_OK)
+ 		TRACE_BT("General: Bluetooth event listener failed\n");
+ 	else
+ 		TRACE_BT("General: Bluetooth event listener Ready\n");
++	log_slow_step("the event listener", start);
+ 
++	sStartStep = "the Deskbar icon";
++	start = system_time();
+ 	_InstallDeskbarIcon();
++	log_slow_step("the Deskbar icon", start);
+ 
++	sStartStep = "the SDP server";
++	start = system_time();
+ 	status_t status = fSDPServer->Start();
+ 	if (status != B_OK)
+ 		TRACE_BT("BluetoothServer: Failed launching the SDP server thread\n");
++	log_slow_step("the SDP server", start);
+ 
++	sStartStep = "listening for HID devices";
++	start = system_time();
+ 	if (HIDProfile::Listen() != B_OK)
+ 		TRACE_BT("BluetoothServer: Failed listening for HID devices\n");
++	log_slow_step("listening for HID devices", start);
++	sStartStep = NULL;
+ }
+ 
+ 
+-- 
+2.39.5
+

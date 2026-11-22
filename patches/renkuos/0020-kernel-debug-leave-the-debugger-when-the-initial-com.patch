@@ -1,0 +1,76 @@
+From 1263d3087bf1d10d25a2a7f237721c6353a3cd15 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Fri, 20 Nov 2026 20:26:26 +0100
+Subject: [PATCH 20/32] kernel/debug: leave the debugger when the initial
+ commands end so, after an error too
+
+An error, such as an unknown command, stops the command line: a final
+"continue" was then never run, and a machine without a keyboard in KDL
+stayed there. When the last initial command leaves the debugger, it is
+honoured even when the line stopped before it.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/system/kernel/debug/debug.cpp | 36 ++++++++++++++++++++++++++++++-
+ 1 file changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/src/system/kernel/debug/debug.cpp b/src/system/kernel/debug/debug.cpp
+index dfe3c4f777..ec6929dec3 100644
+--- a/src/system/kernel/debug/debug.cpp
++++ b/src/system/kernel/debug/debug.cpp
+@@ -792,10 +792,38 @@ print_kernel_debugger_message()
+ }
+ 
+ 
++/*!	Returns whether the last of the commands in \a commands, separated by
++	';', is one of those that leave the debugger.
++*/
++static bool
++last_command_quits(const char* commands)
++{
++	const char* last = strrchr(commands, ';');
++	last = last != NULL ? last + 1 : commands;
++	while (isspace(*last))
++		last++;
++
++	size_t length = strlen(last);
++	while (length > 0 && isspace(last[length - 1]))
++		length--;
++
++	static const char* const kQuitCommands[] = { "continue", "exit", "es" };
++	for (size_t i = 0; i < B_COUNT_OF(kQuitCommands); i++) {
++		if (length == strlen(kQuitCommands[i])
++			&& strncmp(last, kQuitCommands[i], length) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++
+ /*!	Executes the commands that follow kKDLMessageCommandSeparator in the
+ 	kernel debugger message. Returns the return code of the last command, so
+ 	that commands ending with "continue" can leave the debugger again without
+-	a keyboard.
++	a keyboard. An error stops the command line before its end; when the last
++	command leaves the debugger, it is still executed then, since nobody may be
++	able to type it.
+ */
+ static int
+ execute_panic_commands()
+@@ -823,6 +851,12 @@ execute_panic_commands()
+ 				commands += strlen(kKDLMessageCommandSeparator);
+ 				kprintf("initial commands: %s\n", commands);
+ 				returnCode = evaluate_debug_command(commands);
++				if (returnCode != B_KDEBUG_QUIT
++					&& last_command_quits(commands)) {
++					kprintf("initial commands stopped early, leaving the "
++						"debugger as they ask\n");
++					returnCode = B_KDEBUG_QUIT;
++				}
+ 			}
+ 		}
+ 
+-- 
+2.39.5
+

@@ -1,0 +1,133 @@
+From 913ac10ea5def41cbb278c8a988b64fffb0fc62d Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 22 Nov 2026 16:58:46 +0100
+Subject: [PATCH 27/32] ehci: tell why isochronous IN transactions failed
+
+A failed isochronous transaction is handed on as an empty packet, and
+nothing above it can tell why data went missing. The status of every IN
+transaction is counted, and every five seconds with failures the syslog
+gets how many were not run, had a data buffer error, babble, or a
+transaction error.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/add-ons/kernel/busses/usb/ehci.cpp | 63 +++++++++++++++++++++++++-
+ src/add-ons/kernel/busses/usb/ehci.h   | 14 ++++++
+ 2 files changed, 76 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/ehci.cpp b/src/add-ons/kernel/busses/usb/ehci.cpp
+index 4053c9bffd..3de6979ac0 100644
+--- a/src/add-ons/kernel/busses/usb/ehci.cpp
++++ b/src/add-ons/kernel/busses/usb/ehci.cpp
+@@ -1583,6 +1583,9 @@ EHCI::_FinishInit()
+ 			fPeriodicFrameList[i]);
+ 	}
+ 
++	memset(fIsoStats, 0, sizeof(fIsoStats));
++	fIsoStatsSince = 0;
++
+ 	// Create the array that will keep bandwidth information
+ 	fFrameBandwidth = new(std::nothrow) uint16[EHCI_VFRAMELIST_ENTRIES_COUNT];
+ 	for (int32 i = 0; i < EHCI_VFRAMELIST_ENTRIES_COUNT; i++) {
+@@ -4306,6 +4309,61 @@ EHCI::WriteIsochronousDescriptorChain(isochronous_transfer_data *transfer)
+ }
+ 
+ 
++/*!	Counts how the isochronous IN transactions came back and tells the
++	syslog every five seconds when some failed: a failed transaction is
++	handed on as an empty packet, and nothing above can tell why data went
++	missing.
++*/
++void
++EHCI::_CountIsochronousStatus(Pipe* pipe, uint32 status, size_t length)
++{
++	// Per endpoint: a camera streams video and sound on two of them.
++	iso_pipe_stats* stats = NULL;
++	for (int i = 0; i < kIsoStatsPipes; i++) {
++		if (fIsoStats[i].pipe == pipe || fIsoStats[i].pipe == NULL) {
++			stats = &fIsoStats[i];
++			stats->pipe = pipe;
++			break;
++		}
++	}
++	if (stats != NULL) {
++		if (status == 0) {
++			stats->ok++;
++			stats->bytes += length;
++		} else if ((status & EHCI_ITD_STATUS_ACTIVE) != 0)
++			stats->notRun++;
++		else {
++			if ((status & EHCI_ITD_STATUS_BUFFER) != 0)
++				stats->bufferError++;
++			if ((status & EHCI_ITD_STATUS_BABBLE) != 0)
++				stats->babble++;
++			if ((status & EHCI_ITD_STATUS_TERROR) != 0)
++				stats->transactionError++;
++		}
++	}
++
++	bigtime_t now = system_time();
++	if (now - fIsoStatsSince < 5000000)
++		return;
++	for (int i = 0; i < kIsoStatsPipes; i++) {
++		iso_pipe_stats& s = fIsoStats[i];
++		if (s.pipe == NULL)
++			continue;
++		if (s.notRun + s.bufferError + s.babble + s.transactionError > 0) {
++			dprintf("ehci: isochronous in, endpoint 0x%02x of device %d, 5 s: %"
++				B_PRIu32 " ok (%" B_PRIu64 " bytes), %" B_PRIu32 " not run, %"
++				B_PRIu32 " buffer errors, %" B_PRIu32 " babble, %" B_PRIu32
++				" transaction errors\n", s.pipe->EndpointAddress(),
++				s.pipe->DeviceAddress(), s.ok, s.bytes, s.notRun,
++				s.bufferError, s.babble, s.transactionError);
++		}
++	}
++	// A pipe may be gone by now: start again from nothing.
++	memset(fIsoStats, 0, sizeof(fIsoStats));
++	fIsoStatsSince = now;
++}
++
++
+ size_t
+ EHCI::ReadIsochronousDescriptorChain(isochronous_transfer_data *transfer)
+ {
+@@ -4333,7 +4391,10 @@ EHCI::ReadIsochronousDescriptorChain(isochronous_transfer_data *transfer)
+ 			&& packet < isochronousData->packet_count; j += slotStride) {
+ 
+ 			size_t bufferSize = EHCI_ITD_TLENGTH_GET(itd->token[j]);
+-			if (EHCI_ITD_STATUS_GET(itd->token[j]) != 0)
++			uint32 itdStatus = EHCI_ITD_STATUS_GET(itd->token[j]);
++			_CountIsochronousStatus(transfer->transfer->TransferPipe(), itdStatus,
++				bufferSize);
++			if (itdStatus != 0)
+ 				bufferSize = 0;
+ 			isochronousData->packet_descriptors[packet].actual_length
+ 				= bufferSize;
+diff --git a/src/add-ons/kernel/busses/usb/ehci.h b/src/add-ons/kernel/busses/usb/ehci.h
+index 285a05ee48..c68b5ec467 100644
+--- a/src/add-ons/kernel/busses/usb/ehci.h
++++ b/src/add-ons/kernel/busses/usb/ehci.h
+@@ -216,6 +216,20 @@ static int32						FinishIsochronousThread(void *data);
+ 		void						SetIsoAnchor(Pipe *pipe, int32 frame);
+ 		void						ClearIsoAnchor(Pipe *pipe);
+ 
++		void						_CountIsochronousStatus(Pipe* pipe,
++										uint32 status, size_t length);
++		struct iso_pipe_stats {
++			Pipe*					pipe;
++			uint32					ok;
++			uint64					bytes;
++			uint32					notRun;
++			uint32					bufferError;
++			uint32					babble;
++			uint32					transactionError;
++		};
++		static const int			kIsoStatsPipes = 4;
++		iso_pipe_stats				fIsoStats[kIsoStatsPipes];
++		bigtime_t					fIsoStatsSince;
+ 		size_t						ReadIsochronousDescriptorChain(
+ 										isochronous_transfer_data *transfer);
+ 
+-- 
+2.39.5
+

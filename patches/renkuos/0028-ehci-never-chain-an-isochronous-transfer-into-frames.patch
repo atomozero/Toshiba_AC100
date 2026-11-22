@@ -1,0 +1,54 @@
+From 580b5554a2c30b88e6a917623f01e4ea5d6b01d1 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 22 Nov 2026 17:38:59 +0100
+Subject: [PATCH 28/32] ehci: never chain an isochronous transfer into frames
+ already passed
+
+A transfer queued on an isochronous pipe starts right after the frames of
+the pipe's previous one. When the previous transfer had finished and its
+successor came late, that anchor was behind the controller: the first
+descriptors were linked into frames it had left. They stayed active, the
+finisher, which only looks five frames back, did not see them, and a whole
+frame list (128 ms) later the controller ran them, into the buffer of a
+transfer finished long before. A UVC camera on a Toshiba AC100 lost about
+a third of its microphone transactions this way and got pieces of old data
+in its video frames.
+
+An anchor that is not ahead of the controller by the margin a new transfer
+gets is dropped, and the transfer starts after that margin.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/add-ons/kernel/busses/usb/ehci.cpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/src/add-ons/kernel/busses/usb/ehci.cpp b/src/add-ons/kernel/busses/usb/ehci.cpp
+index 3de6979ac0..0ea8e31b32 100644
+--- a/src/add-ons/kernel/busses/usb/ehci.cpp
++++ b/src/add-ons/kernel/busses/usb/ehci.cpp
+@@ -2108,6 +2108,22 @@ EHCI::SubmitIsochronous(Transfer *transfer)
+ 		// Chain off THIS pipe's previous transfer, not a controller-global
+ 		// anchor: see the iso_anchor comment in the header.
+ 		int32 anchor = GetIsoAnchor(pipe);
++		if (anchor != -1 && fFirstIsochronousTransfer != NULL) {
++			// The anchor must still be ahead of the controller, with the
++			// margin a new transfer gets. A transfer queued after its
++			// predecessor's last frame had passed was linked into frames
++			// the controller had left: its first descriptors stayed active,
++			// were not seen by the finisher, which only looks a few frames
++			// back, and ran a whole frame list later into the buffer of a
++			// transfer that was long finished.
++			uint32 now = (ReadOpReg(EHCI_FRINDEX) / 8)
++				& (EHCI_VFRAMELIST_ENTRIES_COUNT - 1);
++			uint32 ahead = ((uint32)anchor - now)
++				& (EHCI_VFRAMELIST_ENTRIES_COUNT - 1);
++			uint32 margin = (fThreshold + 7) / 8 + 1;
++			if (ahead < margin || ahead >= EHCI_VFRAMELIST_ENTRIES_COUNT / 2)
++				anchor = -1;
++		}
+ 		if (fFirstIsochronousTransfer != NULL && anchor != -1)
+ 			currentFrame = anchor;
+ 		else {
+-- 
+2.39.5
+

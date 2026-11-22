@@ -1,0 +1,75 @@
+From 53c2118c52867d2a466531faaf8ddd067fc02b3d Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Thu, 19 Nov 2026 22:19:05 +0100
+Subject: [PATCH 13/32] power_daemon: watch every lid driver in /dev/power
+
+Instead of the ACPI and the NVEC lid by name, every power/<name>_lid/0
+device is watched.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/servers/power/lid_monitor.cpp | 29 ++++++++++++++++++-----------
+ 1 file changed, 18 insertions(+), 11 deletions(-)
+
+diff --git a/src/servers/power/lid_monitor.cpp b/src/servers/power/lid_monitor.cpp
+index c50c06feb6..52858c208b 100644
+--- a/src/servers/power/lid_monitor.cpp
++++ b/src/servers/power/lid_monitor.cpp
+@@ -18,11 +18,13 @@
+ #include <Screen.h>
+ #include <Server.h>
+ 
++#include <dirent.h>
+ #include <driver_settings.h>
+ #include <fcntl.h>
+ #include <net/if.h>
+ #include <scheduler.h>
+ #include <stdio.h>
++#include <string.h>
+ #include <syslog.h>
+ #include <unistd.h>
+ 
+@@ -43,12 +45,9 @@ set_screen_power(bool on)
+ }
+ 
+ 
+-// the lids the daemon knows: ACPI, and the embedded controller of the
+-// Toshiba AC100 (NVEC)
+-static const char* const kLidDevices[] = {
+-	"/dev/power/acpi_lid/0",
+-	"/dev/power/nvec_lid/0",
+-};
++// Each lid driver publishes power/<name>_lid/0 (acpi_lid for ACPI): one
++// byte, 0 while the lid is closed, readable when it changed
++static const char* const kPowerDevices = "/dev/power";
+ 
+ 
+ LidMonitor::LidMonitor()
+@@ -57,11 +56,19 @@ LidMonitor::LidMonitor()
+ 	fLowPower(true),
+ 	fSchedulerMode(-1)
+ {
+-	for (size_t i = 0; i < sizeof(kLidDevices) / sizeof(kLidDevices[0]);
+-			i++) {
+-		int fd = open(kLidDevices[i], O_RDONLY);
+-		if (fd >= 0)
+-			fFDs.insert(fd);
++	DIR* dir = opendir(kPowerDevices);
++	if (dir != NULL) {
++		while (dirent* entry = readdir(dir)) {
++			size_t length = strlen(entry->d_name);
++			if (length < 4 || strcmp(entry->d_name + length - 4, "_lid") != 0)
++				continue;
++			BString path;
++			path.SetToFormat("%s/%s/0", kPowerDevices, entry->d_name);
++			int fd = open(path.String(), O_RDONLY);
++			if (fd >= 0)
++				fFDs.insert(fd);
++		}
++		closedir(dir);
+ 	}
+ 
+ 	// "lid_closed_low_power false" in ~/config/settings/power_daemon keeps
+-- 
+2.39.5
+

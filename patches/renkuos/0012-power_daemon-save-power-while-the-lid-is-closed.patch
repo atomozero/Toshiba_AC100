@@ -1,0 +1,256 @@
+From afc8d25aa35b68f62c7ac436fe38174b9c4652e7 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Thu, 19 Nov 2026 21:19:25 +0100
+Subject: [PATCH 12/32] power_daemon: save power while the lid is closed
+
+The lid monitor only printed the state of the ACPI lid. It now also
+watches the lid of the AC100 embedded controller, and while the lid is
+closed it switches the screen off (DPMS), puts the scheduler in power
+saving mode and takes the wireless interfaces down; opening the lid
+brings all of it back, the network server joining the known networks
+again. "lid_closed_low_power false" in ~/config/settings/power_daemon
+leaves everything running.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/servers/power/Jamfile         |   4 +-
+ src/servers/power/lid_monitor.cpp | 141 ++++++++++++++++++++++++++++--
+ src/servers/power/lid_monitor.h   |  15 +++-
+ 3 files changed, 149 insertions(+), 11 deletions(-)
+
+diff --git a/src/servers/power/Jamfile b/src/servers/power/Jamfile
+index b0d4cd158f..6cacf90f99 100644
+--- a/src/servers/power/Jamfile
++++ b/src/servers/power/Jamfile
+@@ -1,6 +1,6 @@
+ SubDir HAIKU_TOP src servers power ;
+ 
+-UsePrivateHeaders app ;
++UsePrivateHeaders app net shared ;
+ 
+ AddResources power_daemon : power_daemon.rdef ;
+ 
+@@ -11,4 +11,4 @@ Application power_daemon :
+ 	power_button_monitor.cpp
+ 	;
+ 
+-LinkAgainst power_daemon : be [ TargetLibstdc++ TargetLibsupc++ ] ;
++LinkAgainst power_daemon : be bnetapi network [ TargetLibstdc++ TargetLibsupc++ ] ;
+diff --git a/src/servers/power/lid_monitor.cpp b/src/servers/power/lid_monitor.cpp
+index 308508162f..c50c06feb6 100644
+--- a/src/servers/power/lid_monitor.cpp
++++ b/src/servers/power/lid_monitor.cpp
+@@ -1,6 +1,7 @@
+ /*
+  * Copyright 2013, Jérôme Duval, korli@users.berlios.de.
+  * Copyright 2005, Nathan Whitehorn.
++ * Copyright 2026, Andrea Bernardi
+  *
+  * Distributed under the terms of the MIT License.
+  */
+@@ -8,24 +9,81 @@
+ 
+ #include "lid_monitor.h"
+ 
+-#include <Messenger.h>
+-#include <Roster.h>
++#include <Accelerant.h>
++#include <FindDirectory.h>
++#include <NetworkDevice.h>
++#include <NetworkInterface.h>
++#include <NetworkRoster.h>
++#include <Path.h>
++#include <Screen.h>
++#include <Server.h>
+ 
++#include <driver_settings.h>
++#include <fcntl.h>
++#include <net/if.h>
++#include <scheduler.h>
+ #include <stdio.h>
++#include <syslog.h>
++#include <unistd.h>
+ 
+-#include <RosterPrivate.h>
++
++/*!	Switches the screen on or off. The daemon starts without a connection to
++	the app_server, which may not run yet then: it connects the first time.
++*/
++static void
++set_screen_power(bool on)
++{
++	BServer* server = dynamic_cast<BServer*>(be_app);
++	if (server == NULL || server->InitGUIContext() != B_OK)
++		return;
++
++	BScreen screen(B_MAIN_SCREEN_ID);
++	if (screen.IsValid())
++		screen.SetDPMS(on ? B_DPMS_ON : B_DPMS_OFF);
++}
++
++
++// the lids the daemon knows: ACPI, and the embedded controller of the
++// Toshiba AC100 (NVEC)
++static const char* const kLidDevices[] = {
++	"/dev/power/acpi_lid/0",
++	"/dev/power/nvec_lid/0",
++};
+ 
+ 
+ LidMonitor::LidMonitor()
++	:
++	fClosed(false),
++	fLowPower(true),
++	fSchedulerMode(-1)
+ {
+-	int fd = open("/dev/power/acpi_lid/0", O_RDONLY);
+-	if (fd > 0)
+-		fFDs.insert(fd);
++	for (size_t i = 0; i < sizeof(kLidDevices) / sizeof(kLidDevices[0]);
++			i++) {
++		int fd = open(kLidDevices[i], O_RDONLY);
++		if (fd >= 0)
++			fFDs.insert(fd);
++	}
++
++	// "lid_closed_low_power false" in ~/config/settings/power_daemon keeps
++	// everything running while the lid is closed
++	BPath path;
++	if (find_directory(B_USER_SETTINGS_DIRECTORY, &path) == B_OK
++		&& path.Append("power_daemon") == B_OK) {
++		void* settings = load_driver_settings(path.Path());
++		if (settings != NULL) {
++			fLowPower = get_driver_boolean_parameter(settings,
++				"lid_closed_low_power", true, true);
++			unload_driver_settings(settings);
++		}
++	}
+ }
+ 
+ 
+ LidMonitor::~LidMonitor()
+ {
++	if (fClosed)
++		_LidOpened();
++
+ 	for (std::set<int>::iterator it = fFDs.begin(); it != fFDs.end(); ++it)
+ 		close(*it);
+ }
+@@ -38,6 +96,73 @@ LidMonitor::HandleEvent(int fd)
+ 	if (read(fd, &status, 1) != 1)
+ 		return;
+ 
+-	if (status == 1)
+-		printf("lid status 1\n");
++	// 0 when the lid is closed, as ACPI's _LID
++	bool closed = status == 0;
++	if (closed == fClosed)
++		return;
++	fClosed = closed;
++
++	syslog(LOG_INFO, "power_daemon: lid %s\n", closed ? "closed" : "open");
++	if (!fLowPower)
++		return;
++
++	if (closed)
++		_LidClosed();
++	else
++		_LidOpened();
++}
++
++
++/*!	While the lid is closed, nobody looks at the screen or types: the screen
++	is switched off (DPMS, which also cuts the panel where the driver can),
++	the scheduler saves power, and the wireless networks are left.
++*/
++void
++LidMonitor::_LidClosed()
++{
++	set_screen_power(false);
++
++	fSchedulerMode = get_scheduler_mode();
++	set_scheduler_mode(SCHEDULER_MODE_POWER_SAVING);
++
++	fInterfacesDown.MakeEmpty();
++	BNetworkRoster& roster = BNetworkRoster::Default();
++	BNetworkInterface interface;
++	uint32 cookie = 0;
++	while (roster.GetNextInterface(&cookie, interface) == B_OK) {
++		int32 flags = interface.Flags();
++		if ((flags & IFF_UP) == 0 || (flags & IFF_LOOPBACK) != 0)
++			continue;
++		BNetworkDevice device(interface.Name());
++		if (!device.IsWireless())
++			continue;
++		if (interface.SetFlags(flags
++				& ~(IFF_UP | IFF_AUTO_CONFIGURED | IFF_CONFIGURING)) == B_OK)
++			fInterfacesDown.Add(interface.Name());
++	}
++
++	syslog(LOG_INFO, "power_daemon: lid closed: screen off, power saving, "
++		"%" B_PRId32 " wireless interfaces down\n",
++		fInterfacesDown.CountStrings());
++}
++
++
++void
++LidMonitor::_LidOpened()
++{
++	set_screen_power(true);
++
++	if (fSchedulerMode >= 0) {
++		set_scheduler_mode(fSchedulerMode);
++		fSchedulerMode = -1;
++	}
++
++	// the network server joins the known networks again, and asks for an
++	// address, as at boot
++	for (int32 i = 0; i < fInterfacesDown.CountStrings(); i++) {
++		BNetworkInterface interface(fInterfacesDown.StringAt(i).String());
++		interface.SetFlags(interface.Flags() | IFF_UP);
++		interface.AutoConfigure(AF_INET);
++	}
++	fInterfacesDown.MakeEmpty();
+ }
+diff --git a/src/servers/power/lid_monitor.h b/src/servers/power/lid_monitor.h
+index 571aed006e..0d4093a930 100644
+--- a/src/servers/power/lid_monitor.h
++++ b/src/servers/power/lid_monitor.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2005-2013, Haiku, Inc.
++ * Copyright 2005-2026, Haiku, Inc.
+  * Distributed under the terms of the MIT license.
+  *
+  * Authors:
+@@ -9,6 +9,9 @@
+ #define _LID_MONITOR_H
+ 
+ 
++#include <String.h>
++#include <StringList.h>
++
+ #include "power_monitor.h"
+ 
+ 
+@@ -22,7 +25,17 @@ public:
+ 	virtual	const std::set<int>&
+ 								FDs() const { return fFDs; }
+ private:
++			void				_LidClosed();
++			void				_LidOpened();
++
+ 			std::set<int>		fFDs;
++			bool				fClosed;
++			bool				fLowPower;
++				// what the settings ask for when the lid closes
++			int32				fSchedulerMode;
++				// before the lid closed
++			BStringList			fInterfacesDown;
++				// the wireless interfaces taken down when it closed
+ };
+ 
+ 
+-- 
+2.39.5
+

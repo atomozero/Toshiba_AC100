@@ -5,6 +5,9 @@
 wpa_supplicant
 ralink_wifi_firmwares
 ca_root_certificates
+# needed by libidn2 and libpsl (curl, wget), which come with the system
+# image without it
+libunistring
 
 # applications
 webpositive
@@ -19,6 +22,9 @@ localsend
 wonderbrush3
 rtelevision
 glu
+cinema
+bubicam
+aukey_webcam_v4
 
 # command line
 git

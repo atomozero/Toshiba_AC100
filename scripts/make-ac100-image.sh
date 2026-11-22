@@ -77,6 +77,10 @@ bfs "cp -f /myfs/home/config/settings/kernel/drivers/kernel :$T/kernel"
 if [ "${SMP:-1}" = 0 ]; then
 	printf '\n# AC100: one CPU only\ndisable_smp true\n' >> "$T/kernel"
 fi
+# le tensioni nominali del Tegra 2: il governatore della frequenza ne ha
+# bisogno per portare la CPU a 1 GHz (core a 1225 mV)
+grep -q "^tegra_nominal_voltages" "$T/kernel" \
+	|| printf '\n# AC100: nominal Tegra 2 voltages, needed for 1 GHz\ntegra_nominal_voltages true\n' >> "$T/kernel"
 # PMIC=0 non tocca il chip di alimentazione TPS6586x (orologio)
 if [ "${PMIC:-1}" = 0 ]; then
 	printf '\n# AC100: leave the TPS6586x alone\ntps6586x_clock false\n' >> "$T/kernel"

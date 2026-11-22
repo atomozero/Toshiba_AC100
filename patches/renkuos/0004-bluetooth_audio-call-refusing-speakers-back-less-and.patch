@@ -1,0 +1,87 @@
+From 8d1032ddf1f4921fa24612bf9caed9100443a5ca Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Thu, 19 Nov 2026 20:16:34 +0100
+Subject: [PATCH 04/32] bluetooth_audio: call refusing speakers back less and
+ less often
+
+While the sound plays elsewhere, the speakers were called every 30 s for
+good. A Google Home refuses every call, it only connects by itself, so
+the radio paged it twice a minute. Each refused call doubles the time to
+the next one, up to 10 minutes; the speakers being there again brings
+it back to 30 s.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../bluetooth_audio/BluetoothAudioNode.cpp      | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp b/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp
+index aa3aa2175a..d77bef18b1 100644
+--- a/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp
++++ b/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp
+@@ -53,6 +53,9 @@ static const bigtime_t kCallInterval = 15000000;
+ // take it back when they can be reached again: counted from the end of a
+ // call, which pages for a while, so that the radio is not paging all along
+ static const bigtime_t kRecallInterval = 30000000;
++// speakers that keep refusing to be called (a Google Home only connects by
++// itself) are called less and less often, down to this
++static const bigtime_t kMaxRecallInterval = 600000000;
+ // how late speakers play, when they do not tell (A2DP delay reporting)
+ static const bigtime_t kDefaultOutputDelay = 150000;
+ // below this, a sample is silence (16-bit)
+@@ -600,11 +603,14 @@ BluetoothAudioNode::_Link()
+ 	const int32 backlog = (int32)(kFrameRate * kStartBacklog / 1000000);
+ 	int16 chunk[kChunkFrames * kChannels];
+ 	bigtime_t calledAt = 0;
++	bigtime_t recallInterval = kRecallInterval;
+ 	bool remotePaused = false;
+ 	int32 lastRemoteVolume = -1;
+ 
+ 	while (!fQuitting) {
+ 		bigtime_t now = system_time();
++		if (fAvailable)
++			recallInterval = kRecallInterval;
+ 
+ 		if (fInput.source == media_source::null && !fAvailable) {
+ 			// out of reach before, the sound plays elsewhere meanwhile:
+@@ -614,14 +620,15 @@ BluetoothAudioNode::_Link()
+ 			if (!remoteListening)
+ 				remoteListening = remote.Listen() == B_OK;
+ 			bdaddr_t from;
+-			if (now - calledAt > kRecallInterval) {
++			if (now - calledAt > recallInterval) {
+ 				TRACE("%s: calling the speakers back\n", fName.String());
+ 				status_t status = source.Connect(fAddress);
+ 				calledAt = system_time();
+ 				if (status == B_OK) {
+ 					remotePaused = false;
+ 					_SetAvailable(true);
+-				}
++				} else
++					recallInterval = min_c(recallInterval * 2, kMaxRecallInterval);
+ 			} else if (source.WaitForSink(500000, &from) == B_OK) {
+ 				TRACE("%s: the speakers connected\n", fName.String());
+ 				remotePaused = false;
+@@ -694,7 +701,7 @@ BluetoothAudioNode::_Link()
+ 			// sound waits: the speakers are called, now and then; while
+ 			// the sound plays elsewhere, they are called all the same
+ 			if ((sound && now - calledAt > kCallInterval)
+-				|| (!fAvailable && now - calledAt > kRecallInterval)) {
++				|| (!fAvailable && now - calledAt > recallInterval)) {
+ 				TRACE("%s: %s, calling the speakers\n", fName.String(),
+ 					sound ? "sound to play" : "to take the sound back");
+ 				status_t status = source.Connect(fAddress);
+@@ -709,6 +716,10 @@ BluetoothAudioNode::_Link()
+ 				// out of reach: the sound does not wait for them
+ 				if (sound)
+ 					_SetAvailable(false);
++				else {
++					recallInterval = min_c(recallInterval * 2,
++						kMaxRecallInterval);
++				}
+ 			}
+ 			// or they connect by themselves
+ 			bdaddr_t from;
+-- 
+2.39.5
+

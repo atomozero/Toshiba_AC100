@@ -1,6 +1,6 @@
-# The AC100 commits of hrev60107+736 on RenkuOS main d8089a1293, oldest first.
-# 0001-AC100-tree-at-the-merge-of-RenkuOS-main-d8089a1293.patch holds the ones before
-# the merge of RenkuOS main (44abc33fbb); 0002 to 0042 are the ones after it, one each.
+# The AC100 commits of the release on RenkuOS main 7d3aff32eb, oldest first.
+# 0001-AC100-tree-at-the-merge-of-RenkuOS-main-7d3aff32eb.patch holds the AC100 tree at the merge of
+# RenkuOS main (63ec5976d5); the patches after it are the commits since, one each.
 
 763a639c5f 2026-10-20 ARM: link kernel and loader against the cross-compiler libgcc
 2ac377c2cd 2026-10-20 ARM: link libroot and applications against the cross-compiler libsupc++ and libgcc
@@ -167,3 +167,50 @@ cf574ee082 2026-11-12 kernel/scheduler: check where the IRQ went, not where it i
 033ad0ffc2 2026-11-12 tegra_audio: turn the pre-filter of the digital microphone on
 797e35a585 2026-11-12 tegra_audio: record the built-in microphone 12 dB louder by default
 af64ea55db 2026-11-12 tegra_audio: the room noise of the built-in microphone, as measured
+9447d8d1ad 2026-11-09 kernel/vm: take shadowed pages out of MODIFIED before freeing them
+1dee35ee1e 2026-11-14 bluetooth_hid: keep the device until its last cookie is freed
+27a12ea659 2026-11-14 PNGTranslator: volatile for the variables that live across setjmp()
+8ea274e47d 2026-11-14 tegra_dc, nvec: the lid and the sleeping screen share the backlight
+f84b0cdd92 2026-11-15 Bluetooth, Input preferences: open the Input settings of a device
+61415a7b3f 2026-11-15 build: i2c_elan only where the ACPI bus manager is
+f8363d87da 2026-11-15 kernel: find the file system modules the boot loader pre-loaded
+da23948e25 2026-11-15 file_cache: look for a cache module only when the settings name one
+900a0dc08f 2026-11-15 kernel: wrap a long line in module_init_post_boot_device()
+faba712f3c 2026-11-16 file_cache: only accept a cache module from the settings
+3f2d16b18e 2026-11-18 adt7461: report the board temperature when the cpu channel is stuck
+1b87f08df2 2026-11-18 ActivityMonitor: find a temperature without ACPI too
+dc950c894b 2026-11-18 kernel/legacy_drivers: keep counting the users of a published device
+4dae072de4 2026-11-18 kernel/debug: run the initial KDL commands from userland too, and continue
+34a63fd765 2026-11-12 freebsd_network: m_free() deletes the tags of all packet headers
+0952c718d8 2026-11-19 bluetooth: say the clock offset is valid only when an inquiry gave it
+9b5a1dce7f 2026-11-19 bluetooth_audio: stay loaded, so that speakers paired later are seen
+2764dc7f4d 2026-11-19 bluetooth_server: tell of a connection once the link is secured
+8d1032ddf1 2026-11-19 bluetooth_audio: call refusing speakers back less and less often
+bac76e4520 2026-11-19 DIAGNOSTIC sdhci: log the PIO reference reads of the self test (temporary)
+994ad7c597 2026-11-19 nvec: start the controller over at the first EC timeout, after 2 s
+3e29a2d977 2026-11-19 bluetooth_server: tell where the start stops when it takes long
+ea5efa2823 2026-11-19 sdhci: a PIO read waits for the end of the block on the Tegra 2
+73485a672a 2026-11-19 Revert "DIAGNOSTIC sdhci: log the PIO reference reads of the self test (temporary)"
+b21dd67dcf 2026-11-19 wlan, usb_webcam: no debug output in normal use
+d605b84a8d 2026-11-19 nvec: publish the lid for the power_daemon
+afc8d25aa3 2026-11-19 power_daemon: save power while the lid is closed
+53c2118c52 2026-11-19 power_daemon: watch every lid driver in /dev/power
+263c664694 2026-11-19 power_daemon: bring the network back before the screen when the lid opens
+cce58a4e33 2026-11-19 tegra_audio: power the codec down while nothing plays
+06d34da95e 2026-11-19 tegra_audio: the input does not power the codec up while it sleeps
+b68624372b 2026-11-19 kernel/arm: switch the PL310 prefetches on
+c9b3f5834d 2026-11-19 tegra_dvfs: an sclk command to set the system clock
+a44433bbfc 2026-11-20 kernel/legacy_drivers: fail the open of a device the reloaded driver dropped
+1263d3087b 2026-11-20 kernel/debug: leave the debugger when the initial commands end so, after an error too
+7baad0e007 2026-11-20 kernel/arm: leave the PL310 prefetches off unless asked for
+500bbf3e2c 2026-11-20 sdhci: the early buffer read enable of the Tegra 2 as a quirk
+9a3ad1d893 2026-11-21 libmedia: a node's event loop survives a missing time source
+c0d92202bb 2026-09-30 usb_raw: a device unplugged mid-transfer no longer hangs every /dev open
+f64df914e3 2026-10-05 usb_raw, USB Kit: isochronous streams
+27b1fc4b0a 2026-11-22 kernel/legacy_drivers: a non-packaged driver takes over the packaged one
+913ac10ea5 2026-11-22 ehci: tell why isochronous IN transactions failed
+580b5554a2 2026-11-22 ehci: never chain an isochronous transfer into frames already passed
+321cae37ba 2026-11-22 usb: map memory shared with the controller uncached on 32-bit ARM too
+562ac03b6e 2026-11-22 ehci: start a new isochronous transfer a frame later
+fda5f36638 2026-11-22 usb_raw, USB Kit: one isochronous stream per endpoint
+5c81225bbf 2026-11-22 ehci: run the isochronous finisher above real-time media threads

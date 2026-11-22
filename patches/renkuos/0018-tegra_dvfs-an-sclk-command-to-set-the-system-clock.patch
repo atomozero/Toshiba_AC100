@@ -1,0 +1,117 @@
+From c9b3f5834da013c7bee08805950bc43f183254e0 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Thu, 19 Nov 2026 23:49:37 +0100
+Subject: [PATCH 18/32] tegra_dvfs: an sclk command to set the system clock
+
+The system clock (the AHB, which carries the eMMC, USB and DMA traffic)
+runs at 72 MHz from PLLP_OUT3; Linux runs it at 240 MHz from PLLC_OUT1.
+"sclk <MHz>" written to the device moves it to PLLC_OUT1 (240, 200,
+150 or 120 MHz, with the APB at half of it, if the core supply is at
+1200 mV at least), and "sclk 72" back to PLLP_OUT3. Nothing changes
+unless asked, until it is known to be safe.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ .../drivers/power/tegra_dvfs/tegra_dvfs.cpp   | 72 +++++++++++++++++++
+ 1 file changed, 72 insertions(+)
+
+diff --git a/src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp b/src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp
+index c9304ba2d4..0eabfe51db 100644
+--- a/src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp
++++ b/src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp
+@@ -71,6 +71,7 @@
+ #define CAR_SUPER_SCLK_DIVIDER		0x2c
+ #define CAR_CLK_SYSTEM_RATE			0x30
+ #define CAR_PLLC_BASE				0x80
++#define CAR_PLLC_OUT				0x84
+ #define CAR_PLLM_BASE				0x90
+ #define CAR_PLLP_BASE				0xa0
+ #define CAR_PLLX_BASE				0xe0
+@@ -540,6 +541,69 @@ tegra_dvfs_read(void* cookie, off_t position, void* buffer, size_t* _length)
+ }
+ 
+ 
++/*!	The system clock (SCLK = HCLK, the AHB, with PCLK for the APB) runs from
++	PLLP_OUT3 at 72 MHz since the USB driver had to move it. Linux runs it
++	from PLLC_OUT1 at 240 MHz, with the APB at half of it. The AHB carries
++	the eMMC, USB and DMA traffic. A rate above 72 MHz comes from PLLC_OUT1
++	(600 MHz PLLC: 240, 200, 150 or 120 MHz) and needs the core supply at
++	1200 mV at least; 72 goes back to PLLP_OUT3. Only on request: writing
++	"sclk <MHz>" to the device.
++*/
++static status_t
++set_system_clock(uint32 mhz)
++{
++	uint32 ratio = 0;
++	if (mhz != 72) {
++		if (mhz == 0 || 1200 % mhz != 0 || 1200 / mhz < 2 || mhz > 240)
++			return B_BAD_VALUE;
++		ratio = 1200 / mhz - 2;
++		uint32 core;
++		if (read_supply(kSupplies[SUPPLY_CORE], &core) != B_OK || core < 1200)
++			return B_NOT_ALLOWED;
++	}
++
++	void* address;
++	area_id area = map_physical_memory("tegra car", TEGRA20_CAR_BASE,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++	if (area < B_OK)
++		return area;
++	volatile uint32* car = (volatile uint32*)address;
++
++	if ((car[CAR_PLLC_BASE / 4] & (1U << 30)) == 0
++		|| pll_khz(car[CAR_PLLC_BASE / 4]) != 600000) {
++		delete_area(area);
++		return B_NOT_SUPPORTED;
++	}
++
++	uint32 policy = car[CAR_SCLK_BURST_POLICY / 4];
++	// the run source, bits 7-4: 3 PLLP_OUT3, 1 PLLC_OUT1
++	uint32 source = mhz == 72 ? 3 : 1;
++	if (mhz != 72) {
++		// the APB at half of the AHB first, as it stays at 120 MHz at most
++		car[CAR_CLK_SYSTEM_RATE / 4] = (car[CAR_CLK_SYSTEM_RATE / 4] & ~3U)
++			| 1;
++		// PLLC_OUT1: divider (ratio + 2) / 2 in bits 15-8, enable, out of
++		// reset
++		uint32 out = car[CAR_PLLC_OUT / 4] & ~0xffffU;
++		car[CAR_PLLC_OUT / 4] = out | (ratio << 8) | 3;
++		spin(2);
++	}
++	car[CAR_SCLK_BURST_POLICY / 4] = (policy & ~0xf0U) | (source << 4);
++	spin(10);
++	if (mhz == 72) {
++		// back with the APB at the full 72 MHz
++		car[CAR_CLK_SYSTEM_RATE / 4] = car[CAR_CLK_SYSTEM_RATE / 4] & ~3U;
++	}
++	TRACE_ALWAYS("system clock %" B_PRIu32 " MHz (policy %#" B_PRIx32
++		", system rate %#" B_PRIx32 ", pllc out %#" B_PRIx32 ")\n", mhz,
++		car[CAR_SCLK_BURST_POLICY / 4], car[CAR_CLK_SYSTEM_RATE / 4],
++		car[CAR_PLLC_OUT / 4]);
++	delete_area(area);
++	return B_OK;
++}
++
++
+ static status_t
+ tegra_dvfs_write(void* cookie, off_t position, const void* buffer,
+ 	size_t* _length)
+@@ -557,6 +621,14 @@ tegra_dvfs_write(void* cookie, off_t position, const void* buffer,
+ 	}
+ 	*value++ = '\0';
+ 
++	if (strcmp(command, "sclk") == 0) {
++		MutexLocker locker(sLock);
++		status_t status = set_system_clock(strtoul(value, NULL, 10));
++		if (status != B_OK)
++			*_length = 0;
++		return status;
++	}
++
+ 	if (strcmp(command, "cclk") == 0) {
+ 		status_t status = set_cpu_clock(strtoul(value, NULL, 10));
+ 		if (status != B_OK)
+-- 
+2.39.5
+

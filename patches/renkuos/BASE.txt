@@ -1,3 +1,3 @@
-base: d8089a1293011471dcc71f2b8b0d03f430ecf339 (RenkuOS/Source main, Merge pull request #252 from atomozero/bt-kernel)
-apply: git checkout -b ac100 d8089a1293 && git apply --index patches/renkuos/0001-*.patch && git commit -m "AC100 tree at the merge of RenkuOS main" && git am $(ls patches/renkuos/0*.patch | tail -n +2)
-result: identical to the tree of the AC100 branch af64ea55db11c84b0ed4240087c62219d3837232, from which hrev60107+736 was built
+base: 7d3aff32eb5ca067ac0aea0361019340a4daf3f9 (RenkuOS/Source main, Merge pull request #497 from 12akakor/realtek-rtw88-firmware)
+apply: git checkout -b ac100 7d3aff32eb && git apply --index patches/renkuos/0001-*.patch && git commit -m "AC100 tree at the merge of RenkuOS main" && git am $(ls patches/renkuos/0*.patch | tail -n +2)
+result: identical to the tree of the AC100 branch 5c81225bbf7f4e27c2b6780dbcbbee8cc27bbb51, from which hrev60107+1272 was built

@@ -1,0 +1,54 @@
+From 994ad7c597d4dc036277b94d97400bd81ac08ae5 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Thu, 19 Nov 2026 20:19:18 +0100
+Subject: [PATCH 06/32] nvec: start the controller over at the first EC
+ timeout, after 2 s
+
+The EC stopped answering once, and the keyboard and the touchpad were
+dead for about 15 s: each try waited 5 s, and the controller was started
+over only after the second timeout, which is what brought the EC back.
+The EC answers within milliseconds, so a try now waits 2 s, and the
+controller is started over at the first timeout.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/add-ons/kernel/busses/i2c/nvec/nvec.cpp | 13 ++++++-------
+ 1 file changed, 6 insertions(+), 7 deletions(-)
+
+diff --git a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+index 1679c6f02e..16edfa3b89 100644
+--- a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
++++ b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
+@@ -221,7 +221,6 @@ struct nvec_device {
+ 	uint32				protocolErrors;
+ 	uint32				interrupts;
+ 	uint32				lostInterrupts;
+-	int32				timeouts;	// in a row, by tx_thread
+ 	// check_lost_interrupt(): the interrupt count when it found one pending
+ 	uint32				pendingInterrupts;
+ 	int32				pendingChecks;
+@@ -765,15 +764,15 @@ tx_thread(void* data)
+ 		int32 tries = 0;
+ 		while (!device->stopping) {
+ 			set_request(device, true);
++			// The EC answers within milliseconds. When it does not, the
++			// controller is started over at once: until then the keyboard
++			// and the touchpad are dead too (seen once for 15 s, with the
++			// former 5 s wait and a restart after the second timeout).
+ 			status_t status = acquire_sem_etc(device->transferSem, 1,
+-				B_RELATIVE_TIMEOUT, 5000000);
++				B_RELATIVE_TIMEOUT, 2000000);
+ 
+-			if (status == B_OK)
+-				device->timeouts = 0;
+-			else if (++device->timeouts >= 2) {
++			if (status != B_OK)
+ 				restart_controller(device);
+-				device->timeouts = 0;
+-			}
+ 
+ 			InterruptsSpinLocker locker(device->lock);
+ 			if (status == B_OK || ++tries >= 3) {
+-- 
+2.39.5
+

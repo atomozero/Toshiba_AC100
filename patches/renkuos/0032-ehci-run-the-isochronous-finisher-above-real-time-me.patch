@@ -1,0 +1,39 @@
+From 5c81225bbf7f4e27c2b6780dbcbbee8cc27bbb51 Mon Sep 17 00:00:00 2001
+From: atomozero <bernardi.andrea@gmail.com>
+Date: Sun, 22 Nov 2026 21:49:06 +0100
+Subject: [PATCH 32/32] ehci: run the isochronous finisher above real-time
+ media threads
+
+The isochronous finish thread runs the completions that queue the next
+transfers (usb_raw streams requeue from their callback). At urgent display
+priority the real-time threads of a media application could hold it off
+past the queued transfers, and the endpoint went unserved for a few
+milliseconds. On a Toshiba AC100 streaming 640x480 MJPEG, the microframes
+that were never scheduled fell from about 1000 to about 300 per 5 s.
+
+Signed-off-by: atomozero <bernardi.andrea@gmail.com>
+---
+ src/add-ons/kernel/busses/usb/ehci.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/add-ons/kernel/busses/usb/ehci.cpp b/src/add-ons/kernel/busses/usb/ehci.cpp
+index 6dc38f230c..af6f28fce1 100644
+--- a/src/add-ons/kernel/busses/usb/ehci.cpp
++++ b/src/add-ons/kernel/busses/usb/ehci.cpp
+@@ -1409,8 +1409,12 @@ EHCI::_PrepareController()
+ 	}
+ 
+ 	// Create the isochronous finisher service thread
++	// Above the real-time threads of media applications: this thread runs
++	// the completions that queue the next isochronous transfers (streams
++	// requeue from their callback), and while it waits the endpoint has
++	// holes of several milliseconds that a camera fills with lost data.
+ 	fFinishIsochronousThread = spawn_kernel_thread(FinishIsochronousThread,
+-		"ehci isochronous finish thread", B_URGENT_DISPLAY_PRIORITY,
++		"ehci isochronous finish thread", B_REAL_TIME_DISPLAY_PRIORITY,
+ 		(void *)this);
+ 	resume_thread(fFinishIsochronousThread);
+ 
+-- 
+2.39.5
+
