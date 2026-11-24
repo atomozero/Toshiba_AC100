@@ -214,3 +214,4 @@ f64df914e3 2026-10-05 usb_raw, USB Kit: isochronous streams
 562ac03b6e 2026-11-22 ehci: start a new isochronous transfer a frame later
 fda5f36638 2026-11-22 usb_raw, USB Kit: one isochronous stream per endpoint
 5c81225bbf 2026-11-22 ehci: run the isochronous finisher above real-time media threads
+1e178b1eda 2026-11-24 ehci: an isochronous anchor queued far ahead is not one already passed
