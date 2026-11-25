@@ -45,7 +45,7 @@ ln -s "../../../../apps/Install to internal memory" \
 	"$ST/data/deskbar/menu/Applications/Install to internal memory"
 cat > "$W/ac100_install.PackageInfo" <<EOF
 name			ac100_install
-version			1.0.0-1
+version			1.0.1-1
 architecture	arm
 summary			"Installs RenkuOS on the internal memory of the Toshiba AC100"
 description		"ac100-install copies the system started from the microSD card to the internal eMMC of the Toshiba AC100, in two phases with a restart in between, without touching the NVIDIA boot data and the original bootloader in the first 16 MB. \"Install to internal memory\" guides through it in a Terminal."
@@ -61,9 +61,9 @@ urls			{
 	"https://github.com/atomozero/Toshiba_AC100"
 }
 provides		{
-	ac100_install = 1.0.0
-	cmd:ac100_install = 1.0.0
-	app:Install_to_internal_memory = 1.0.0
+	ac100_install = 1.0.1
+	cmd:ac100_install = 1.0.1
+	app:Install_to_internal_memory = 1.0.1
 }
 requires		{
 	haiku
@@ -71,7 +71,7 @@ requires		{
 }
 EOF
 bash "$HOME/haiku-arm/apps-extra/scripts/mkpkg.sh" "$ST" "$W/ac100_install.PackageInfo" \
-	"$OUTDIR/ac100_install-1.0.0-1-arm.hpkg"
+	"$OUTDIR/ac100_install-1.0.1-1-arm.hpkg"
 
 # ----------------------------------------------------------------- salagiochi
 B=$W/salagiochi-build
@@ -134,7 +134,7 @@ EOF
 bash "$HOME/haiku-arm/apps-extra/scripts/mkpkg.sh" "$ST" "$W/salagiochi.PackageInfo" \
 	"$OUTDIR/salagiochi-1.0.0-1-arm.hpkg"
 
-bash "$FIXATTR" "$OUTDIR/ac100_install-1.0.0-1-arm.hpkg" \
+bash "$FIXATTR" "$OUTDIR/ac100_install-1.0.1-1-arm.hpkg" \
 	"$OUTDIR/salagiochi-1.0.0-1-arm.hpkg"
 bash "$HOME/haiku-arm/apps-extra/scripts/check-d16.sh" -q "$OUTDIR"/*.hpkg \
 	2>/dev/null || true

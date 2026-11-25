@@ -118,7 +118,7 @@ index 0f2fce8265..585b900496 100644
  		file: base libjpeg_turbo
  			runtime: lib
 diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
-index d795535658..ab173c25ed 100644
+index eca876e65a..6fb3eb9de6 100644
 --- a/build/jam/images/definitions/minimum
 +++ b/build/jam/images/definitions/minimum
 @@ -37,6 +37,7 @@ SYSTEM_BIN = [ FFilterByBuildFeatures
@@ -222,7 +222,7 @@ index d795535658..ab173c25ed 100644
  ] ;
  
  SYSTEM_ADD_ONS_DRIVERS_POWER = [ FFilterByBuildFeatures
-@@ -364,7 +395,7 @@ SYSTEM_ADD_ONS_BUS_MANAGERS = [ FFilterByBuildFeatures
+@@ -365,7 +396,7 @@ SYSTEM_ADD_ONS_BUS_MANAGERS = [ FFilterByBuildFeatures
  	agp_gart@x86,x86_64
  	ata
  	hyperv@x86,x86_64,arm64
@@ -231,7 +231,7 @@ index d795535658..ab173c25ed 100644
  	isa@x86,x86_64
  	mmc
  	scsi
-@@ -459,3 +490,181 @@ if $(HAIKU_IS_BOOTSTRAP) != 1 {
+@@ -460,3 +491,181 @@ if $(HAIKU_IS_BOOTSTRAP) != 1 {
  	AddFilesToHaikuImage system settings package-repositories
  		: $(thirdPartyRepositoryConfigs) ;
  }
@@ -414,7 +414,7 @@ index d795535658..ab173c25ed 100644
 +	] ;
 +}
 diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
-index b2805846a0..925aa72a8b 100644
+index f579405e5d..f401f031fb 100644
 --- a/build/jam/packages/Haiku
 +++ b/build/jam/packages/Haiku
 @@ -46,8 +46,13 @@ AddFilesToPackage add-ons kernel busses ata :
@@ -431,15 +431,15 @@ index b2805846a0..925aa72a8b 100644
  	pch_i2c@x86,x86_64
  	;
  AddFilesToPackage add-ons kernel busses mmc :
-@@ -115,6 +120,7 @@ AddFilesToPackage add-ons kernel interrupt_controllers :
- AddFilesToPackage add-ons kernel power cpufreq :
+@@ -121,6 +126,7 @@ AddFilesToPackage add-ons kernel power cpufreq :
  	amd_pstates@x86,x86_64
  	intel_pstates@x86,x86_64
+ 	jh7110_cpufreq@riscv64
 +	tegra20_cpufreq@arm
  	;
  AddFilesToPackage add-ons kernel power cpuidle :
  	x86_cstates@x86,x86_64
-@@ -148,6 +154,9 @@ AddNewDriversToPackage disk virtual :
+@@ -154,6 +160,9 @@ AddNewDriversToPackage disk virtual :
  AddNewDriversToPackage gpio :
  	baytrail_gpio@x86,x86_64
  	;
@@ -447,25 +447,26 @@ index b2805846a0..925aa72a8b 100644
 +	gpio_leds@arm
 +	;
  AddNewDriversToPackage graphics :
+ 	hyperv_video@x86,x86_64,arm64
  	virtio_gpu
- 	;
-@@ -165,13 +174,14 @@ AddNewDriversToPackage input :
- 	hyperv_hid@x86,x86_64
+@@ -175,7 +184,7 @@ AddNewDriversToPackage input :
+ 	hyperv_kbd@x86,x86_64,arm64
  	i2c_elan@x86,x86_64,arm64
  	i2c_goodix@x86,x86_64
 -	i2c_hid
 +	i2c_hid@!arm
+ 	rmi4_smbus@x86,x86_64
  	virtio_input
  	;
- AddNewDriversToPackage display :
+@@ -183,6 +192,7 @@ AddNewDriversToPackage display :
  #	display_adapter@x86
  	;
  AddNewDriversToPackage audio hmulti :
 +	tegra_audio@arm
  #	virtio_sound
- 	;
- AddNewDriversToPackage hyperv :
-@@ -205,6 +215,7 @@ AddDriversToPackage dvb :
+ 	jh7110_i2stx@riscv64
+ 	jh7110_pwmdac@riscv64
+@@ -218,6 +228,7 @@ AddDriversToPackage dvb :
  	;
  AddDriversToPackage graphics
  	: $(SYSTEM_ADD_ONS_DRIVERS_GRAPHICS) ;
@@ -473,7 +474,7 @@ index b2805846a0..925aa72a8b 100644
  AddDriversToPackage input :
  	bluetooth_hid
  	ps2_hid
-@@ -219,6 +230,12 @@ AddDriversToPackage misc :
+@@ -232,6 +243,12 @@ AddDriversToPackage misc :
  	<driver>mem
  	nvmm@x86_64
  	;
@@ -486,8 +487,8 @@ index b2805846a0..925aa72a8b 100644
  AddDriversToPackage net
  	: $(SYSTEM_ADD_ONS_DRIVERS_NET) ;
  AddDriversToPackage ports :
-@@ -383,6 +400,8 @@ AddBootModuleSymlinksToPackage
- 	smbios@x86,x86_64
+@@ -399,6 +416,8 @@ AddBootModuleSymlinksToPackage
+ 	designware_mmc@riscv64
  	sdhci
  	bcm2711_emmc2@arm64
 +	# sdhci powers the Tegra slots through it
@@ -495,14 +496,14 @@ index b2805846a0..925aa72a8b 100644
  	usb
  	usb_disk
  	<usb>ehci
-@@ -399,6 +418,7 @@ AddBootModuleSymlinksToPackage
+@@ -415,6 +434,7 @@ AddBootModuleSymlinksToPackage
  # add-ons
  AddFilesToPackage add-ons accelerants :
  	framebuffer.accelerant
 +	tegra_dc.accelerant@arm
+ 	vesa.accelerant@arm64
+ 		# hyperv_video uses it; x86 gets it from SYSTEM_ADD_ONS_ACCELERANTS
  	virtio_gpu.accelerant
- 	$(SYSTEM_ADD_ONS_ACCELERANTS) ;
- AddFilesToPackage add-ons locale catalogs :
 diff --git a/build/scripts/build_cross_tools_gcc4 b/build/scripts/build_cross_tools_gcc4
 index 81a33fe7c9..a8e0140d50 100755
 --- a/build/scripts/build_cross_tools_gcc4
@@ -763,18 +764,6 @@ index 2796d39bbf..7d54e443b3 100644
  };
  #else
  struct bluetooth_device;
-diff --git a/headers/os/bluetooth/LocalDevice.h b/headers/os/bluetooth/LocalDevice.h
-index 11e8b52d94..f8b58d8869 100644
---- a/headers/os/bluetooth/LocalDevice.h
-+++ b/headers/os/bluetooth/LocalDevice.h
-@@ -60,6 +60,7 @@ private:
- 			status_t		_ReadBufferSize();
- 			status_t		_ReadLocalFeatures();
- 			status_t		_ReadTimeouts();
-+			status_t		_EnableSimplePairing();
- 			status_t		_ReadLinkKeys();
- 			status_t		Reset();
- 
 diff --git a/headers/os/bluetooth/RemoteDevice.h b/headers/os/bluetooth/RemoteDevice.h
 index ca7777e613..d851a68429 100644
 --- a/headers/os/bluetooth/RemoteDevice.h
@@ -788,16 +777,66 @@ index ca7777e613..d851a68429 100644
  };
  
  }
+diff --git a/headers/os/device/USBKit.h b/headers/os/device/USBKit.h
+index 1e82f83f5a..88dcafbd7a 100644
+--- a/headers/os/device/USBKit.h
++++ b/headers/os/device/USBKit.h
+@@ -305,6 +305,21 @@ mutable	char *						fInterfaceString;
+ /*	The BUSBEndpoint represent a device endpoint that can be used to send or
+ 	receive data. It also allows to query endpoint characteristics like
+ 	endpoint type or direction. */
++// What precedes each packet returned by
++// BUSBEndpoint::ReadIsochronousStream().
++struct usb_stream_packet_header {
++		uint16						length;
++		uint16						flags;
++};
++
++enum {
++	B_USB_STREAM_PACKET_ERROR	= 0x0001,
++		// the packet was received with an error
++	B_USB_STREAM_PACKET_GAP		= 0x0002
++		// packets before this one were lost
++};
++
++
+ class BUSBEndpoint {
+ public:
+ 		// Interface() returns the parent interface of this endpoint.
+@@ -350,6 +365,25 @@ public:
+ 										usb_iso_packet_descriptor *packetDescriptors,
+ 										uint32 packetCount)	const;
+ 
++		// A single IsochronousTransfer() at a time loses what the device
++		// sends between two calls. For an isochronous input endpoint that
++		// has to be read without gaps, start a stream instead: the system
++		// then keeps transferCount transfers of packetsPerTransfer packets
++		// queued and holds up to bufferSize bytes of what arrived.
++		// ReadIsochronousStream() waits up to timeout for packets and
++		// stores them one after another, each as a usb_stream_packet_header
++		// followed by its data; packets without data are left out. It
++		// returns the number of bytes stored, B_TIMED_OUT, or another error
++		// when the stream has ended. There is one stream per device.
++		status_t					StartIsochronousStream(size_t packetSize,
++										uint32 packetsPerTransfer = 32,
++										uint32 transferCount = 4,
++										size_t bufferSize = 0) const;
++		ssize_t						ReadIsochronousStream(void *data,
++										size_t length,
++										bigtime_t timeout) const;
++		status_t					StopIsochronousStream() const;
++
+ 		// These are convenience methods for getting and clearing the halt
+ 		// state of an endpoint. They use the control pipe of the device to
+ 		// send the corresponding requests.
 diff --git a/headers/os/kernel/OS.h b/headers/os/kernel/OS.h
-index fc6dfb4fb2..9eea0db5e8 100644
+index 50b44ffdbb..0be18fe823 100644
 --- a/headers/os/kernel/OS.h
 +++ b/headers/os/kernel/OS.h
-@@ -537,7 +537,21 @@ enum cpu_vendor {
- 	B_CPU_VENDOR_NEC,
+@@ -538,6 +538,20 @@ enum cpu_vendor {
  	B_CPU_VENDOR_HYGON,
  	B_CPU_VENDOR_SUN,
--	B_CPU_VENDOR_FUJITSU
-+	B_CPU_VENDOR_FUJITSU,
+ 	B_CPU_VENDOR_FUJITSU,
 +	B_CPU_VENDOR_ARM,
 +	B_CPU_VENDOR_BROADCOM,
 +	B_CPU_VENDOR_CAVIUM,
@@ -811,10 +850,10 @@ index fc6dfb4fb2..9eea0db5e8 100644
 +	B_CPU_VENDOR_MARVELL,
 +	B_CPU_VENDOR_APPLE,
 +	B_CPU_VENDOR_AMPERE,
-+	B_CPU_VENDOR_MICROSOFT
++	B_CPU_VENDOR_MICROSOFT,
+ 	B_CPU_VENDOR_SIFIVE
  };
  
- typedef struct {
 diff --git a/headers/posix/arch/arm/fenv.h b/headers/posix/arch/arm/fenv.h
 index 308976c024..2f27df73aa 100644
 --- a/headers/posix/arch/arm/fenv.h
@@ -902,24 +941,23 @@ index 308976c024..2f27df73aa 100644
  
  static __inline int
 diff --git a/headers/private/bluetooth/bluetoothserver_p.h b/headers/private/bluetooth/bluetoothserver_p.h
-index e7b974e033..57e92aa2d0 100644
+index 827ec2d639..57e92aa2d0 100644
 --- a/headers/private/bluetooth/bluetoothserver_p.h
 +++ b/headers/private/bluetooth/bluetoothserver_p.h
-@@ -38,6 +38,26 @@
- #define BT_REQ_REMOVE_DEVICE            'rdRD'
+@@ -39,9 +39,25 @@
  
  #define BT_REQ_CONN_STATE               'rdCS'
-+#define BT_MSG_GET_CONNECTED_DEVICES    'gtCD'
+ #define BT_MSG_GET_CONNECTED_DEVICES    'gtCD'
 +	// what the server knows of one device ("address"): name, class, state,
 +	// encryption, pairing, service classes, battery
 +#define BT_MSG_GET_DEVICE_INFO          'gtDI'
 +	// to the Bluetooth preferences: show the device of "address", or do
 +	// "action" with it ("audio output")
 +#define BT_MSG_SHOW_DEVICE              'shDv'
-+	// replies with "name" (string), "class_of_device" (3 bytes), "address"
-+	// (string) and "battery" (int32 percent, -1 unknown) for every connected
-+	// device
-+
+ 	// replies with "name" (string), "class_of_device" (3 bytes), "address"
+ 	// (string) and "battery" (int32 percent, -1 unknown) for every connected
+ 	// device
+ 
 +// A bond was made, changed or removed: sent with SendNotices() to whoever
 +// watches the server for it (BHandler::StartWatching()), with "adapter" and
 +// "address" (B_RAW_TYPE, bdaddr_t) and "change" (int32: 0 made, 1 changed,
@@ -929,7 +967,7 @@ index e7b974e033..57e92aa2d0 100644
 +	// "device" message for each, with "address" (B_RAW_TYPE, bdaddr_t),
 +	// "name", "class" (3 bytes) and "service class" (uint16, each)
 +#define BT_MSG_GET_BONDED_DEVICES       'btgB'
- 
++
  
  #endif
 diff --git a/headers/private/bluetooth/btCoreData.h b/headers/private/bluetooth/btCoreData.h
@@ -2255,10 +2293,10 @@ index 0000000000..ce73782399
 +
 +#endif // ARCH_CPU_TYPE_H
 diff --git a/headers/private/shared/cpu_type.h b/headers/private/shared/cpu_type.h
-index d9c11e23a4..bfdfb26b30 100644
+index 8d0cf275b1..33cd1efe63 100644
 --- a/headers/private/shared/cpu_type.h
 +++ b/headers/private/shared/cpu_type.h
-@@ -1,206 +1,43 @@
+@@ -1,207 +1,60 @@
  /*
   * Copyright 2004-2013, Axel Dörfler, axeld@pinc-software.de.
   * Copyright 2013, Paweł Dziepak, pdziepak@quarnos.org.
@@ -2317,7 +2355,7 @@ index d9c11e23a4..bfdfb26b30 100644
 +#elif defined(__aarch64__) || defined(__arm__)
 +// the MIDR layout and the part numbers are the same on 32 bit ARM
 +#include <arch/arm64/arch_cpu_type.h>
-+#else
++#elif defined(__riscv)
  
  
 -	// parse model
@@ -2366,8 +2404,18 @@ index d9c11e23a4..bfdfb26b30 100644
 -			&& ((buffer[outIndex - 1] >= '0' && buffer[outIndex - 1] <= '9')
 -				|| buffer[outIndex - 1] == '.')) {
 -			outIndex--;
--		}
--	}
++static inline const char*
++get_cpu_model_string(enum cpu_platform platform, enum cpu_vendor cpuVendor, uint32 cpuModel)
++{
++	if (platform != B_CPU_RISC_V)
++		return NULL;
++	// the model is the low 32 bits of marchid
++	if (cpuVendor == B_CPU_VENDOR_SIFIVE) {
++		switch (cpuModel) {
++			case 7:
++				return "U74";
+ 		}
+ 	}
 -
 -	// cut off trailing spaces
 -	while (outIndex > 0 && buffer[outIndex - 1] == ' ')
@@ -2375,9 +2423,11 @@ index d9c11e23a4..bfdfb26b30 100644
 -
 -	buffer[outIndex] = '\0';
 -	return buffer;
--}
--
--
++	return NULL;
+ }
++#else
+ 
+ 
 -static const char*
 -parse_amd(const char* name)
 +static inline const char*
@@ -2474,16 +2524,17 @@ index d9c11e23a4..bfdfb26b30 100644
  	// Should match vendors in OS.h
 -	static const char* vendorStrings[] = {
 -		NULL, "AMD", "Cyrix", "IDT", "Intel", "National Semiconductor", "Rise",
--		"Transmeta", "VIA", "IBM", "Motorola", "NEC", "Hygon"
+-		"Transmeta", "VIA", "IBM", "Motorola", "NEC", "Hygon", "Sun",
+-		"Fujitsu", "SiFive"
 -	};
 +	static const char* vendorStrings[] = {NULL, "AMD", "Cyrix", "IDT", "Intel",
 +		"National Semiconductor", "Rise", "Transmeta", "VIA", "IBM", "Motorola", "NEC", "Hygon",
 +		"Sun", "Fujitsu", "ARM", "Broadcom", "Cavium", "DEC", "HiSilicon", "Infineon", "Freescale",
-+		"NVIDIA", "Applied Micro", "Qualcomm", "Marvell", "Apple", "Ampere", "Microsoft"};
++		"NVIDIA", "Applied Micro", "Qualcomm", "Marvell", "Apple", "Ampere", "Microsoft", "SiFive"};
  
  	if ((size_t)cpuVendor >= sizeof(vendorStrings) / sizeof(const char*))
  		return NULL;
-@@ -208,268 +45,18 @@ get_cpu_vendor_string(enum cpu_vendor cpuVendor)
+@@ -209,279 +62,18 @@ get_cpu_vendor_string(enum cpu_vendor cpuVendor)
  }
  
  
@@ -2589,6 +2640,17 @@ index d9c11e23a4..bfdfb26b30 100644
 -
 -	(void)cpuVendor;
 -	(void)cpuModel;
+-
+-	if (platform == B_CPU_RISC_V) {
+-		// the model is the low 32 bits of marchid
+-		if (cpuVendor == B_CPU_VENDOR_SIFIVE) {
+-			switch (cpuModel) {
+-				case 7:
+-					return "U74";
+-			}
+-		}
+-		return NULL;
+-	}
 -
 -#if defined(__i386__) || defined(__x86_64__)
 -	if (platform != B_CPU_x86 && platform != B_CPU_x86_64)
@@ -2758,7 +2820,7 @@ index d9c11e23a4..bfdfb26b30 100644
  	get_cpu_topology_info(topology, &topologyNodeCount);
  
  	enum cpu_platform platform = B_CPU_UNKNOWN;
-@@ -508,27 +95,29 @@ get_cpu_type(char *vendorBuffer, size_t vendorSize, char *modelBuffer,
+@@ -520,27 +112,29 @@ get_cpu_type(char *vendorBuffer, size_t vendorSize, char *modelBuffer,
  }
  
  
@@ -2794,7 +2856,7 @@ index d9c11e23a4..bfdfb26b30 100644
  	uint x;
  
  	target = cpuFrequency / 1000000;
-@@ -543,3 +132,4 @@ get_rounded_cpu_speed(void)
+@@ -555,3 +149,4 @@ get_rounded_cpu_speed(void)
  	return target + delta;
  }
  
@@ -4233,6 +4295,29 @@ index ef6ea9b82c..05e48f599d 100644
  	memset(logAddress, 0, size);
  	if (logicalAddress)
  		*logicalAddress = logAddress;
+diff --git a/src/add-ons/kernel/bus_managers/usb/usb_dma.h b/src/add-ons/kernel/bus_managers/usb/usb_dma.h
+index 78aa6af04a..eac6273e9b 100644
+--- a/src/add-ons/kernel/bus_managers/usb/usb_dma.h
++++ b/src/add-ons/kernel/bus_managers/usb/usb_dma.h
+@@ -27,6 +27,18 @@ usb_prepare_dma_area(area_id area, void* address, size_t size)
+ 		asm volatile("dc civac, %0" : : "r"(p) : "memory");
+ 	asm volatile("dsb sy" : : : "memory");
+ 
++	physical_entry entry;
++	if (get_memory_map(address, B_PAGE_SIZE, &entry, 1) == B_OK) {
++		vm_set_area_memory_type(area, entry.address,
++			B_WRITE_COMBINING_MEMORY);
++	}
++#elif defined(__arm__)
++	// The same on 32-bit ARM, where the USB controllers of a Tegra 2 do not
++	// snoop the caches either: the descriptors the CPU wrote could stay in
++	// its cache while the controller read old ones from memory, and the CPU
++	// read back a status the controller had already changed. Making the
++	// memory non-cacheable writes the cached lines back first.
++	(void)size;
+ 	physical_entry entry;
+ 	if (get_memory_map(address, B_PAGE_SIZE, &entry, 1) == B_OK) {
+ 		vm_set_area_memory_type(area, entry.address,
 diff --git a/src/add-ons/kernel/busses/Jamfile b/src/add-ons/kernel/busses/Jamfile
 index f3d5bbe374..09af6e9383 100644
 --- a/src/add-ons/kernel/busses/Jamfile
@@ -5073,10 +5158,10 @@ index 0000000000..0a03d6c0ce
 +	;
 diff --git a/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
 new file mode 100644
-index 0000000000..1679c6f02e
+index 0000000000..0c602cbe07
 --- /dev/null
 +++ b/src/add-ons/kernel/busses/i2c/nvec/nvec.cpp
-@@ -0,0 +1,2219 @@
+@@ -0,0 +1,2255 @@
 +/*
 + * Copyright 2026, Haiku, Inc. All rights reserved.
 + * Distributed under the terms of the MIT License.
@@ -5300,7 +5385,6 @@ index 0000000000..1679c6f02e
 +	uint32				protocolErrors;
 +	uint32				interrupts;
 +	uint32				lostInterrupts;
-+	int32				timeouts;	// in a row, by tx_thread
 +	// check_lost_interrupt(): the interrupt count when it found one pending
 +	uint32				pendingInterrupts;
 +	int32				pendingChecks;
@@ -5338,6 +5422,10 @@ index 0000000000..1679c6f02e
 +	mutex				powerButtonLock;
 +	uint8				powerButtonPressed;
 +	select_sync_pool*	powerButtonSelectPool;
++	// the lid, watched by the power_daemon as an ACPI lid: protected by
++	// powerButtonLock too
++	bool				lidChanged;		// not read since it changed
++	select_sync_pool*	lidSelectPool;
 +
 +	// touchpad
 +	spinlock			mouseLock;
@@ -5382,6 +5470,7 @@ index 0000000000..1679c6f02e
 +	NVEC_MOUSE,
 +	NVEC_BATTERY,
 +	NVEC_POWER_BUTTON,
++	NVEC_LID,
 +	NVEC_DIAG,
 +};
 +
@@ -5844,15 +5933,15 @@ index 0000000000..1679c6f02e
 +		int32 tries = 0;
 +		while (!device->stopping) {
 +			set_request(device, true);
++			// The EC answers within milliseconds. When it does not, the
++			// controller is started over at once: until then the keyboard
++			// and the touchpad are dead too (seen once for 15 s, with the
++			// former 5 s wait and a restart after the second timeout).
 +			status_t status = acquire_sem_etc(device->transferSem, 1,
-+				B_RELATIVE_TIMEOUT, 5000000);
++				B_RELATIVE_TIMEOUT, 2000000);
 +
-+			if (status == B_OK)
-+				device->timeouts = 0;
-+			else if (++device->timeouts >= 2) {
++			if (status != B_OK)
 +				restart_controller(device);
-+				device->timeouts = 0;
-+			}
 +
 +			InterruptsSpinLocker locker(device->lock);
 +			if (status == B_OK || ++tries >= 3) {
@@ -5935,6 +6024,14 @@ index 0000000000..1679c6f02e
 +		return;
 +	device->lidClosed = closed;
 +	TRACE_ALWAYS("lid %s\n", closed ? "closed" : "open");
++
++	{
++		// tell the power_daemon
++		MutexLocker locker(device->powerButtonLock);
++		device->lidChanged = true;
++		if (device->lidSelectPool != NULL)
++			notify_select_event_pool(device->lidSelectPool, B_SELECT_READ);
++	}
 +
 +	if (device->pwm == NULL)
 +		return;
@@ -6641,6 +6738,8 @@ index 0000000000..1679c6f02e
 +		handle->kind = NVEC_MOUSE;
 +	else if (strstr(path, "button") != NULL)
 +		handle->kind = NVEC_POWER_BUTTON;
++	else if (strstr(path, "lid") != NULL)
++		handle->kind = NVEC_LID;
 +	else if (strcmp(path, NVEC_DIAG_PATH) == 0)
 +		handle->kind = NVEC_DIAG;
 +	else
@@ -6669,16 +6768,24 @@ index 0000000000..1679c6f02e
 +nvec_read(void* cookie, off_t position, void* buffer, size_t* _length)
 +{
 +	nvec_handle* handle = (nvec_handle*)cookie;
-+	if (handle->kind != NVEC_POWER_BUTTON || *_length < 1) {
++	if ((handle->kind != NVEC_POWER_BUTTON && handle->kind != NVEC_LID)
++		|| *_length < 1) {
 +		*_length = 0;
 +		return B_NOT_ALLOWED;
 +	}
 +
-+	// 1 if the button was pressed since the last read
++	// the button: 1 if it was pressed since the last read; the lid: 1 when
++	// it is open, 0 when it is closed, as the ACPI lid
 +	nvec_device* device = handle->device;
 +	MutexLocker locker(device->powerButtonLock);
-+	uint8 pressed = device->powerButtonPressed;
-+	device->powerButtonPressed = 0;
++	uint8 pressed;
++	if (handle->kind == NVEC_LID) {
++		pressed = device->lidClosed ? 0 : 1;
++		device->lidChanged = false;
++	} else {
++		pressed = device->powerButtonPressed;
++		device->powerButtonPressed = 0;
++	}
 +	locker.Unlock();
 +
 +	if (!IS_USER_ADDRESS(buffer)
@@ -6694,14 +6801,19 @@ index 0000000000..1679c6f02e
 +nvec_select(void* cookie, uint8 event, selectsync* sync)
 +{
 +	nvec_handle* handle = (nvec_handle*)cookie;
-+	if (handle->kind != NVEC_POWER_BUTTON || event != B_SELECT_READ)
++	if ((handle->kind != NVEC_POWER_BUTTON && handle->kind != NVEC_LID)
++		|| event != B_SELECT_READ) {
 +		return B_BAD_VALUE;
++	}
 +
 +	nvec_device* device = handle->device;
++	bool lid = handle->kind == NVEC_LID;
 +	MutexLocker locker(device->powerButtonLock);
-+	status_t status = add_select_sync_pool_entry(
-+		&device->powerButtonSelectPool, sync, event);
-+	if (status == B_OK && device->powerButtonPressed != 0)
++	status_t status = add_select_sync_pool_entry(lid
++		? &device->lidSelectPool : &device->powerButtonSelectPool, sync,
++		event);
++	if (status == B_OK
++		&& (lid ? device->lidChanged : device->powerButtonPressed != 0))
 +		notify_select_event(sync, event);
 +	return status;
 +}
@@ -6711,12 +6823,15 @@ index 0000000000..1679c6f02e
 +nvec_deselect(void* cookie, uint8 event, selectsync* sync)
 +{
 +	nvec_handle* handle = (nvec_handle*)cookie;
-+	if (handle->kind != NVEC_POWER_BUTTON || event != B_SELECT_READ)
++	if ((handle->kind != NVEC_POWER_BUTTON && handle->kind != NVEC_LID)
++		|| event != B_SELECT_READ) {
 +		return B_BAD_VALUE;
++	}
 +
 +	nvec_device* device = handle->device;
 +	MutexLocker locker(device->powerButtonLock);
-+	return remove_select_sync_pool_entry(&device->powerButtonSelectPool, sync,
++	return remove_select_sync_pool_entry(handle->kind == NVEC_LID
++		? &device->lidSelectPool : &device->powerButtonSelectPool, sync,
 +		event);
 +}
 +
@@ -7083,6 +7198,8 @@ index 0000000000..1679c6f02e
 +	device->mouseLock = B_SPINLOCK_INITIALIZER;
 +	device->batteryLock = B_SPINLOCK_INITIALIZER;
 +	mutex_init(&device->powerButtonLock, "nvec power button");
++	device->lidChanged = true;
++		// the power_daemon reads the state of the lid when it starts
 +	mutex_init(&device->diagLock, "nvec diag");
 +	device->diagSem = -1;
 +	device->diagClass = -1;
@@ -7233,6 +7350,10 @@ index 0000000000..1679c6f02e
 +	if (status == B_OK) {
 +		status = gDeviceManager->publish_device(device->node,
 +			"power/button/power_nvec", NVEC_DEVICE_MODULE_NAME);
++	}
++	if (status == B_OK) {
++		status = gDeviceManager->publish_device(device->node,
++			"power/nvec_lid/0", NVEC_DEVICE_MODULE_NAME);
 +	}
 +	if (status == B_OK) {
 +		gDeviceManager->publish_device(device->node, NVEC_DIAG_PATH,
@@ -7843,7 +7964,7 @@ index 0000000000..717e15c187
 +	NULL
 +};
 diff --git a/src/add-ons/kernel/busses/mmc/Jamfile b/src/add-ons/kernel/busses/mmc/Jamfile
-index 32ea0366a6..54134f24c4 100644
+index 2440917482..7a63d66885 100644
 --- a/src/add-ons/kernel/busses/mmc/Jamfile
 +++ b/src/add-ons/kernel/busses/mmc/Jamfile
 @@ -3,7 +3,7 @@ SubDir HAIKU_TOP src add-ons kernel busses mmc ;
@@ -7864,7 +7985,7 @@ index 32ea0366a6..54134f24c4 100644
  ;
  
 diff --git a/src/add-ons/kernel/busses/mmc/sdhci.cpp b/src/add-ons/kernel/busses/mmc/sdhci.cpp
-index 2a7aaaf21a..42b4c6b013 100644
+index 2a7aaaf21a..4ada09c794 100644
 --- a/src/add-ons/kernel/busses/mmc/sdhci.cpp
 +++ b/src/add-ons/kernel/busses/mmc/sdhci.cpp
 @@ -57,7 +57,8 @@ sdhci_generic_interrupt(void* data)
@@ -8271,7 +8392,26 @@ index 2a7aaaf21a..42b4c6b013 100644
  	// For multiple block transfers, the DMA boundary is set to the largest
  	// value. The device node properties make sure the DMA resource never gives
  	// us a buffer crossing it, but SDMA boundary interrupts are handled below
-@@ -1070,7 +1253,9 @@ SdhciBus::_TransferChunk(uint8 command, uint32 argument, uint32 blockCount,
+@@ -1018,8 +1201,16 @@ SdhciBus::_TransferChunk(uint8 command, uint32 argument, uint32 blockCount,
+ 					status = B_IO_ERROR;
+ 					break;
+ 				}
+-				if ((live & readyBit) != 0
+-					|| (fRegisters->present_state.Bits() & bufferEnableBit) != 0)
++				// With earlyBufferReadEnable (Tegra 2) the buffer read
++				// enable bit counts only once the controller stopped
++				// receiving (read transfer active, bit 9, clear): it is set
++				// while a block is still coming in, and a block read then was
++				// half old data, the rest of the block left for the next read.
++				uint32 present = fRegisters->present_state.Bits();
++				bool bufferEnabled = (present & bufferEnableBit) != 0
++					&& (isWrite || !fQuirks.earlyBufferReadEnable
++						|| (present & (1 << 9)) == 0);
++				if ((live & readyBit) != 0 || bufferEnabled)
+ 					break;
+ 				bigtime_t now = system_time();
+ 				if (now >= deadline) {
+@@ -1070,7 +1261,9 @@ SdhciBus::_TransferChunk(uint8 command, uint32 argument, uint32 blockCount,
  		// and cannot be lost. SDMA stops at each buffer boundary, writing the
  		// address register again lets it continue.
  		static int32 sFallbackLogCount = 0;
@@ -8282,7 +8422,7 @@ index 2a7aaaf21a..42b4c6b013 100644
  		while (true) {
  			uint32 live = fRegisters->interrupt_status;
  			uint32 recorded = fCommandResult;
-@@ -1087,10 +1272,17 @@ SdhciBus::_TransferChunk(uint8 command, uint32 argument, uint32 blockCount,
+@@ -1087,10 +1280,17 @@ SdhciBus::_TransferChunk(uint8 command, uint32 argument, uint32 blockCount,
  				fRegisters->system_address = fRegisters->system_address;
  				continue;
  			}
@@ -8301,7 +8441,7 @@ index 2a7aaaf21a..42b4c6b013 100644
  				uint32 again = fRegisters->interrupt_status | fCommandResult;
  				if ((again & kDataErrorBits) != 0) {
  					status = B_IO_ERROR;
-@@ -1099,9 +1291,10 @@ SdhciBus::_TransferChunk(uint8 command, uint32 argument, uint32 blockCount,
+@@ -1099,9 +1299,10 @@ SdhciBus::_TransferChunk(uint8 command, uint32 argument, uint32 blockCount,
  				if ((again & SDHCI_INT_TRANS_CMP) != 0)
  					break;
  				if (atomic_add(&sFallbackLogCount, 1) < 5) {
@@ -8315,7 +8455,7 @@ index 2a7aaaf21a..42b4c6b013 100644
  				}
  				break;
  			}
-@@ -1151,6 +1344,16 @@ SdhciBus::_TransferChunk(uint8 command, uint32 argument, uint32 blockCount,
+@@ -1151,6 +1352,16 @@ SdhciBus::_TransferChunk(uint8 command, uint32 argument, uint32 blockCount,
  	}
  
  	fRegisters->interrupt_status = kDataStatusBits;
@@ -8332,7 +8472,7 @@ index 2a7aaaf21a..42b4c6b013 100644
  	return B_OK;
  }
  
-@@ -1158,7 +1361,8 @@ SdhciBus::_TransferChunk(uint8 command, uint32 argument, uint32 blockCount,
+@@ -1158,7 +1369,8 @@ SdhciBus::_TransferChunk(uint8 command, uint32 argument, uint32 blockCount,
  status_t
  SdhciBus::_TransferBlocks(bool isWrite, uint32 argument, uint32 argumentStep,
  	uint32 blockCount, int dataMode, int stopMode, phys_addr_t physical,
@@ -8342,7 +8482,7 @@ index 2a7aaaf21a..42b4c6b013 100644
  {
  	if (stopMode == kStopModeSingle) {
  		uint8 command = isWrite ? SD_WRITE_SINGLE_BLOCK : SD_READ_SINGLE_BLOCK;
-@@ -1191,7 +1395,49 @@ SdhciBus::_TransferBlocks(bool isWrite, uint32 argument, uint32 argumentStep,
+@@ -1191,7 +1403,49 @@ SdhciBus::_TransferBlocks(bool isWrite, uint32 argument, uint32 argumentStep,
  
  	uint8 command = isWrite ? SD_WRITE_MULTIPLE_BLOCKS : SD_READ_MULTIPLE_BLOCKS;
  	return _TransferChunk(command, argument, blockCount, kBlockSize, isWrite,
@@ -8393,7 +8533,7 @@ index 2a7aaaf21a..42b4c6b013 100644
  }
  
  
-@@ -1217,13 +1463,13 @@ SdhciBus::_SelectTransferMode()
+@@ -1217,13 +1471,13 @@ SdhciBus::_SelectTransferMode()
  	TRACE_ALWAYS("controller: spec %d, SDMA %s, ADMA2 %s, high speed %s, DDR50 %s, "
  		"SDR104/HS200 %s, HS400 (Intel bit 63) %s, base clock %u MHz; card "
  		"type %d (%s addressing), RCA %u\n",
@@ -8409,7 +8549,7 @@ index 2a7aaaf21a..42b4c6b013 100644
  		step == 1 ? "sector" : "byte", fSelectedRca);
  
  	// Order of preference. CMD23 is the normal way for eMMC, auto CMD12 for SD
-@@ -1260,13 +1506,35 @@ SdhciBus::_SelectTransferMode()
+@@ -1260,13 +1514,35 @@ SdhciBus::_SelectTransferMode()
  	uint8* reference = (uint8*)malloc(testLength);
  	bool haveReference = false;
  
@@ -8450,7 +8590,7 @@ index 2a7aaaf21a..42b4c6b013 100644
  		haveReference = status == B_OK;
  		if (haveReference) {
  			TRACE("reference read OK:%s%s\n",
-@@ -1409,7 +1677,6 @@ SdhciBus::_ExecuteTuning()
+@@ -1409,7 +1685,6 @@ SdhciBus::_ExecuteTuning()
  		fRegisters->block_size.ConfigureTransfer(blockSize, 0);
  		fRegisters->block_count = 1;
  		fRegisters->argument = 0;
@@ -8458,7 +8598,7 @@ index 2a7aaaf21a..42b4c6b013 100644
  
  		// While tuning, the controller does not report "command complete":
  		// the buffer read ready status is the only sign that the device
-@@ -1417,8 +1684,9 @@ SdhciBus::_ExecuteTuning()
+@@ -1417,8 +1692,9 @@ SdhciBus::_ExecuteTuning()
  		// ExecuteCommand(), which waits for command complete (that is what
  		// made the first version of this give up after 5s, although the
  		// tuning block had arrived).
@@ -8470,7 +8610,7 @@ index 2a7aaaf21a..42b4c6b013 100644
  
  		// Wait for the tuning block (buffer read ready), 50ms at most
  		bigtime_t deadline = system_time() + 50000;
-@@ -1552,18 +1820,22 @@ SdhciBus::SetTiming(int timing, uint32 flags)
+@@ -1552,18 +1828,22 @@ SdhciBus::SetTiming(int timing, uint32 flags)
  	hostControl2 |= uhsMode;
  	if ((flags & MMC_TIMING_SIGNALING_1V8) != 0)
  		hostControl2 |= 1 << 3;
@@ -8498,7 +8638,7 @@ index 2a7aaaf21a..42b4c6b013 100644
  		/ (divider <= 1 ? 1 : (divider + 1) / 2 * 2);
  	TRACE("timing %s%s: clock about %d kHz, host control %02x, host "
  		"control 2 %04x\n", name, signaling18 ? " (1.8V signaling)" : "",
-@@ -1612,6 +1884,39 @@ SdhciBus::DoIO(uint8_t command, IOOperation* operation, bool offsetAsSectors)
+@@ -1612,6 +1892,39 @@ SdhciBus::DoIO(uint8_t command, IOOperation* operation, bool offsetAsSectors)
  	const generic_io_vec* vecs = operation->Vecs();
  	generic_size_t vecOffset = 0;
  
@@ -8538,7 +8678,7 @@ index 2a7aaaf21a..42b4c6b013 100644
  	while (length > 0) {
  		size_t toCopy = std::min((generic_size_t)length,
  			vecs->length - vecOffset);
-@@ -2032,6 +2337,8 @@ register_child_devices(void* cookie)
+@@ -2032,6 +2345,8 @@ register_child_devices(void* cookie)
  		status = register_child_devices_pci(cookie);
  	else if (strcmp(bus, "acpi") == 0)
  		status = register_child_devices_acpi(cookie);
@@ -8547,7 +8687,7 @@ index 2a7aaaf21a..42b4c6b013 100644
  	else
  		status = B_BAD_VALUE;
  
-@@ -2104,7 +2411,7 @@ supports_device(device_node* parent)
+@@ -2104,7 +2419,7 @@ supports_device(device_node* parent)
  {
  	const char* bus;
  
@@ -8556,7 +8696,7 @@ index 2a7aaaf21a..42b4c6b013 100644
  	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
  		!= B_OK) {
  		TRACE("Could not find required attribute device/bus\n");
-@@ -2115,6 +2422,8 @@ supports_device(device_node* parent)
+@@ -2115,6 +2430,8 @@ supports_device(device_node* parent)
  		return supports_device_pci(parent);
  	else if (strcmp(bus, "acpi") == 0)
  		return supports_device_acpi(parent);
@@ -8565,7 +8705,7 @@ index 2a7aaaf21a..42b4c6b013 100644
  
  	return 0.0f;
  }
-@@ -2220,7 +2529,7 @@ set_card_interrupt(void* controller, void (*handler)(void*), void* cookie)
+@@ -2220,7 +2537,7 @@ set_card_interrupt(void* controller, void (*handler)(void*), void* cookie)
  }
  
  
@@ -8574,7 +8714,7 @@ index 2a7aaaf21a..42b4c6b013 100644
  // node for each SD slot in the device.
  static driver_module_info sSDHCIDevice = {
  	{
-@@ -2242,5 +2551,6 @@ module_info* modules[] = {
+@@ -2242,5 +2559,6 @@ module_info* modules[] = {
  	(module_info* )&sSDHCIDevice,
  	(module_info* )&gSDHCIPCIDeviceModule,
  	(module_info* )&gSDHCIACPIDeviceModule,
@@ -8582,7 +8722,7 @@ index 2a7aaaf21a..42b4c6b013 100644
  	NULL
  };
 diff --git a/src/add-ons/kernel/busses/mmc/sdhci.h b/src/add-ons/kernel/busses/mmc/sdhci.h
-index 624fda1054..3d23870ae9 100644
+index 624fda1054..805c77b1cb 100644
 --- a/src/add-ons/kernel/busses/mmc/sdhci.h
 +++ b/src/add-ons/kernel/busses/mmc/sdhci.h
 @@ -19,6 +19,9 @@
@@ -8595,7 +8735,7 @@ index 624fda1054..3d23870ae9 100644
  // A single entry of the ADMA2 descriptor table, in the 32-bit address format.
  // See SD Host Controller Simplified Specification, section 1.13.
  struct adma2_descriptor {
-@@ -59,9 +62,30 @@ enum sdhci_stop_mode {
+@@ -59,9 +62,34 @@ enum sdhci_stop_mode {
  };
  
  
@@ -8616,6 +8756,10 @@ index 624fda1054..3d23870ae9 100644
 +	bool	combinedCommandWrite;
 +	// there is no high speed enable bit in the host control register
 +	bool	noHighSpeedBit;
++	// the buffer read enable bit of the present state is set while a block
++	// is still coming in: in PIO reads it only counts once the read transfer
++	// active bit is clear
++	bool	earlyBufferReadEnable;
 +};
 +
 +
@@ -8627,7 +8771,7 @@ index 624fda1054..3d23870ae9 100644
  								~SdhciBus();
  
  			void				EnableInterrupts(uint32_t mask);
-@@ -95,6 +119,11 @@ class SdhciBus {
+@@ -95,6 +123,11 @@ class SdhciBus {
  
  			bool				_IsMMC() const
  									{ return is_mmc_card_type(fCardType); }
@@ -8639,7 +8783,7 @@ index 624fda1054..3d23870ae9 100644
  			bool				_IsEmbeddedSlot();
  			bool				_IsCardPresent();
  			bool				_UsesSectorAddressing() const;
-@@ -109,16 +138,21 @@ class SdhciBus {
+@@ -109,16 +142,21 @@ class SdhciBus {
  									uint32 blockSize, bool isWrite,
  									int dataMode, int stopMode,
  									phys_addr_t physical, uint8* buffer,
@@ -8663,7 +8807,7 @@ index 624fda1054..3d23870ae9 100644
  			status_t			_VerifyTransfers(const char* what);
  			status_t			_ExecuteTuning();
  
-@@ -131,6 +165,7 @@ class SdhciBus {
+@@ -131,6 +169,7 @@ class SdhciBus {
  			status_t			fStatus;
  			thread_id			fWorkerThread;
  			card_type			fCardType;
@@ -8671,7 +8815,7 @@ index 624fda1054..3d23870ae9 100644
  
  			// Page 0 holds the ADMA2 descriptor table, the rest is a bounce
  			// buffer for the self test, for ReadData() and for SDIO
-@@ -332,6 +367,8 @@ class TimeoutControl {
+@@ -332,6 +371,8 @@ class TimeoutControl {
  
  			fBits = i - 13;
  		}
@@ -8680,7 +8824,7 @@ index 624fda1054..3d23870ae9 100644
  	private:
  		volatile  uint8_t fBits;
  } __attribute__((packed));
-@@ -486,6 +523,12 @@ class HostControl {
+@@ -486,6 +527,12 @@ class HostControl {
  				value &= ~kHighSpeed;
  		}
  
@@ -8693,7 +8837,7 @@ index 624fda1054..3d23870ae9 100644
  		// TODO add other bits for LED control, etc.
  
  		uint8 Bits() { return value; }
-@@ -505,6 +548,9 @@ class HostControl {
+@@ -505,6 +552,9 @@ class HostControl {
  
  		static const uint8_t kDataTransferWidthMask
  			= kDataTransfer4Bit | kDataTransfer8Bit;
@@ -8703,7 +8847,7 @@ index 624fda1054..3d23870ae9 100644
  	private:
  		volatile uint8_t value;
  } __attribute__((packed));
-@@ -637,15 +683,18 @@ struct sdhci_crs {
+@@ -637,15 +687,18 @@ struct sdhci_crs {
  };
  
  extern float supports_device_acpi(device_node* parent);
@@ -8722,7 +8866,7 @@ index 624fda1054..3d23870ae9 100644
  extern status_t init_bus_pci(device_node* node, void** bus_cookie);
  
  extern void uninit_bus(void* bus_cookie);
-@@ -669,6 +718,7 @@ void set_card_interrupt(void* controller, void (*handler)(void*),
+@@ -669,6 +722,7 @@ void set_card_interrupt(void* controller, void (*handler)(void*),
  	void* cookie);
  
  extern mmc_bus_interface gSDHCIACPIDeviceModule;
@@ -8746,10 +8890,10 @@ index 9ad0bbce99..00aac5a186 100644
  		// private data to identify device
 diff --git a/src/add-ons/kernel/busses/mmc/sdhci_fdt.cpp b/src/add-ons/kernel/busses/mmc/sdhci_fdt.cpp
 new file mode 100644
-index 0000000000..767ee81f0e
+index 0000000000..abd46435ec
 --- /dev/null
 +++ b/src/add-ons/kernel/busses/mmc/sdhci_fdt.cpp
-@@ -0,0 +1,450 @@
+@@ -0,0 +1,452 @@
 +/*
 + * Copyright 2026, Haiku, Inc. All rights reserved.
 + * Distributed under the terms of the MIT License.
@@ -8998,6 +9142,8 @@ index 0000000000..767ee81f0e
 +	quirks.brokenTimeoutValue = true;
 +	quirks.combinedCommandWrite = true;
 +	quirks.noHighSpeedBit = true;
++	// seen on the AC100 eMMC: PIO reads returned the block before
++	quirks.earlyBufferReadEnable = true;
 +
 +	// Card detection is done through a GPIO on Tegra, not by the controller.
 +	// TODO: use the "cd-gpios" GPIO for insertion and removal instead of
@@ -9215,7 +9361,7 @@ index ca4877d760..779a7e31ff 100644
  
  			// private data to identify device
 diff --git a/src/add-ons/kernel/busses/usb/ehci.cpp b/src/add-ons/kernel/busses/usb/ehci.cpp
-index b6a8431211..4053c9bffd 100644
+index b6a8431211..c83adb0ff9 100644
 --- a/src/add-ons/kernel/busses/usb/ehci.cpp
 +++ b/src/add-ons/kernel/busses/usb/ehci.cpp
 @@ -11,6 +11,7 @@
@@ -10231,7 +10377,7 @@ index b6a8431211..4053c9bffd 100644
  	}
  
  	// create finisher service thread
-@@ -593,7 +1405,7 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+@@ -593,12 +1405,16 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
  		"EHCI Isochronous Finish Transfers");
  	if (fFinishIsochronousTransfersSem < 0) {
  		TRACE_ERROR("failed to create isochronous finisher semaphore\n");
@@ -10240,7 +10386,17 @@ index b6a8431211..4053c9bffd 100644
  	}
  
  	// Create the isochronous finisher service thread
-@@ -607,7 +1419,13 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
++	// Above the real-time threads of media applications: this thread runs
++	// the completions that queue the next isochronous transfers (streams
++	// requeue from their callback), and while it waits the endpoint has
++	// holes of several milliseconds that a camera fills with lost data.
+ 	fFinishIsochronousThread = spawn_kernel_thread(FinishIsochronousThread,
+-		"ehci isochronous finish thread", B_URGENT_DISPLAY_PRIORITY,
++		"ehci isochronous finish thread", B_REAL_TIME_DISPLAY_PRIORITY,
+ 		(void *)this);
+ 	resume_thread(fFinishIsochronousThread);
+ 
+@@ -607,7 +1423,13 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
  		B_NORMAL_PRIORITY, (void *)this);
  	resume_thread(fCleanupThread);
  
@@ -10255,7 +10411,7 @@ index b6a8431211..4053c9bffd 100644
  	bool polling = false;
  	void *settings = load_driver_settings(B_SAFEMODE_DRIVER_SETTINGS);
  	if (settings != NULL) {
-@@ -616,49 +1434,14 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+@@ -616,49 +1438,14 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
  		unload_driver_settings(settings);
  	}
  
@@ -10286,13 +10442,13 @@ index b6a8431211..4053c9bffd 100644
 -				fPCIInfo->bus, fPCIInfo->device, fPCIInfo->function);
 -			return;
 -		}
--
++	return polling;
++}
+ 
 -		// install the interrupt handler and enable interrupts
 -		install_io_interrupt_handler(fIRQ, InterruptHandler,
 -			(void *)this, 0);
 -	}
-+	return polling;
-+}
  
 -	// ensure that interrupts are en-/disabled on the PCI device
 -	command = fPci->read_pci_config(fDevice, PCI_command, 2);
@@ -10301,7 +10457,7 @@ index b6a8431211..4053c9bffd 100644
 -			command &= ~PCI_command_int_disable;
 -		else
 -			command |= PCI_command_int_disable;
- 
+-
 -		fPci->write_pci_config(fDevice, PCI_command, 2, command);
 -	}
 +status_t
@@ -10311,7 +10467,7 @@ index b6a8431211..4053c9bffd 100644
  
  	fEnabledInterrupts = EHCI_USBINTR_HOSTSYSERR | EHCI_USBINTR_USBERRINT
  		| EHCI_USBINTR_USBINT | EHCI_USBINTR_INTONAA;
-@@ -683,7 +1466,7 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+@@ -683,7 +1470,7 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
  		&physicalAddress, frameListSize, "USB EHCI Periodic Framelist");
  	if (fPeriodicFrameListArea < 0) {
  		TRACE_ERROR("unable to allocate periodic framelist\n");
@@ -10320,7 +10476,17 @@ index b6a8431211..4053c9bffd 100644
  	}
  
  	if ((physicalAddress & 0xfff) != 0) {
-@@ -810,7 +1593,7 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+@@ -800,6 +1587,9 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+ 			fPeriodicFrameList[i]);
+ 	}
+ 
++	memset(fIsoStats, 0, sizeof(fIsoStats));
++	fIsoStatsSince = 0;
++
+ 	// Create the array that will keep bandwidth information
+ 	fFrameBandwidth = new(std::nothrow) uint16[EHCI_VFRAMELIST_ENTRIES_COUNT];
+ 	for (int32 i = 0; i < EHCI_VFRAMELIST_ENTRIES_COUNT; i++) {
+@@ -810,7 +1600,7 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
  	fAsyncQueueHead = CreateQueueHead();
  	if (!fAsyncQueueHead) {
  		TRACE_ERROR("unable to allocate stray async queue head\n");
@@ -10329,7 +10495,7 @@ index b6a8431211..4053c9bffd 100644
  	}
  
  	fAsyncQueueHead->next_phy = fAsyncQueueHead->this_phy;
-@@ -827,6 +1610,7 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
+@@ -827,6 +1617,7 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
  
  	fInitOK = true;
  	TRACE("EHCI host controller driver constructed\n");
@@ -10337,7 +10503,50 @@ index b6a8431211..4053c9bffd 100644
  }
  
  
-@@ -1565,7 +2349,17 @@ EHCI::GetPortStatus(uint8 index, usb_port_status *status)
+@@ -1321,6 +2112,28 @@ EHCI::SubmitIsochronous(Transfer *transfer)
+ 		// Chain off THIS pipe's previous transfer, not a controller-global
+ 		// anchor: see the iso_anchor comment in the header.
+ 		int32 anchor = GetIsoAnchor(pipe);
++		if (anchor != -1 && fFirstIsochronousTransfer != NULL) {
++			// The anchor must still be ahead of the controller, with the
++			// margin a new transfer gets. A transfer queued after its
++			// predecessor's last frame had passed was linked into frames
++			// the controller had left: its first descriptors stayed active,
++			// were not seen by the finisher, which only looks a few frames
++			// back, and ran a whole frame list later into the buffer of a
++			// transfer that was long finished.
++			// The anchor counts frames modulo the whole frame list, so a
++			// transfer queued up to a virtual frame list ahead (128 ms; a
++			// sound card keeps about 100 ms queued) is not mistaken for one
++			// whose frames have passed.
++			uint32 now = (ReadOpReg(EHCI_FRINDEX) / 8)
++				& (EHCI_FRAMELIST_ENTRIES_COUNT - 1);
++			uint32 ahead = ((uint32)anchor - now)
++				& (EHCI_FRAMELIST_ENTRIES_COUNT - 1);
++			uint32 margin = (fThreshold + 7) / 8 + 1;
++			if (ahead < margin || ahead >= EHCI_VFRAMELIST_ENTRIES_COUNT)
++				anchor = -1;
++			else
++				anchor &= EHCI_VFRAMELIST_ENTRIES_COUNT - 1;
++		}
+ 		if (fFirstIsochronousTransfer != NULL && anchor != -1)
+ 			currentFrame = anchor;
+ 		else {
+@@ -1332,7 +2145,12 @@ EHCI::SubmitIsochronous(Transfer *transfer)
+ 			// number in the driver makes no sense for many reason, one of which
+ 			// is that frame numbers value are host controller specific, and the
+ 			// driver does not know which host controller is running.
+-			currentFrame = ((ReadOpReg(EHCI_FRINDEX) + threshold) / 8)
++			// One frame more than the threshold: the descriptors are
++			// linked after this read, and a controller that caches a whole
++			// frame (IST) had often fetched the first one's frame already,
++			// so its first packet never ran (a fifth of a microphone's
++			// transactions on an AC100, whose transfers are four packets).
++			currentFrame = ((ReadOpReg(EHCI_FRINDEX) + threshold) / 8 + 1)
+ 				& (EHCI_FRAMELIST_ENTRIES_COUNT - 1);
+ 		}
+ 
+@@ -1565,7 +2383,17 @@ EHCI::GetPortStatus(uint8 index, usb_port_status *status)
  		status->status |= PORT_STATUS_CONNECTION;
  	if (portStatus & EHCI_PORTSC_ENABLE)
  		status->status |= PORT_STATUS_ENABLE;
@@ -10356,7 +10565,7 @@ index b6a8431211..4053c9bffd 100644
  		status->status |= PORT_STATUS_HIGH_SPEED;
  	if (portStatus & EHCI_PORTSC_OCACTIVE)
  		status->status |= PORT_STATUS_OVER_CURRENT;
-@@ -1575,7 +2369,7 @@ EHCI::GetPortStatus(uint8 index, usb_port_status *status)
+@@ -1575,7 +2403,7 @@ EHCI::GetPortStatus(uint8 index, usb_port_status *status)
  		status->status |= PORT_STATUS_POWER;
  	if (portStatus & EHCI_PORTSC_SUSPEND)
  		status->status |= PORT_STATUS_SUSPEND;
@@ -10365,7 +10574,7 @@ index b6a8431211..4053c9bffd 100644
  		status->status |= PORT_STATUS_LOW_SPEED;
  
  	// build the change
-@@ -1671,7 +2465,7 @@ EHCI::ResetPort(uint8 index)
+@@ -1671,7 +2499,7 @@ EHCI::ResetPort(uint8 index)
  	uint32 portRegister = EHCI_PORTSC + index * sizeof(uint32);
  	uint32 portStatus = ReadOpReg(portRegister) & EHCI_PORTSC_DATAMASK;
  
@@ -10374,7 +10583,7 @@ index b6a8431211..4053c9bffd 100644
  		TRACE_ALWAYS("lowspeed device connected, giving up port ownership\n");
  		// there is a lowspeed device connected.
  		// we give the ownership to a companion controller.
-@@ -1701,7 +2495,7 @@ EHCI::ResetPort(uint8 index)
+@@ -1701,7 +2529,7 @@ EHCI::ResetPort(uint8 index)
  		return B_ERROR;
  	}
  
@@ -10383,7 +10592,7 @@ index b6a8431211..4053c9bffd 100644
  		TRACE_ALWAYS("fullspeed device connected, giving up port ownership\n");
  		// the port was not enabled, this means that no high speed device is
  		// attached to this port. we give up ownership to a companion controler
-@@ -1748,6 +2542,18 @@ EHCI::ControllerReset()
+@@ -1748,6 +2576,18 @@ EHCI::ControllerReset()
  			return B_ERROR;
  	}
  
@@ -10402,7 +10611,7 @@ index b6a8431211..4053c9bffd 100644
  	return B_OK;
  }
  
-@@ -1773,6 +2579,7 @@ EHCI::Interrupt()
+@@ -1773,6 +2613,7 @@ EHCI::Interrupt()
  
  	// check if any interrupt was generated
  	uint32 status = ReadOpReg(EHCI_USBSTS) & EHCI_USBSTS_INTMASK;
@@ -10410,7 +10619,7 @@ index b6a8431211..4053c9bffd 100644
  	if ((status & fEnabledInterrupts) == 0) {
  		if (status != 0) {
  			TRACE("discarding not enabled interrupts 0x%08" B_PRIx32 "\n",
-@@ -2649,7 +3456,12 @@ EHCI::InitQueueHead(ehci_qh *queueHead, Pipe *pipe)
+@@ -2649,7 +3490,12 @@ EHCI::InitQueueHead(ehci_qh *queueHead, Pipe *pipe)
  			return B_ERROR;
  	}
  
@@ -10424,7 +10633,7 @@ index b6a8431211..4053c9bffd 100644
  		| (pipe->MaxPacketSize() << EHCI_QH_CHARS_MPL_SHIFT)
  		| (pipe->EndpointAddress() << EHCI_QH_CHARS_EPT_SHIFT)
  		| (pipe->DeviceAddress() << EHCI_QH_CHARS_DEV_SHIFT)
-@@ -2660,8 +3472,16 @@ EHCI::InitQueueHead(ehci_qh *queueHead, Pipe *pipe)
+@@ -2660,8 +3506,16 @@ EHCI::InitQueueHead(ehci_qh *queueHead, Pipe *pipe)
  		if ((pipe->Type() & USB_OBJECT_CONTROL_PIPE) != 0)
  			queueHead->endpoint_chars |= EHCI_QH_CHARS_CONTROL;
  
@@ -10443,7 +10652,97 @@ index b6a8431211..4053c9bffd 100644
  	}
  
  	return B_OK;
-@@ -3599,6 +4419,10 @@ EHCI::UnlockIsochronous()
+@@ -3401,6 +4255,15 @@ EHCI::GetIsoAnchor(Pipe *pipe)
+ void
+ EHCI::SetIsoAnchor(Pipe *pipe, int32 frame)
+ {
++	// Keep the frame modulo the whole frame list: the frame is less than a
++	// virtual frame list ahead of the controller, which tells which of its
++	// turns it belongs to.
++	uint32 now = (ReadOpReg(EHCI_FRINDEX) / 8)
++		& (EHCI_FRAMELIST_ENTRIES_COUNT - 1);
++	frame = (now + (((uint32)frame - now)
++		& (EHCI_VFRAMELIST_ENTRIES_COUNT - 1)))
++		& (EHCI_FRAMELIST_ENTRIES_COUNT - 1);
++
+ 	int free = -1;
+ 	for (int i = 0; i < kIsoAnchorCount; i++) {
+ 		if (fIsoAnchors[i].pipe == pipe) {
+@@ -3486,6 +4349,61 @@ EHCI::WriteIsochronousDescriptorChain(isochronous_transfer_data *transfer)
+ }
+ 
+ 
++/*!	Counts how the isochronous IN transactions came back and tells the
++	syslog every five seconds when some failed: a failed transaction is
++	handed on as an empty packet, and nothing above can tell why data went
++	missing.
++*/
++void
++EHCI::_CountIsochronousStatus(Pipe* pipe, uint32 status, size_t length)
++{
++	// Per endpoint: a camera streams video and sound on two of them.
++	iso_pipe_stats* stats = NULL;
++	for (int i = 0; i < kIsoStatsPipes; i++) {
++		if (fIsoStats[i].pipe == pipe || fIsoStats[i].pipe == NULL) {
++			stats = &fIsoStats[i];
++			stats->pipe = pipe;
++			break;
++		}
++	}
++	if (stats != NULL) {
++		if (status == 0) {
++			stats->ok++;
++			stats->bytes += length;
++		} else if ((status & EHCI_ITD_STATUS_ACTIVE) != 0)
++			stats->notRun++;
++		else {
++			if ((status & EHCI_ITD_STATUS_BUFFER) != 0)
++				stats->bufferError++;
++			if ((status & EHCI_ITD_STATUS_BABBLE) != 0)
++				stats->babble++;
++			if ((status & EHCI_ITD_STATUS_TERROR) != 0)
++				stats->transactionError++;
++		}
++	}
++
++	bigtime_t now = system_time();
++	if (now - fIsoStatsSince < 5000000)
++		return;
++	for (int i = 0; i < kIsoStatsPipes; i++) {
++		iso_pipe_stats& s = fIsoStats[i];
++		if (s.pipe == NULL)
++			continue;
++		if (s.notRun + s.bufferError + s.babble + s.transactionError > 0) {
++			dprintf("ehci: isochronous in, endpoint 0x%02x of device %d, 5 s: %"
++				B_PRIu32 " ok (%" B_PRIu64 " bytes), %" B_PRIu32 " not run, %"
++				B_PRIu32 " buffer errors, %" B_PRIu32 " babble, %" B_PRIu32
++				" transaction errors\n", s.pipe->EndpointAddress(),
++				s.pipe->DeviceAddress(), s.ok, s.bytes, s.notRun,
++				s.bufferError, s.babble, s.transactionError);
++		}
++	}
++	// A pipe may be gone by now: start again from nothing.
++	memset(fIsoStats, 0, sizeof(fIsoStats));
++	fIsoStatsSince = now;
++}
++
++
+ size_t
+ EHCI::ReadIsochronousDescriptorChain(isochronous_transfer_data *transfer)
+ {
+@@ -3513,7 +4431,10 @@ EHCI::ReadIsochronousDescriptorChain(isochronous_transfer_data *transfer)
+ 			&& packet < isochronousData->packet_count; j += slotStride) {
+ 
+ 			size_t bufferSize = EHCI_ITD_TLENGTH_GET(itd->token[j]);
+-			if (EHCI_ITD_STATUS_GET(itd->token[j]) != 0)
++			uint32 itdStatus = EHCI_ITD_STATUS_GET(itd->token[j]);
++			_CountIsochronousStatus(transfer->transfer->TransferPipe(), itdStatus,
++				bufferSize);
++			if (itdStatus != 0)
+ 				bufferSize = 0;
+ 			isochronousData->packet_descriptors[packet].actual_length
+ 				= bufferSize;
+@@ -3599,6 +4520,10 @@ EHCI::UnlockIsochronous()
  inline void
  EHCI::WriteOpReg(uint32 reg, uint32 value)
  {
@@ -10455,7 +10754,7 @@ index b6a8431211..4053c9bffd 100644
  }
  
 diff --git a/src/add-ons/kernel/busses/usb/ehci.h b/src/add-ons/kernel/busses/usb/ehci.h
-index 3119e78397..285a05ee48 100644
+index 3119e78397..c68b5ec467 100644
 --- a/src/add-ons/kernel/busses/usb/ehci.h
 +++ b/src/add-ons/kernel/busses/usb/ehci.h
 @@ -53,6 +53,11 @@ class EHCI : public BusManager {
@@ -10493,7 +10792,28 @@ index 3119e78397..285a05ee48 100644
  		// Controller resets
  		status_t					ControllerReset();
  		status_t					LightReset();
-@@ -280,6 +300,8 @@ inline	uint32						ReadCapReg32(uint32 reg);
+@@ -196,6 +216,20 @@ static int32						FinishIsochronousThread(void *data);
+ 		void						SetIsoAnchor(Pipe *pipe, int32 frame);
+ 		void						ClearIsoAnchor(Pipe *pipe);
+ 
++		void						_CountIsochronousStatus(Pipe* pipe,
++										uint32 status, size_t length);
++		struct iso_pipe_stats {
++			Pipe*					pipe;
++			uint32					ok;
++			uint64					bytes;
++			uint32					notRun;
++			uint32					bufferError;
++			uint32					babble;
++			uint32					transactionError;
++		};
++		static const int			kIsoStatsPipes = 4;
++		iso_pipe_stats				fIsoStats[kIsoStatsPipes];
++		bigtime_t					fIsoStatsSince;
+ 		size_t						ReadIsochronousDescriptorChain(
+ 										isochronous_transfer_data *transfer);
+ 
+@@ -280,6 +314,8 @@ inline	uint32						ReadCapReg32(uint32 reg);
  		uint32						fIRQ;
  		bool						fUseMSI;
  		spinlock					fInterruptLock;
@@ -10527,11 +10847,11 @@ index 2d9c2deb15..c366cc5e85 100644
  // Extended Capabilities
  #define EHCI_ECP_SHIFT			8			// Extended Capability Pointer
 diff --git a/src/add-ons/kernel/drivers/audio/Jamfile b/src/add-ons/kernel/drivers/audio/Jamfile
-index 3cda965baf..929611971c 100644
+index 7b81a1b531..8e4e599a0e 100644
 --- a/src/add-ons/kernel/drivers/audio/Jamfile
 +++ b/src/add-ons/kernel/drivers/audio/Jamfile
-@@ -9,6 +9,7 @@ SubInclude HAIKU_TOP src add-ons kernel drivers audio hda ;
- SubInclude HAIKU_TOP src add-ons kernel drivers audio ice1712 ;
+@@ -11,6 +11,7 @@ SubInclude HAIKU_TOP src add-ons kernel drivers audio jh7110_i2stx ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers audio jh7110_pwmdac ;
  SubInclude HAIKU_TOP src add-ons kernel drivers audio null ;
  SubInclude HAIKU_TOP src add-ons kernel drivers audio sb16 ;
 +SubInclude HAIKU_TOP src add-ons kernel drivers audio tegra ;
@@ -10554,10 +10874,10 @@ index 0000000000..38f7ccfd1d
 +	;
 diff --git a/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp b/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
 new file mode 100644
-index 0000000000..071cff51e7
+index 0000000000..72a4654b9e
 --- /dev/null
 +++ b/src/add-ons/kernel/drivers/audio/tegra/tegra_audio.cpp
-@@ -0,0 +1,2303 @@
+@@ -0,0 +1,2370 @@
 +/*
 + * Copyright 2026, Haiku, Inc. All rights reserved.
 + * Distributed under the terms of the MIT License.
@@ -10824,6 +11144,8 @@ index 0000000000..071cff51e7
 +	mutex					lock;
 +	bool					opened;
 +	bool					running;
++	bool					codecAsleep;	// powered down while stopped
++	uint16					codecPower[3];	// its power registers then
 +	bool					interruptInstalled;
 +
 +	area_id					bufferArea;
@@ -11054,9 +11376,11 @@ index 0000000000..071cff51e7
 +		codec_write(audio, ALC5632_DIGI_BOOST_CTRL,
 +			(1U << 15) | (1U << 12) | boost);
 +		codec_write(audio, ALC5632_ADC_REC_MIXER, 0x7f7f);
-+		codec_update(audio, ALC5632_PWR_MANAG_ADD1, 1U << 3, 0);
-+		codec_update(audio, ALC5632_PWR_MANAG_ADD2, 0x00c3, 0x00c0);
-+		codec_update(audio, ALC5632_PWR_MANAG_ADD3, 1U << 3, 0);
++		if (!audio->codecAsleep) {
++			codec_update(audio, ALC5632_PWR_MANAG_ADD1, 1U << 3, 0);
++			codec_update(audio, ALC5632_PWR_MANAG_ADD2, 0x00c3, 0x00c0);
++			codec_update(audio, ALC5632_PWR_MANAG_ADD3, 1U << 3, 0);
++		}
 +	} else {
 +		// MIC1 with its bias and boost (0, 20, 30 or 40 dB) into the record
 +		// mixers
@@ -11065,9 +11389,11 @@ index 0000000000..071cff51e7
 +		codec_update(audio, ALC5632_MIC_CTRL, 3U << 10, micBoost << 10);
 +		codec_write(audio, ALC5632_ADC_REC_MIXER,
 +			0x7f7f & ~((1U << 14) | (1U << 6)));
-+		codec_update(audio, ALC5632_PWR_MANAG_ADD1, 1U << 3, 1U << 3);
-+		codec_update(audio, ALC5632_PWR_MANAG_ADD2, 0x00c3, 0x00c3);
-+		codec_update(audio, ALC5632_PWR_MANAG_ADD3, 0x000a, 0x000a);
++		if (!audio->codecAsleep) {
++			codec_update(audio, ALC5632_PWR_MANAG_ADD1, 1U << 3, 1U << 3);
++			codec_update(audio, ALC5632_PWR_MANAG_ADD2, 0x00c3, 0x00c3);
++			codec_update(audio, ALC5632_PWR_MANAG_ADD3, 0x000a, 0x000a);
++		}
 +	}
 +	TRACE_ALWAYS("recording the %s microphone, gain %u, boost %u\n",
 +		digital ? "built-in" : "headset", audio->recordLevel[0], boost);
@@ -11505,11 +11831,63 @@ index 0000000000..071cff51e7
 +}
 +
 +
++/*!	While nothing plays through the internal output (the stream is stopped,
++	as when the sound goes to Bluetooth speakers), the codec's amplifiers,
++	mixers and converters are powered down: about 65 mW. Called with the
++	lock held.
++*/
++static void
++codec_sleep(tegra_audio* audio)
++{
++	if (audio->codecAsleep)
++		return;
++
++	static const uint8 kPower[] = { ALC5632_PWR_MANAG_ADD1,
++		ALC5632_PWR_MANAG_ADD2, ALC5632_PWR_MANAG_ADD3 };
++	for (uint32 i = 0; i < B_COUNT_OF(kPower); i++) {
++		if (codec_read(audio, kPower[i], &audio->codecPower[i]) != B_OK)
++			return;
++	}
++	// the outputs first, the references last
++	codec_write(audio, ALC5632_PWR_MANAG_ADD3, 0);
++	codec_write(audio, ALC5632_PWR_MANAG_ADD2, 0);
++	codec_write(audio, ALC5632_PWR_MANAG_ADD1, 0);
++	audio->codecAsleep = true;
++}
++
++
++/*!	Powers the codec up again as codec_init() does, with the depop sequence
++	of the headphone amplifiers, then as it was. Called with the lock held.
++*/
++static void
++codec_wake(tegra_audio* audio)
++{
++	if (!audio->codecAsleep)
++		return;
++
++	codec_update(audio, ALC5632_PWR_MANAG_ADD1, 1U << 6, 1U << 6);
++	codec_update(audio, ALC5632_PWR_MANAG_ADD3, 1U << 1, 1U << 1);
++	codec_update(audio, ALC5632_MISC_CTRL, 1U << 8, 1U << 8);
++	snooze(100000);
++	codec_update(audio, ALC5632_PWR_MANAG_ADD2, 1U << 13, 1U << 13);
++	codec_write(audio, ALC5632_PWR_MANAG_ADD1, audio->codecPower[0]);
++	codec_write(audio, ALC5632_PWR_MANAG_ADD2, audio->codecPower[1]);
++	codec_write(audio, ALC5632_PWR_MANAG_ADD3, audio->codecPower[2]);
++	codec_update(audio, ALC5632_MISC_CTRL, 1U << 8, 0);
++	audio->codecAsleep = false;
++
++	// the input may have been changed meanwhile
++	set_input(audio);
++}
++
++
 +static void
 +start_playback(tegra_audio* audio)
 +{
 +	if (audio->running)
 +		return;
++
++	codec_wake(audio);
 +
 +	audio->playing = 0;
 +	audio->i2sBuffersDone = 0;
@@ -11606,6 +11984,8 @@ index 0000000000..071cff51e7
 +			read32(audio->spdifChannel, DMA_STATUS));
 +	}
 +	audio->running = false;
++
++	codec_sleep(audio);
 +}
 +
 +
@@ -12780,6 +13160,13 @@ index 0000000000..071cff51e7
 +	if (selfTest)
 +		self_test(audio);
 +	start_jack_detection(audio);
++
++	{
++		// until something plays
++		MutexLocker locker(audio->lock);
++		if (!audio->running)
++			codec_sleep(audio);
++	}
 +
 +	*_cookie = audio;
 +	return B_OK;
@@ -14684,6 +15071,872 @@ index 4e4e009b01..b8af86dfc9 100644
  
  void sched_tx_processing(bt_usb_dev* bdev);
  
+diff --git a/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp b/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp
+index d6dbd7503e..4f9ee0f604 100644
+--- a/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp
++++ b/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp
+@@ -32,9 +32,17 @@
+ #define DRIVER_NAME		"usb_raw"
+ #define DEVICE_NAME		"bus/usb/raw"
+ 
++struct raw_stream;
++
++// Streams of one device at a time, one per endpoint: a camera streams video
++// and sound on two endpoints of the same device.
++#define MAX_STREAMS				4
++
+ typedef struct {
+ 	usb_device			device;
+ 	mutex				lock;
++	mutex				stream_lock;
++	raw_stream			*streams[MAX_STREAMS];
+ 	uint32				reference_count;
+ 
+ 	char				name[64];
+@@ -59,10 +67,14 @@ usb_raw_device_added(usb_device newDevice, void **cookie)
+ 	raw_device *device = (raw_device *)malloc(sizeof(raw_device));
+ 
+ 	mutex_init(&device->lock, "usb_raw device lock");
++	mutex_init(&device->stream_lock, "usb_raw stream lock");
++	for (int32 i = 0; i < MAX_STREAMS; i++)
++		device->streams[i] = NULL;
+ 
+ 	device->notify = create_sem(0, "usb_raw callback notify");
+ 	if (device->notify < B_OK) {
+ 		mutex_destroy(&device->lock);
++		mutex_destroy(&device->stream_lock);
+ 		free(device);
+ 		return B_NO_MORE_SEMS;
+ 	}
+@@ -91,24 +103,43 @@ usb_raw_device_added(usb_device newDevice, void **cookie)
+ }
+ 
+ 
++static void usb_raw_stream_stop(raw_device *device);
++static void usb_raw_stream_callback(void *cookie, status_t status, void *data,
++	size_t actualLength);
++
++
+ static status_t
+ usb_raw_device_removed(void *cookie)
+ {
+ 	TRACE((DRIVER_NAME": device_removed(0x%p)\n", cookie));
+ 	raw_device *device = (raw_device *)cookie;
+ 
++	// the stream's transfers have callbacks to be called, too
++	usb_raw_stream_stop(device);
++
+ 	// cancel all pending transfers to make sure no one keeps waiting forever
+-	// in syscalls.
++	// in syscalls. This has to happen here: once the device is freed, the
++	// stack cancels what is left by force, without calling the callbacks, and
++	// an ioctl waiting for one would never return while holding the device
++	// lock. That includes control requests on the default pipe.
++	gUSBModule->cancel_queued_requests(device->device);
++
+ 	const usb_configuration_info *configurationInfo =
+ 		gUSBModule->get_configuration(device->device);
+-	if (configurationInfo != NULL && configurationInfo->interface_count > 0) {
+-		// An interface the device described no alternate for has no active
+-		// one.
+-		struct usb_interface_info* interface
+-			= configurationInfo->interface->active;
+-		for (unsigned int i = 0;
+-				interface != NULL && i < interface->endpoint_count; i++)
+-			gUSBModule->cancel_queued_transfers(interface->endpoint[i].handle);
++	if (configurationInfo != NULL) {
++		for (size_t i = 0; i < configurationInfo->interface_count; i++) {
++			// An interface the device described no alternate for has no
++			// active one.
++			struct usb_interface_info* interface
++				= configurationInfo->interface[i].active;
++			if (interface == NULL)
++				continue;
++
++			for (size_t j = 0; j < interface->endpoint_count; j++) {
++				gUSBModule->cancel_queued_transfers(
++					interface->endpoint[j].handle);
++			}
++		}
+ 	}
+ 
+ 	mutex_lock(&gDeviceListLock);
+@@ -132,6 +163,7 @@ usb_raw_device_removed(void *cookie)
+ 	if (device->reference_count == 0) {
+ 		mutex_lock(&device->lock);
+ 		mutex_destroy(&device->lock);
++		mutex_destroy(&device->stream_lock);
+ 		delete_sem(device->notify);
+ 		free(device);
+ 	}
+@@ -235,9 +267,15 @@ usb_raw_free(void *cookie)
+ 
+ 	raw_device *device = (raw_device *)cookie;
+ 	device->reference_count--;
+-	if (device->device == 0) {
++	if (device->device != 0 && device->reference_count == 0) {
++		// nobody is left to read from it
++		usb_raw_stream_stop(device);
++	}
++	if (device->device == 0 && device->reference_count == 0) {
++		// the device is gone and this was its last user
+ 		mutex_lock(&device->lock);
+ 		mutex_destroy(&device->lock);
++		mutex_destroy(&device->stream_lock);
+ 		delete_sem(device->notify);
+ 		free(device);
+ 	}
+@@ -296,6 +334,484 @@ usb_raw_callback(void *cookie, status_t status, void *data, size_t actualLength)
+ }
+ 
+ 
++//
++//#pragma mark - isochronous streams
++//
++
++
++// A stream that nobody reads from is stopped after this long, so that a
++// program that died does not leave the device streaming for ever.
++#define STREAM_IDLE_TIMEOUT		5000000LL
++#define STREAM_MAX_ERRORS		64
++
++struct raw_stream_transfer {
++	raw_stream					*stream;
++	uint8						*data;
++	usb_iso_packet_descriptor	*descriptors;
++};
++
++struct raw_stream {
++	usb_pipe					pipe;
++	uint32						interface;
++	uint32						packet_size;
++	uint32						packets_per_transfer;
++	uint32						transfer_count;
++	raw_stream_transfer			*transfers;
++
++	mutex						lock;
++	uint8						*buffer;
++	size_t						buffer_size;
++	size_t						buffer_head;
++	size_t						buffer_used;
++	bool						gap;
++
++	bool						running;
++	int32						pending;
++	uint32						errors;
++	bigtime_t					last_read;
++
++	sem_id						data_sem;
++	int32						waiting;
++	int32						readers;
++};
++
++
++static void
++usb_raw_stream_store(raw_stream *stream, const void *_data, size_t length)
++{
++	const uint8 *data = (const uint8 *)_data;
++	size_t position = (stream->buffer_head + stream->buffer_used)
++		% stream->buffer_size;
++	size_t first = min_c(length, stream->buffer_size - position);
++	memcpy(stream->buffer + position, data, first);
++	if (first < length)
++		memcpy(stream->buffer, data + first, length - first);
++	stream->buffer_used += length;
++}
++
++
++static void
++usb_raw_stream_fetch(raw_stream *stream, void *_data, size_t offset,
++	size_t length)
++{
++	uint8 *data = (uint8 *)_data;
++	size_t position = (stream->buffer_head + offset) % stream->buffer_size;
++	size_t first = min_c(length, stream->buffer_size - position);
++	memcpy(data, stream->buffer + position, first);
++	if (first < length)
++		memcpy(data + first, stream->buffer, length - first);
++}
++
++
++static status_t
++usb_raw_stream_queue(raw_stream_transfer *transfer)
++{
++	raw_stream *stream = transfer->stream;
++	for (uint32 i = 0; i < stream->packets_per_transfer; i++) {
++		transfer->descriptors[i].request_length = stream->packet_size;
++		transfer->descriptors[i].actual_length = 0;
++		transfer->descriptors[i].status = B_OK;
++	}
++
++	return gUSBModule->queue_isochronous(stream->pipe, transfer->data,
++		stream->packet_size * stream->packets_per_transfer,
++		transfer->descriptors, stream->packets_per_transfer, NULL,
++		USB_ISO_ASAP, usb_raw_stream_callback, transfer);
++}
++
++
++static void
++usb_raw_stream_callback(void *cookie, status_t status, void *data,
++	size_t actualLength)
++{
++	raw_stream_transfer *transfer = (raw_stream_transfer *)cookie;
++	raw_stream *stream = transfer->stream;
++
++	MutexLocker locker(stream->lock);
++
++	if (status != B_CANCELED && stream->running) {
++		size_t offset = 0;
++		for (uint32 i = 0; i < stream->packets_per_transfer; i++) {
++			const usb_iso_packet_descriptor &descriptor
++				= transfer->descriptors[i];
++			size_t length = descriptor.actual_length;
++			if (length > stream->packet_size)
++				length = stream->packet_size;
++
++			if (length > 0) {
++				usb_raw_stream_packet header;
++				if (stream->buffer_used + sizeof(header) + length
++						> stream->buffer_size) {
++					stream->gap = true;
++				} else {
++					header.length = length;
++					header.flags = 0;
++					if (descriptor.status != B_OK)
++						header.flags |= B_USB_RAW_STREAM_PACKET_ERROR;
++					if (stream->gap)
++						header.flags |= B_USB_RAW_STREAM_PACKET_GAP;
++					stream->gap = false;
++					usb_raw_stream_store(stream, &header, sizeof(header));
++					usb_raw_stream_store(stream, transfer->data + offset,
++						length);
++				}
++			}
++
++			offset += stream->packet_size;
++		}
++	}
++
++	bool requeue = stream->running && status != B_CANCELED;
++	if (status == B_OK)
++		stream->errors = 0;
++	else if (++stream->errors > STREAM_MAX_ERRORS)
++		requeue = false;
++	if (system_time() - stream->last_read > STREAM_IDLE_TIMEOUT)
++		requeue = false;
++
++	if (requeue && usb_raw_stream_queue(transfer) != B_OK)
++		requeue = false;
++
++	if (!requeue) {
++		stream->pending--;
++		if (stream->pending == 0)
++			stream->running = false;
++	}
++
++	if (stream->waiting > 0 && (stream->buffer_used > 0 || !stream->running)) {
++		stream->waiting--;
++		release_sem_etc(stream->data_sem, 1, B_DO_NOT_RESCHEDULE);
++	}
++}
++
++
++static void
++usb_raw_stream_free(raw_stream *stream)
++{
++	if (stream->transfers != NULL) {
++		for (uint32 i = 0; i < stream->transfer_count; i++) {
++			free(stream->transfers[i].data);
++			free(stream->transfers[i].descriptors);
++		}
++		free(stream->transfers);
++	}
++	free(stream->buffer);
++	if (stream->data_sem >= 0)
++		delete_sem(stream->data_sem);
++	mutex_destroy(&stream->lock);
++	free(stream);
++}
++
++
++static void
++usb_raw_stream_stop_slot(raw_device *device, int32 slot)
++{
++	mutex_lock(&device->stream_lock);
++	raw_stream *stream = device->streams[slot];
++	device->streams[slot] = NULL;
++	mutex_unlock(&device->stream_lock);
++
++	if (stream == NULL)
++		return;
++
++	mutex_lock(&stream->lock);
++	stream->running = false;
++	bool pending = stream->pending > 0;
++	mutex_unlock(&stream->lock);
++
++	// this calls the callbacks of what is still queued
++	if (pending)
++		gUSBModule->cancel_queued_transfers(stream->pipe);
++
++	// Wait for the transfers and for readers to be gone. The callbacks are
++	// normally called by the cancel above; in case one is still on its way,
++	// give it time.
++	bool done = false;
++	for (int32 tries = 0; tries < 200; tries++) {
++		mutex_lock(&stream->lock);
++		done = stream->pending == 0 && stream->readers == 0;
++		while (stream->waiting > 0) {
++			stream->waiting--;
++			release_sem_etc(stream->data_sem, 1, B_DO_NOT_RESCHEDULE);
++		}
++		mutex_unlock(&stream->lock);
++		if (done)
++			break;
++		snooze(10000);
++	}
++
++	if (!done) {
++		// Something still refers to the stream: leaking it is the lesser evil.
++		dprintf(DRIVER_NAME ": stream still in use, not freeing it\n");
++		return;
++	}
++
++	usb_raw_stream_free(stream);
++}
++
++
++//!	Stops every stream of the device.
++static void
++usb_raw_stream_stop(raw_device *device)
++{
++	for (int32 i = 0; i < MAX_STREAMS; i++)
++		usb_raw_stream_stop_slot(device, i);
++}
++
++
++//!	Stops the streams of one interface, whose pipes are about to go away.
++static void
++usb_raw_stream_stop_interface(raw_device *device, uint32 interface)
++{
++	for (int32 i = 0; i < MAX_STREAMS; i++) {
++		mutex_lock(&device->stream_lock);
++		bool match = device->streams[i] != NULL
++			&& device->streams[i]->interface == interface;
++		mutex_unlock(&device->stream_lock);
++		if (match)
++			usb_raw_stream_stop_slot(device, i);
++	}
++}
++
++
++/*!	The slot of the stream of \a pipe, or with a NULL \a pipe the first
++	stream (the commands that name no endpoint). -1 when there is none. The
++	caller holds the stream lock of the device.
++*/
++static int32
++usb_raw_stream_slot(raw_device *device, usb_pipe pipe)
++{
++	for (int32 i = 0; i < MAX_STREAMS; i++) {
++		raw_stream *stream = device->streams[i];
++		if (stream != NULL && (pipe == 0 || stream->pipe == pipe))
++			return i;
++	}
++	return -1;
++}
++
++
++static status_t
++usb_raw_stream_start(raw_device *device, uint32 interface, usb_pipe pipe,
++	uint32 packetSize, uint32 packetsPerTransfer, uint32 transferCount,
++	uint32 bufferSize)
++{
++	if (packetSize == 0 || packetSize > 3 * 1024 || packetsPerTransfer == 0
++		|| packetsPerTransfer > 64 || transferCount == 0 || transferCount > 6
++		|| bufferSize > 64 * 1024 * 1024) {
++		return B_BAD_VALUE;
++	}
++
++	// room for at least what the queued transfers can deliver at once
++	size_t minimum = (size_t)(packetSize + sizeof(usb_raw_stream_packet))
++		* packetsPerTransfer * transferCount * 2;
++	if (bufferSize < minimum)
++		bufferSize = minimum;
++
++	// A new stream replaces the endpoint's old one, and needs a free slot.
++	mutex_lock(&device->stream_lock);
++	int32 old = usb_raw_stream_slot(device, pipe);
++	mutex_unlock(&device->stream_lock);
++	if (old >= 0)
++		usb_raw_stream_stop_slot(device, old);
++
++	raw_stream *stream = (raw_stream *)calloc(1, sizeof(raw_stream));
++	if (stream == NULL)
++		return B_NO_MEMORY;
++
++	mutex_init(&stream->lock, "usb_raw stream");
++	stream->pipe = pipe;
++	stream->interface = interface;
++	stream->packet_size = packetSize;
++	stream->packets_per_transfer = packetsPerTransfer;
++	stream->transfer_count = transferCount;
++	stream->buffer_size = bufferSize;
++	stream->last_read = system_time();
++	stream->data_sem = create_sem(0, "usb_raw stream data");
++	stream->buffer = (uint8 *)malloc(bufferSize);
++	stream->transfers = (raw_stream_transfer *)calloc(transferCount,
++		sizeof(raw_stream_transfer));
++
++	bool allocated = stream->data_sem >= 0 && stream->buffer != NULL
++		&& stream->transfers != NULL;
++	for (uint32 i = 0; allocated && i < transferCount; i++) {
++		raw_stream_transfer &transfer = stream->transfers[i];
++		transfer.stream = stream;
++		transfer.data = (uint8 *)malloc(packetSize * packetsPerTransfer);
++		transfer.descriptors = (usb_iso_packet_descriptor *)malloc(
++			sizeof(usb_iso_packet_descriptor) * packetsPerTransfer);
++		if (transfer.data == NULL || transfer.descriptors == NULL)
++			allocated = false;
++	}
++
++	if (!allocated) {
++		usb_raw_stream_free(stream);
++		return B_NO_MEMORY;
++	}
++
++	// Take a free slot in one go: a camera's video and sound streams may be
++	// started at the same time from two threads.
++	mutex_lock(&device->stream_lock);
++	int32 slot = -1;
++	for (int32 i = 0; i < MAX_STREAMS; i++) {
++		if (device->streams[i] == NULL) {
++			slot = i;
++			device->streams[i] = stream;
++			break;
++		}
++	}
++	mutex_unlock(&device->stream_lock);
++	if (slot < 0) {
++		usb_raw_stream_free(stream);
++		return B_BUSY;
++	}
++
++	mutex_lock(&stream->lock);
++	stream->running = true;
++	status_t status = B_OK;
++	for (uint32 i = 0; i < transferCount; i++) {
++		status = usb_raw_stream_queue(&stream->transfers[i]);
++		if (status != B_OK)
++			break;
++		stream->pending++;
++	}
++	if (stream->pending == 0)
++		stream->running = false;
++	mutex_unlock(&stream->lock);
++
++	if (status != B_OK) {
++		dprintf(DRIVER_NAME ": queueing a stream transfer failed: %s\n",
++			strerror(status));
++		usb_raw_stream_stop_slot(device, slot);
++		return status;
++	}
++
++	return B_OK;
++}
++
++
++/*!	Copies whole packets into the caller's buffer, waiting up to \a timeout
++	for the first one.
++*/
++static status_t
++usb_raw_stream_read(raw_device *device, usb_pipe pipe, void *userData,
++	size_t *_length, bigtime_t timeout)
++{
++	size_t capacity = *_length;
++	*_length = 0;
++
++	mutex_lock(&device->stream_lock);
++	int32 slot = usb_raw_stream_slot(device, pipe);
++	raw_stream *stream = slot >= 0 ? device->streams[slot] : NULL;
++	if (stream == NULL) {
++		mutex_unlock(&device->stream_lock);
++		return B_NO_INIT;
++	}
++	mutex_lock(&stream->lock);
++	if (stream->readers > 0) {
++		// one reader at a time
++		mutex_unlock(&stream->lock);
++		mutex_unlock(&device->stream_lock);
++		return B_BUSY;
++	}
++	stream->readers++;
++	mutex_unlock(&device->stream_lock);
++
++	status_t status = B_OK;
++	size_t total = 0;
++	bigtime_t end = system_time() + timeout;
++
++	while (true) {
++		stream->last_read = system_time();
++
++		while (stream->buffer_used >= sizeof(usb_raw_stream_packet)) {
++			usb_raw_stream_packet header;
++			usb_raw_stream_fetch(stream, &header, 0, sizeof(header));
++			size_t size = sizeof(header) + header.length;
++			if (total + size > capacity)
++				break;
++
++			// The data cannot be copied to userland with the lock held (the
++			// memory may have to be paged in), so take it out in pieces.
++			uint8 chunk[512];
++			size_t offset = 0;
++			bool failed = false;
++			mutex_unlock(&stream->lock);
++			while (offset < size) {
++				size_t length = min_c(sizeof(chunk), size - offset);
++				mutex_lock(&stream->lock);
++				usb_raw_stream_fetch(stream, chunk, offset, length);
++				mutex_unlock(&stream->lock);
++				if (user_memcpy((uint8 *)userData + total + offset, chunk,
++						length) != B_OK) {
++					failed = true;
++					break;
++				}
++				offset += length;
++			}
++			mutex_lock(&stream->lock);
++			if (failed) {
++				status = B_BAD_ADDRESS;
++				break;
++			}
++
++			stream->buffer_head = (stream->buffer_head + size)
++				% stream->buffer_size;
++			stream->buffer_used -= size;
++			total += size;
++		}
++
++		if (total > 0 || status != B_OK)
++			break;
++		if (stream->buffer_used >= sizeof(usb_raw_stream_packet)) {
++			// the caller's buffer cannot even hold one packet
++			status = B_BUFFER_OVERFLOW;
++			break;
++		}
++		if (!stream->running) {
++			status = B_DEV_NOT_READY;
++			break;
++		}
++
++		stream->waiting++;
++		mutex_unlock(&stream->lock);
++		status = acquire_sem_etc(stream->data_sem, 1,
++			B_ABSOLUTE_TIMEOUT | B_CAN_INTERRUPT, end);
++		mutex_lock(&stream->lock);
++		if (status != B_OK) {
++			// nobody released the semaphore for us
++			if (stream->waiting > 0)
++				stream->waiting--;
++			else
++				acquire_sem_etc(stream->data_sem, 1, B_RELATIVE_TIMEOUT, 0);
++			break;
++		}
++	}
++
++	stream->readers--;
++	mutex_unlock(&stream->lock);
++
++	*_length = total;
++	return status;
++}
++
++
++//!	The pipe of an active endpoint, 0 when there is none.
++static usb_pipe
++usb_raw_stream_pipe(raw_device *device, uint32 interface, uint32 endpoint)
++{
++	const usb_configuration_info *configurationInfo
++		= gUSBModule->get_configuration(device->device);
++	if (configurationInfo == NULL
++		|| interface >= configurationInfo->interface_count)
++		return 0;
++	const usb_interface_info *interfaceInfo
++		= configurationInfo->interface[interface].active;
++	if (interfaceInfo == NULL || endpoint >= interfaceInfo->endpoint_count)
++		return 0;
++	return interfaceInfo->endpoint[endpoint].handle;
++}
++
++
+ static status_t
+ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+ {
+@@ -687,6 +1203,9 @@ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+ 			if (configurationInfo == NULL)
+ 				break;
+ 
++			// its pipe is about to go away
++			usb_raw_stream_stop(device);
++
+ 			if (gUSBModule->set_configuration(device->device,
+ 				configurationInfo) < B_OK) {
+ 				command.config.status = B_USB_RAW_STATUS_FAILED;
+@@ -723,6 +1242,11 @@ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+ 				break;
+ 			}
+ 
++			// its pipes are about to go away; the streams of the device's
++			// other interfaces go on
++			usb_raw_stream_stop_interface(device,
++				command.alternate.interface_index);
++
+ 			if (gUSBModule->set_alt_interface(device->device,
+ 				&interfaceList->alt[command.alternate.alternate_info]) < B_OK) {
+ 				command.alternate.status = B_USB_RAW_STATUS_FAILED;
+@@ -945,6 +1469,157 @@ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+ 
+ 			break;
+ 		}
++
++		case B_USB_RAW_COMMAND_ISOCHRONOUS_STREAM_START:
++		{
++			if (length < sizeof(command.stream_start))
++				return B_BUFFER_OVERFLOW;
++
++			status = B_OK;
++			const usb_configuration_info *configurationInfo =
++				gUSBModule->get_configuration(device->device);
++			if (configurationInfo == NULL) {
++				command.stream_start.status
++					= B_USB_RAW_STATUS_INVALID_CONFIGURATION;
++				break;
++			}
++
++			if (command.stream_start.interface
++					>= configurationInfo->interface_count) {
++				command.stream_start.status
++					= B_USB_RAW_STATUS_INVALID_INTERFACE;
++				break;
++			}
++
++			const usb_interface_info *interfaceInfo = configurationInfo
++				->interface[command.stream_start.interface].active;
++			if (interfaceInfo == NULL) {
++				command.stream_start.status = B_USB_RAW_STATUS_ABORTED;
++				break;
++			}
++
++			if (command.stream_start.endpoint
++					>= interfaceInfo->endpoint_count) {
++				command.stream_start.status
++					= B_USB_RAW_STATUS_INVALID_ENDPOINT;
++				break;
++			}
++
++			const usb_endpoint_info *endpointInfo
++				= &interfaceInfo->endpoint[command.stream_start.endpoint];
++			if (!endpointInfo->handle
++				|| (endpointInfo->descr->attributes
++					& USB_ENDPOINT_ATTR_MASK) != USB_ENDPOINT_ATTR_ISOCHRONOUS
++				|| (endpointInfo->descr->endpoint_address
++					& USB_ENDPOINT_ADDR_DIR_IN) == 0) {
++				command.stream_start.status
++					= B_USB_RAW_STATUS_INVALID_ENDPOINT;
++				break;
++			}
++
++			status_t result = usb_raw_stream_start(device,
++				command.stream_start.interface,
++				endpointInfo->handle, command.stream_start.packet_size,
++				command.stream_start.packets_per_transfer,
++				command.stream_start.transfer_count,
++				command.stream_start.buffer_size);
++			if (result == B_NO_MEMORY)
++				command.stream_start.status = B_USB_RAW_STATUS_NO_MEMORY;
++			else if (result != B_OK)
++				command.stream_start.status = B_USB_RAW_STATUS_FAILED;
++			else
++				command.stream_start.status = B_USB_RAW_STATUS_SUCCESS;
++			break;
++		}
++
++		case B_USB_RAW_COMMAND_ISOCHRONOUS_STREAM_READ:
++		{
++			if (length < sizeof(command.stream_read))
++				return B_BUFFER_OVERFLOW;
++			if (!IS_USER_ADDRESS(command.stream_read.data))
++				return B_BAD_ADDRESS;
++
++			status_t result = usb_raw_stream_read(device, 0,
++				command.stream_read.data, &command.stream_read.length,
++				command.stream_read.timeout);
++			status = B_OK;
++			if (result == B_OK)
++				command.stream_read.status = B_USB_RAW_STATUS_SUCCESS;
++			else if (result == B_TIMED_OUT || result == B_WOULD_BLOCK)
++				command.stream_read.status = B_USB_RAW_STATUS_TIMEOUT;
++			else if (result == B_INTERRUPTED)
++				status = B_INTERRUPTED;
++			else if (result == B_BAD_ADDRESS)
++				return B_BAD_ADDRESS;
++			else
++				command.stream_read.status = B_USB_RAW_STATUS_ABORTED;
++			break;
++		}
++
++		case B_USB_RAW_COMMAND_ISOCHRONOUS_STREAM_STOP:
++		{
++			usb_raw_stream_stop(device);
++			command.version.status = B_USB_RAW_STATUS_SUCCESS;
++			status = B_OK;
++			break;
++		}
++
++		case B_USB_RAW_COMMAND_ISOCHRONOUS_STREAM_READ_ENDPOINT:
++		{
++			if (length < sizeof(command.stream_read_endpoint))
++				return B_BUFFER_OVERFLOW;
++			if (!IS_USER_ADDRESS(command.stream_read_endpoint.data))
++				return B_BAD_ADDRESS;
++
++			status = B_OK;
++			usb_pipe pipe = usb_raw_stream_pipe(device,
++				command.stream_read_endpoint.interface,
++				command.stream_read_endpoint.endpoint);
++			if (pipe == 0) {
++				command.stream_read_endpoint.status
++					= B_USB_RAW_STATUS_INVALID_ENDPOINT;
++				command.stream_read_endpoint.length = 0;
++				break;
++			}
++
++			status_t result = usb_raw_stream_read(device, pipe,
++				command.stream_read_endpoint.data,
++				&command.stream_read_endpoint.length,
++				command.stream_read_endpoint.timeout);
++			if (result == B_OK) {
++				command.stream_read_endpoint.status
++					= B_USB_RAW_STATUS_SUCCESS;
++			} else if (result == B_TIMED_OUT || result == B_WOULD_BLOCK) {
++				command.stream_read_endpoint.status
++					= B_USB_RAW_STATUS_TIMEOUT;
++			} else if (result == B_INTERRUPTED)
++				status = B_INTERRUPTED;
++			else if (result == B_BAD_ADDRESS)
++				return B_BAD_ADDRESS;
++			else {
++				command.stream_read_endpoint.status
++					= B_USB_RAW_STATUS_FAILED;
++			}
++			break;
++		}
++
++		case B_USB_RAW_COMMAND_ISOCHRONOUS_STREAM_STOP_ENDPOINT:
++		{
++			if (length < sizeof(command.stream_stop_endpoint))
++				return B_BUFFER_OVERFLOW;
++
++			status = B_OK;
++			usb_pipe pipe = usb_raw_stream_pipe(device,
++				command.stream_stop_endpoint.interface,
++				command.stream_stop_endpoint.endpoint);
++			mutex_lock(&device->stream_lock);
++			int32 slot = pipe != 0 ? usb_raw_stream_slot(device, pipe) : -1;
++			mutex_unlock(&device->stream_lock);
++			if (slot >= 0)
++				usb_raw_stream_stop_slot(device, slot);
++			command.stream_stop_endpoint.status = B_USB_RAW_STATUS_SUCCESS;
++			break;
++		}
+ 	}
+ 
+ 	if (user_memcpy(buffer, &command, min_c(length, sizeof(command))) != B_OK)
+diff --git a/src/add-ons/kernel/drivers/bus/usb/usb_raw.h b/src/add-ons/kernel/drivers/bus/usb/usb_raw.h
+index 9968fa825e..52fa80054b 100644
+--- a/src/add-ons/kernel/drivers/bus/usb/usb_raw.h
++++ b/src/add-ons/kernel/drivers/bus/usb/usb_raw.h
+@@ -37,10 +37,36 @@ typedef enum {
+ 	B_USB_RAW_COMMAND_CONTROL_TRANSFER = 0x4000,
+ 	B_USB_RAW_COMMAND_INTERRUPT_TRANSFER,
+ 	B_USB_RAW_COMMAND_BULK_TRANSFER,
+-	B_USB_RAW_COMMAND_ISOCHRONOUS_TRANSFER
++	B_USB_RAW_COMMAND_ISOCHRONOUS_TRANSFER,
++
++	// A continuous isochronous IN stream: the driver keeps several transfers
++	// queued at all times and collects what arrives, so that no service
++	// interval is missed between two calls from userland.
++	B_USB_RAW_COMMAND_ISOCHRONOUS_STREAM_START = 0x5000,
++	B_USB_RAW_COMMAND_ISOCHRONOUS_STREAM_READ,
++	B_USB_RAW_COMMAND_ISOCHRONOUS_STREAM_STOP,
++		// READ and STOP act on the device's first stream (and STOP on all
++		// of them); the _ENDPOINT ones name the endpoint, as a device can
++		// stream on several (a camera's video and sound)
++	B_USB_RAW_COMMAND_ISOCHRONOUS_STREAM_READ_ENDPOINT,
++	B_USB_RAW_COMMAND_ISOCHRONOUS_STREAM_STOP_ENDPOINT
+ } usb_raw_command_id;
+ 
+ 
++// What B_USB_RAW_COMMAND_ISOCHRONOUS_STREAM_READ returns is a sequence of
++// these headers, each followed by "length" bytes of packet data. Packets
++// without data are left out.
++typedef struct {
++	uint16								length;
++	uint16								flags;
++} usb_raw_stream_packet;
++
++#define B_USB_RAW_STREAM_PACKET_ERROR	0x0001
++	// the controller reported an error for this packet
++#define B_USB_RAW_STREAM_PACKET_GAP		0x0002
++	// packets before this one were lost (the reader was too slow)
++
++
+ typedef enum {
+ 	B_USB_RAW_STATUS_SUCCESS = 0,
+ 
+@@ -183,6 +209,43 @@ typedef union {
+ 		usb_iso_packet_descriptor		*packet_descriptors;
+ 		uint32							packet_count;
+ 	} isochronous;
++
++	struct {
++		status_t						status;
++		uint32							interface;
++		uint32							endpoint;
++		uint32							packet_size;
++			// bytes to ask for per service interval
++		uint32							packets_per_transfer;
++		uint32							transfer_count;
++			// number of transfers kept queued
++		uint32							buffer_size;
++			// bytes of received packets to hold for the reader
++	} stream_start;
++
++	struct {
++		status_t						status;
++		void							*data;
++		size_t							length;
++			// in: size of data, out: bytes stored
++		bigtime_t						timeout;
++	} stream_read;
++
++	struct {
++		status_t						status;
++		uint32							interface;
++		uint32							endpoint;
++		void							*data;
++		size_t							length;
++			// in: size of data, out: bytes stored
++		bigtime_t						timeout;
++	} stream_read_endpoint;
++
++	struct {
++		status_t						status;
++		uint32							interface;
++		uint32							endpoint;
++	} stream_stop_endpoint;
+ } usb_raw_command;
+ 
+ #endif // _USB_RAW_H_
 diff --git a/src/add-ons/kernel/drivers/disk/mmc/Jamfile b/src/add-ons/kernel/drivers/disk/mmc/Jamfile
 index 9849a2d76c..c3b0af5a9d 100644
 --- a/src/add-ons/kernel/drivers/disk/mmc/Jamfile
@@ -14914,10 +16167,10 @@ index f0d2f5ea9a..167a09e492 100644
  
  	device_geometry geometry;
 diff --git a/src/add-ons/kernel/drivers/graphics/Jamfile b/src/add-ons/kernel/drivers/graphics/Jamfile
-index cfaa4e4878..08fc69f278 100644
+index 6a12b9aa07..7b73d32cd8 100644
 --- a/src/add-ons/kernel/drivers/graphics/Jamfile
 +++ b/src/add-ons/kernel/drivers/graphics/Jamfile
-@@ -14,6 +14,7 @@ SubInclude HAIKU_TOP src add-ons kernel drivers graphics radeon ;
+@@ -15,6 +15,7 @@ SubInclude HAIKU_TOP src add-ons kernel drivers graphics radeon ;
  SubInclude HAIKU_TOP src add-ons kernel drivers graphics radeon_hd ;
  SubInclude HAIKU_TOP src add-ons kernel drivers graphics s3 ;
  SubInclude HAIKU_TOP src add-ons kernel drivers graphics skeleton ;
@@ -20150,12 +21403,12 @@ index 0000000000..62f853ca56
 +	return &sDeviceHooks;
 +}
 diff --git a/src/add-ons/kernel/drivers/power/Jamfile b/src/add-ons/kernel/drivers/power/Jamfile
-index 1f73634fd3..9829ad9bae 100644
+index 94511607f1..92128b9ab7 100644
 --- a/src/add-ons/kernel/drivers/power/Jamfile
 +++ b/src/add-ons/kernel/drivers/power/Jamfile
-@@ -9,3 +9,6 @@ SubInclude HAIKU_TOP src add-ons kernel drivers power amd_thermal ;
- SubInclude HAIKU_TOP src add-ons kernel drivers power axp288 ;
+@@ -10,3 +10,6 @@ SubInclude HAIKU_TOP src add-ons kernel drivers power axp288 ;
  SubInclude HAIKU_TOP src add-ons kernel drivers power intel_energy ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers power jh7110_thermal ;
  SubInclude HAIKU_TOP src add-ons kernel drivers power pch_thermal ;
 +if $(TARGET_ARCH) = arm {
 +	SubInclude HAIKU_TOP src add-ons kernel drivers power tegra_dvfs ;
@@ -20176,10 +21429,10 @@ index 0000000000..0278b0dded
 +	;
 diff --git a/src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp b/src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp
 new file mode 100644
-index 0000000000..c9304ba2d4
+index 0000000000..0eabfe51db
 --- /dev/null
 +++ b/src/add-ons/kernel/drivers/power/tegra_dvfs/tegra_dvfs.cpp
-@@ -0,0 +1,631 @@
+@@ -0,0 +1,703 @@
 +/*
 + * Copyright 2026, Andrea Bernardi
 + * SPDX-License-Identifier: MIT
@@ -20253,6 +21506,7 @@ index 0000000000..c9304ba2d4
 +#define CAR_SUPER_SCLK_DIVIDER		0x2c
 +#define CAR_CLK_SYSTEM_RATE			0x30
 +#define CAR_PLLC_BASE				0x80
++#define CAR_PLLC_OUT				0x84
 +#define CAR_PLLM_BASE				0x90
 +#define CAR_PLLP_BASE				0xa0
 +#define CAR_PLLX_BASE				0xe0
@@ -20722,6 +21976,69 @@ index 0000000000..c9304ba2d4
 +}
 +
 +
++/*!	The system clock (SCLK = HCLK, the AHB, with PCLK for the APB) runs from
++	PLLP_OUT3 at 72 MHz since the USB driver had to move it. Linux runs it
++	from PLLC_OUT1 at 240 MHz, with the APB at half of it. The AHB carries
++	the eMMC, USB and DMA traffic. A rate above 72 MHz comes from PLLC_OUT1
++	(600 MHz PLLC: 240, 200, 150 or 120 MHz) and needs the core supply at
++	1200 mV at least; 72 goes back to PLLP_OUT3. Only on request: writing
++	"sclk <MHz>" to the device.
++*/
++static status_t
++set_system_clock(uint32 mhz)
++{
++	uint32 ratio = 0;
++	if (mhz != 72) {
++		if (mhz == 0 || 1200 % mhz != 0 || 1200 / mhz < 2 || mhz > 240)
++			return B_BAD_VALUE;
++		ratio = 1200 / mhz - 2;
++		uint32 core;
++		if (read_supply(kSupplies[SUPPLY_CORE], &core) != B_OK || core < 1200)
++			return B_NOT_ALLOWED;
++	}
++
++	void* address;
++	area_id area = map_physical_memory("tegra car", TEGRA20_CAR_BASE,
++		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
++	if (area < B_OK)
++		return area;
++	volatile uint32* car = (volatile uint32*)address;
++
++	if ((car[CAR_PLLC_BASE / 4] & (1U << 30)) == 0
++		|| pll_khz(car[CAR_PLLC_BASE / 4]) != 600000) {
++		delete_area(area);
++		return B_NOT_SUPPORTED;
++	}
++
++	uint32 policy = car[CAR_SCLK_BURST_POLICY / 4];
++	// the run source, bits 7-4: 3 PLLP_OUT3, 1 PLLC_OUT1
++	uint32 source = mhz == 72 ? 3 : 1;
++	if (mhz != 72) {
++		// the APB at half of the AHB first, as it stays at 120 MHz at most
++		car[CAR_CLK_SYSTEM_RATE / 4] = (car[CAR_CLK_SYSTEM_RATE / 4] & ~3U)
++			| 1;
++		// PLLC_OUT1: divider (ratio + 2) / 2 in bits 15-8, enable, out of
++		// reset
++		uint32 out = car[CAR_PLLC_OUT / 4] & ~0xffffU;
++		car[CAR_PLLC_OUT / 4] = out | (ratio << 8) | 3;
++		spin(2);
++	}
++	car[CAR_SCLK_BURST_POLICY / 4] = (policy & ~0xf0U) | (source << 4);
++	spin(10);
++	if (mhz == 72) {
++		// back with the APB at the full 72 MHz
++		car[CAR_CLK_SYSTEM_RATE / 4] = car[CAR_CLK_SYSTEM_RATE / 4] & ~3U;
++	}
++	TRACE_ALWAYS("system clock %" B_PRIu32 " MHz (policy %#" B_PRIx32
++		", system rate %#" B_PRIx32 ", pllc out %#" B_PRIx32 ")\n", mhz,
++		car[CAR_SCLK_BURST_POLICY / 4], car[CAR_CLK_SYSTEM_RATE / 4],
++		car[CAR_PLLC_OUT / 4]);
++	delete_area(area);
++	return B_OK;
++}
++
++
 +static status_t
 +tegra_dvfs_write(void* cookie, off_t position, const void* buffer,
 +	size_t* _length)
@@ -20738,6 +22055,14 @@ index 0000000000..c9304ba2d4
 +		return B_BAD_VALUE;
 +	}
 +	*value++ = '\0';
++
++	if (strcmp(command, "sclk") == 0) {
++		MutexLocker locker(sLock);
++		status_t status = set_system_clock(strtoul(value, NULL, 10));
++		if (status != B_OK)
++			*_length = 0;
++		return status;
++	}
 +
 +	if (strcmp(command, "cclk") == 0) {
 +		status_t status = set_cpu_clock(strtoul(value, NULL, 10));
@@ -21936,15 +23261,16 @@ index eee0c153e5..4e5d9937be 100644
  
  
 diff --git a/src/add-ons/kernel/power/cpufreq/Jamfile b/src/add-ons/kernel/power/cpufreq/Jamfile
-index 81306a7e6b..f6bfdffdb4 100644
+index 71d14e9319..47d056d1d7 100644
 --- a/src/add-ons/kernel/power/cpufreq/Jamfile
 +++ b/src/add-ons/kernel/power/cpufreq/Jamfile
-@@ -2,4 +2,5 @@ SubDir HAIKU_TOP src add-ons kernel power cpufreq ;
+@@ -2,5 +2,6 @@ SubDir HAIKU_TOP src add-ons kernel power cpufreq ;
  
  SubInclude HAIKU_TOP src add-ons kernel power cpufreq amd_pstates ;
  SubInclude HAIKU_TOP src add-ons kernel power cpufreq intel_pstates ;
 +SubInclude HAIKU_TOP src add-ons kernel power cpufreq tegra20_cpufreq ;
  
+ SubInclude HAIKU_TOP src add-ons kernel power cpufreq jh7110 ;
 diff --git a/src/add-ons/kernel/power/cpufreq/tegra20_cpufreq/Jamfile b/src/add-ons/kernel/power/cpufreq/tegra20_cpufreq/Jamfile
 new file mode 100644
 index 0000000000..75b4e52ee1
@@ -25780,10 +27106,10 @@ index 0000000000..bcb10a4f87
 +#endif	// AVRCP_TARGET_H
 diff --git a/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioAddOn.cpp b/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioAddOn.cpp
 new file mode 100644
-index 0000000000..7cce6e5d1d
+index 0000000000..e8a99ee43a
 --- /dev/null
 +++ b/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioAddOn.cpp
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,348 @@
 +/*
 + * Copyright 2026, Andrea Bernardi
 + * SPDX-License-Identifier: MIT
@@ -25806,6 +27132,7 @@ index 0000000000..7cce6e5d1d
 +
 +#include <bluetooth/bdaddrUtils.h>
 +#include <bluetoothserver_p.h>
++#include <DormantNodeManager.h>
 +
 +#include "BluetoothAudioNode.h"
 +
@@ -25884,7 +27211,8 @@ index 0000000000..7cce6e5d1d
 +	:
 +	BMediaAddOn(image),
 +	fLock("bluetooth audio devices"),
-+	fWatcher(NULL)
++	fWatcher(NULL),
++	fStaysLoaded(false)
 +{
 +	_LoadDevices();
 +	syslog(LOG_INFO, "bluetooth_audio: %" B_PRId32 " outputs\n",
@@ -25918,6 +27246,8 @@ index 0000000000..7cce6e5d1d
 +int32
 +BluetoothAudioAddOn::CountFlavors()
 +{
++	_StayLoaded();
++
 +	BAutolock locker(fLock);
 +	return fDevices.CountItems();
 +}
@@ -25980,6 +27310,27 @@ index 0000000000..7cce6e5d1d
 +	index (it no longer calls the speakers: they have no key).
 +	Returns how many were added.
 +*/
++/*!	The media add-on server unloads an add-on that has no node, which for
++	us is whenever no speakers were paired when the media services started.
++	The add-on would then take its bond watcher along, and speakers paired
++	later would not become outputs until the media services restart. So it
++	keeps itself loaded: one more use of the add-on, which is never given
++	back. The first call to CountFlavors() comes after the add-on server
++	gave the add-on its ID.
++*/
++void
++BluetoothAudioAddOn::_StayLoaded()
++{
++	if (fStaysLoaded || AddonID() <= 0)
++		return;
++	BMediaAddOn* addOn = gDormantNodeManager->GetAddOn(AddonID());
++	if (addOn == this)
++		fStaysLoaded = true;
++	else if (addOn != NULL)
++		gDormantNodeManager->PutAddOn(AddonID());
++}
++
++
 +int32
 +BluetoothAudioAddOn::_LoadDevices()
 +{
@@ -26109,10 +27460,10 @@ index 0000000000..7cce6e5d1d
 +}
 diff --git a/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioAddOn.h b/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioAddOn.h
 new file mode 100644
-index 0000000000..beb3109c9b
+index 0000000000..ee2b3deff5
 --- /dev/null
 +++ b/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioAddOn.h
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,62 @@
 +/*
 + * Copyright 2026, Andrea Bernardi
 + * SPDX-License-Identifier: MIT
@@ -26163,22 +27514,24 @@ index 0000000000..beb3109c9b
 +
 +private:
 +			int32				_LoadDevices();
++			void				_StayLoaded();
 +
 +			BLocker				fLock;
 +			BObjectList<BluetoothAudioDevice, true> fDevices;
 +				// only added to while running: a node knows its device by
 +				// its index
 +			BondWatcher*		fWatcher;
++			bool				fStaysLoaded;
 +};
 +
 +
 +#endif	// BLUETOOTH_AUDIO_ADD_ON_H
 diff --git a/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp b/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp
 new file mode 100644
-index 0000000000..aa3aa2175a
+index 0000000000..d77bef18b1
 --- /dev/null
 +++ b/src/add-ons/media/media-add-ons/bluetooth_audio/BluetoothAudioNode.cpp
-@@ -0,0 +1,795 @@
+@@ -0,0 +1,806 @@
 +/*
 + * Copyright 2026, Andrea Bernardi
 + * SPDX-License-Identifier: MIT
@@ -26234,6 +27587,9 @@ index 0000000000..aa3aa2175a
 +// take it back when they can be reached again: counted from the end of a
 +// call, which pages for a while, so that the radio is not paging all along
 +static const bigtime_t kRecallInterval = 30000000;
++// speakers that keep refusing to be called (a Google Home only connects by
++// itself) are called less and less often, down to this
++static const bigtime_t kMaxRecallInterval = 600000000;
 +// how late speakers play, when they do not tell (A2DP delay reporting)
 +static const bigtime_t kDefaultOutputDelay = 150000;
 +// below this, a sample is silence (16-bit)
@@ -26781,11 +28137,14 @@ index 0000000000..aa3aa2175a
 +	const int32 backlog = (int32)(kFrameRate * kStartBacklog / 1000000);
 +	int16 chunk[kChunkFrames * kChannels];
 +	bigtime_t calledAt = 0;
++	bigtime_t recallInterval = kRecallInterval;
 +	bool remotePaused = false;
 +	int32 lastRemoteVolume = -1;
 +
 +	while (!fQuitting) {
 +		bigtime_t now = system_time();
++		if (fAvailable)
++			recallInterval = kRecallInterval;
 +
 +		if (fInput.source == media_source::null && !fAvailable) {
 +			// out of reach before, the sound plays elsewhere meanwhile:
@@ -26795,14 +28154,15 @@ index 0000000000..aa3aa2175a
 +			if (!remoteListening)
 +				remoteListening = remote.Listen() == B_OK;
 +			bdaddr_t from;
-+			if (now - calledAt > kRecallInterval) {
++			if (now - calledAt > recallInterval) {
 +				TRACE("%s: calling the speakers back\n", fName.String());
 +				status_t status = source.Connect(fAddress);
 +				calledAt = system_time();
 +				if (status == B_OK) {
 +					remotePaused = false;
 +					_SetAvailable(true);
-+				}
++				} else
++					recallInterval = min_c(recallInterval * 2, kMaxRecallInterval);
 +			} else if (source.WaitForSink(500000, &from) == B_OK) {
 +				TRACE("%s: the speakers connected\n", fName.String());
 +				remotePaused = false;
@@ -26875,7 +28235,7 @@ index 0000000000..aa3aa2175a
 +			// sound waits: the speakers are called, now and then; while
 +			// the sound plays elsewhere, they are called all the same
 +			if ((sound && now - calledAt > kCallInterval)
-+				|| (!fAvailable && now - calledAt > kRecallInterval)) {
++				|| (!fAvailable && now - calledAt > recallInterval)) {
 +				TRACE("%s: %s, calling the speakers\n", fName.String(),
 +					sound ? "sound to play" : "to take the sound back");
 +				status_t status = source.Connect(fAddress);
@@ -26890,6 +28250,10 @@ index 0000000000..aa3aa2175a
 +				// out of reach: the sound does not wait for them
 +				if (sound)
 +					_SetAvailable(false);
++				else {
++					recallInterval = min_c(recallInterval * 2,
++						kMaxRecallInterval);
++				}
 +			}
 +			// or they connect by themselves
 +			bdaddr_t from;
@@ -28414,10 +29778,10 @@ index 0000000000..27a07870d6
 +	: be media [ TargetLibsupc++ ]
 +;
 diff --git a/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp b/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp
-index b34a5f87f7..9d192433d4 100644
+index e7965510c7..5e63d9d53f 100644
 --- a/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp
 +++ b/src/add-ons/media/media-add-ons/multi_audio/MultiAudioNode.cpp
-@@ -1832,8 +1832,11 @@ MultiAudioNode::MakeParameterWeb()
+@@ -1844,8 +1844,11 @@ MultiAudioNode::MakeParameterWeb()
  			B_TRANSLATE("Input & Output"), PARAMETER_ID_INPUT_FREQUENCY,
  			description.input_rates);
  	} else {
@@ -28469,155 +29833,6 @@ index 61af5baf02..5e9061ce50 100644
  
  CPUCapabilities::~CPUCapabilities()
  {
-diff --git a/src/apps/activitymonitor/SystemInfoHandler.cpp b/src/apps/activitymonitor/SystemInfoHandler.cpp
-index 8b3f18e1f6..3b602c9600 100644
---- a/src/apps/activitymonitor/SystemInfoHandler.cpp
-+++ b/src/apps/activitymonitor/SystemInfoHandler.cpp
-@@ -6,6 +6,9 @@
- 
- #include "SystemInfoHandler.h"
- 
-+#include <dirent.h>
-+#include <fcntl.h>
-+#include <math.h>
- #include <stdio.h>
- #include <stdlib.h>
- #include <string.h>
-@@ -35,8 +38,8 @@ SystemInfoHandler::SystemInfoHandler()
- 	fMediaConnections = 0;
- 	fMediaBuffers = 0;
- 
--	fThermalFD = open("/dev/power/acpi_thermal/0", O_RDONLY);
--	if (fThermalFD <= 0) {
-+	fThermalFD = _OpenThermalSensor();
-+	if (fThermalFD < 0) {
- 		fThermalZoneName = B_TRANSLATE("No thermal sensor");
- 		return;
- 	}
-@@ -51,7 +54,82 @@ SystemInfoHandler::SystemInfoHandler()
- 
- SystemInfoHandler::~SystemInfoHandler()
- {
--	close(fThermalFD);
-+	if (fThermalFD >= 0)
-+		close(fThermalFD);
-+}
-+
-+
-+/*!	Opens the first device that reports a "Current Temperature": ACPI thermal
-+	zones first, then the other thermal drivers in /dev/power, then the sensors
-+	in /dev/sensor (as on boards without ACPI).
-+*/
-+/*static*/ int
-+SystemInfoHandler::_OpenThermalSensor()
-+{
-+	int fd = open("/dev/power/acpi_thermal/0", O_RDONLY);
-+	if (fd >= 0)
-+		return fd;
-+
-+	DIR* dir = opendir("/dev/power");
-+	if (dir != NULL) {
-+		dirent* entry;
-+		while ((entry = readdir(dir)) != NULL) {
-+			size_t length = strlen(entry->d_name);
-+			if (length <= 8 || strcmp(entry->d_name + length - 8, "_thermal") != 0)
-+				continue;
-+			BString path("/dev/power/");
-+			path << entry->d_name << "/0";
-+			fd = open(path.String(), O_RDONLY);
-+			if (fd >= 0 && !isnan(_ReadTemperature(fd)))
-+				break;
-+			if (fd >= 0)
-+				close(fd);
-+			fd = -1;
-+		}
-+		closedir(dir);
-+	}
-+	if (fd >= 0)
-+		return fd;
-+
-+	dir = opendir("/dev/sensor");
-+	if (dir != NULL) {
-+		dirent* entry;
-+		while ((entry = readdir(dir)) != NULL) {
-+			if (entry->d_name[0] == '.')
-+				continue;
-+			BString path("/dev/sensor/");
-+			path << entry->d_name;
-+			fd = open(path.String(), O_RDONLY);
-+			if (fd >= 0 && !isnan(_ReadTemperature(fd)))
-+				break;
-+			if (fd >= 0)
-+				close(fd);
-+			fd = -1;
-+		}
-+		closedir(dir);
-+	}
-+	return fd;
-+}
-+
-+
-+/*static*/ float
-+SystemInfoHandler::_ReadTemperature(int fd)
-+{
-+	float temperature = std::nanf("");
-+	char buffer[512];
-+	// TODO it would be nice to use ioctl to get direct access to the temperature instead,
-+	// but that provides raw values from the sensors without the "kelvin offset" fixup, making
-+	// it unusable.
-+	// The ioctl reply also uses a different format for each of the *_thermal drivers.
-+	ssize_t length = pread(fd, buffer, sizeof(buffer) - 1, 0);
-+	if (length <= 0)
-+		return temperature;
-+	buffer[length] = '\0';
-+
-+	const char* currTemp = strstr(buffer, "Current Temperature: ");
-+	if (currTemp != NULL)
-+		sscanf(currTemp + strlen("Current Temperature: "), "%f", &temperature);
-+	return temperature;
- }
- 
- 
-@@ -221,23 +299,9 @@ SystemInfoHandler::MediaBuffers() const
- float
- SystemInfoHandler::Temperature() const
- {
--	float temperature = std::nanf("");
--	if (fThermalFD >= 0) {
--		char buffer[256];
--		// TODO it would be nice to use ioctl to get direct access to the temperature instead,
--		// but that provides raw values from the sensors without the "kelvin offset" fixup, making
--		// it unusable.
--		// The ioctl reply also uses a different format for each of the *_thermal drivers, so that
--		// would be a problem if ActivityMonitor is extended to collect info from these as well.
--		pread(fThermalFD, buffer, sizeof(buffer), 0);
--
--		char* currTemp = strstr(buffer, "Current Temperature: ");
--		if (currTemp != NULL)
--			sscanf(currTemp + strlen("Current Temperature: "), "%f", &temperature);
--
--	}
--
--	return temperature;
-+	if (fThermalFD < 0)
-+		return std::nanf("");
-+	return _ReadTemperature(fThermalFD);
- }
- 
- 
-diff --git a/src/apps/activitymonitor/SystemInfoHandler.h b/src/apps/activitymonitor/SystemInfoHandler.h
-index 4c2218742b..09fe167de5 100644
---- a/src/apps/activitymonitor/SystemInfoHandler.h
-+++ b/src/apps/activitymonitor/SystemInfoHandler.h
-@@ -34,6 +34,8 @@ public:
- 
- private:
- 			void		_UpdateClipboardData();
-+	static	int			_OpenThermalSensor();
-+	static	float		_ReadTemperature(int fd);
- 
- 	uint32				fRunningApps;
- 	uint32				fClipboardSize;
 diff --git a/src/apps/cortex/Persistence/Wrappers/MediaFormatIO.cpp b/src/apps/cortex/Persistence/Wrappers/MediaFormatIO.cpp
 index 381231ed87..4c4e703074 100644
 --- a/src/apps/cortex/Persistence/Wrappers/MediaFormatIO.cpp
@@ -28649,48 +29864,11 @@ index 381231ed87..4c4e703074 100644
  	if(f.forward_history != w.forward_history)
  		context.writeAttr(gKey_forward_history, (int32)f.forward_history);
  	if(f.backward_history != w.backward_history)
-diff --git a/src/kits/bluetooth/CommandManager.cpp b/src/kits/bluetooth/CommandManager.cpp
-index a34819b703..0d4382f076 100644
---- a/src/kits/bluetooth/CommandManager.cpp
-+++ b/src/kits/bluetooth/CommandManager.cpp
-@@ -20,7 +20,8 @@ buildCommand(uint8 ogf, uint8 ocf, void** param, size_t psize,
- 	CALLED();
- 	struct hci_command_header* header;
- 
--	header = (struct hci_command_header*) malloc(psize
-+	// zeroed, as the reserved fields of the parameters must be 0
-+	header = (struct hci_command_header*) calloc(1, psize
- 		+ sizeof(struct hci_command_header));
- 	*outsize = psize + sizeof(struct hci_command_header);
- 
-@@ -147,7 +148,8 @@ buildRemoteNameRequest(bdaddr_t bdaddr, uint8 pscan_rep_mode,
- 	if (command != NULL) {
- 		param->bdaddr = bdaddr;
- 		param->pscan_rep_mode = pscan_rep_mode;
--		param->clock_offset = clock_offset;
-+		// as given: bit 15 is set only when the offset is known
-+		param->clock_offset = B_HOST_TO_LENDIAN_INT16(clock_offset);
- 	}
- 
- 	return command;
 diff --git a/src/kits/bluetooth/DiscoveryListener.cpp b/src/kits/bluetooth/DiscoveryListener.cpp
-index 14a8843f16..6676bc2659 100644
+index fd090f75e9..6676bc2659 100644
 --- a/src/kits/bluetooth/DiscoveryListener.cpp
 +++ b/src/kits/bluetooth/DiscoveryListener.cpp
-@@ -103,7 +103,11 @@ DiscoveryListener::MessageReceived(BMessage* message)
- 
- 				// if not present, the default value of these fields will be used
- 				message->FindUInt8("scan_mode", i, &scanMode);
--				message->FindUInt16("clock_offset", i, &clockOffset);
-+				// The inquiry gives bits 16-2 of the offset in bits 14-0. Bit
-+				// 15 tells the controller that the offset is valid, which a
-+				// device known only by its address does not have.
-+				if (message->FindUInt16("clock_offset", i, &clockOffset) == B_OK)
-+					clockOffset = (clockOffset & 0x7fff) | 0x8000;
- 				message->FindInt8("rssi", i, &rssi);
- 				message->FindBool("friendly_name_is_complete", &friendlyNameIsComplete);
- 
-@@ -150,7 +154,10 @@ DiscoveryListener::MessageReceived(BMessage* message)
+@@ -154,7 +154,10 @@ DiscoveryListener::MessageReceived(BMessage* message)
  
  		case BT_MSG_INQUIRY_STARTED:
  			if (message->FindUInt8("status", &status) == B_OK) {
@@ -28702,63 +29880,8 @@ index 14a8843f16..6676bc2659 100644
  				InquiryStarted(status);
  			}
  			break;
-diff --git a/src/kits/bluetooth/LocalDevice.cpp b/src/kits/bluetooth/LocalDevice.cpp
-index ea6b39e85e..7e965e5d5a 100644
---- a/src/kits/bluetooth/LocalDevice.cpp
-+++ b/src/kits/bluetooth/LocalDevice.cpp
-@@ -550,6 +550,42 @@ LocalDevice::_ReadTimeouts()
- }
- 
- 
-+struct eventMask_t {
-+	uint64 param;
-+} __attribute__ ((packed));
-+
-+
-+struct simplePairingMode_t {
-+	uint8 param;
-+} __attribute__ ((packed));
-+
-+
-+status_t
-+LocalDevice::_EnableSimplePairing()
-+{
-+	// Secure Simple Pairing came with Bluetooth 2.1 (LMP version 4). Without
-+	// it the controller falls back to PIN codes, which devices without a
-+	// keypad, like gamepads, refuse.
-+	uint32 lmpVersion = 0;
-+	if (GetProperty("lmp_version", &lmpVersion) != B_OK || lmpVersion < 4)
-+		return B_NOT_SUPPORTED;
-+
-+	// The default event mask of a controller leaves out the events of the
-+	// simple pairing: add them (IO capability request and response, user
-+	// confirmation, passkey request, remote OOB data, pairing complete,
-+	// extended inquiry result, passkey notification, keypress notification,
-+	// remote host features) to the default of the version 2.0.
-+	SingleParameterCommandRequest<struct eventMask_t, uint64>
-+		(OGF_CONTROL_BASEBAND, OCF_SET_EVENT_MASK,
-+		B_HOST_TO_LENDIAN_INT64(0x1c7f1fffffffffffULL), NULL, fHid,
-+		fMessenger);
-+
-+	return SingleParameterCommandRequest<struct simplePairingMode_t, uint8>
-+		(OGF_CONTROL_BASEBAND, OCF_WRITE_SIMPLE_PAIRING_MODE, 1, NULL,
-+		fHid, fMessenger);
-+}
-+
-+
- status_t
- LocalDevice::Reset()
- {
-@@ -599,6 +635,7 @@ LocalDevice::LocalDevice(hci_id hid)
- 	_ReadLocalVersion();
- 	_ReadLocalSupportedCommands();
- 	_ReadTimeouts();
-+	_EnableSimplePairing();
- 	_ReadLinkKeys();
- 
- 	// Uncomment this if you want your device to have a nicer default name
 diff --git a/src/kits/bluetooth/RemoteDevice.cpp b/src/kits/bluetooth/RemoteDevice.cpp
-index f1e4757bb5..ddada4186f 100644
+index 7bd280e932..ddada4186f 100644
 --- a/src/kits/bluetooth/RemoteDevice.cpp
 +++ b/src/kits/bluetooth/RemoteDevice.cpp
 @@ -35,7 +35,9 @@ bool
@@ -28780,189 +29903,28 @@ index f1e4757bb5..ddada4186f 100644
  
  		rdList.AddItem(rd);
  	}
-@@ -87,8 +90,15 @@ RemoteDevice::ParseRemoteDevice(LocalDevice* localDevice, BMessage* message)
- 	message->FindData("class_of_device", B_ANY_TYPE, (const void**)&class_of_device, &size);
- 	RemoteDevice* rd = new RemoteDevice(*bdaddr, class_of_device);
- 
--	// TODO: we should request the remote device's name and other parameters.
--	rd->fDiscovererLocalDevice = localDevice;
-+	// the name the server knows, if any
-+	BString name;
-+	if (message->FindString("name", &name) == B_OK && !name.IsEmpty()) {
-+		rd->fFriendlyName = name;
-+		rd->fFriendlyNameIsComplete = true;
-+	}
-+
-+	rd->fDiscovererLocalDevice = localDevice != NULL
-+		? localDevice : LocalDevice::GetLocalDevice();
- 
- 	return rd;
- }
-@@ -104,10 +114,14 @@ RemoteDevice::GetFriendlyName(bool alwaysAsk)
- 	}
- 
- 	if (fDiscovererLocalDevice == NULL)
--		return BString(B_TRANSLATE("#NoOwnerError#Not Valid name"));
-+		fDiscovererLocalDevice = LocalDevice::GetLocalDevice();
- 
--	if (fMessenger == NULL)
--		return BString(B_TRANSLATE("#ServerNotReady#Not Valid name"));
-+	// without a name, the address is better than an error
-+	BString fallback = fFriendlyName.IsEmpty()
-+		? bdaddrUtils::ToString(fBdaddr) : fFriendlyName;
-+
-+	if (fDiscovererLocalDevice == NULL || fMessenger == NULL)
-+		return fallback;
- 
- 	void* remoteNameCommand = NULL;
- 	size_t size;
-@@ -130,8 +144,11 @@ RemoteDevice::GetFriendlyName(bool alwaysAsk)
- 
- 	request.AddInt16("eventExpected",  HCI_EVENT_REMOTE_NAME_REQUEST_COMPLETE);
- 
--
--	if (fMessenger->SendMessage(&request, &reply) == B_OK) {
-+	// The answer waits for the controller, which may not give it when the
-+	// link drops in the middle: the Bluetooth preferences, asking from their
-+	// window, hung for good. A name request takes seconds at most.
-+	if (fMessenger->SendMessage(&request, &reply, B_INFINITE_TIMEOUT,
-+			20000000) == B_OK) {
- 		BString name;
- 		uint8 status;
- 
-@@ -147,14 +164,11 @@ RemoteDevice::GetFriendlyName(bool alwaysAsk)
- 
- 		} else {
- 			// seems we got a negative event
--			if (!fFriendlyName.IsEmpty())
--				return fFriendlyName;
--
--			return BString(B_TRANSLATE("#CommandFailed#Not Valid name"));
-+			return fallback;
- 		}
- 	}
- 
--	return BString(B_TRANSLATE("#NotCompletedRequest#Not Valid name"));
-+	return fallback;
- }
- 
- 
-@@ -185,7 +199,8 @@ RemoteDevice::GetBluetoothAddress()
- uint16
- RemoteDevice::GetClockOffset()
- {
--	return fClockOffset;
-+	// without the bit that tells whether it is known
-+	return fClockOffset & 0x7fff;
- }
- 
- 
-@@ -208,6 +223,12 @@ status_t
- RemoteDevice::Connect()
- {
- 	CALLED();
-+	// devices loaded from the paired list have no owner yet
-+	if (fDiscovererLocalDevice == NULL)
-+		fDiscovererLocalDevice = LocalDevice::GetLocalDevice();
-+	if (fDiscovererLocalDevice == NULL || fMessenger == NULL)
-+		return B_ERROR;
-+
- 	BMessage request(BT_REQ_CREATE_CONN);
- 
- 	request.AddInt32("hci_id", fDiscovererLocalDevice->ID());
-@@ -218,17 +239,17 @@ RemoteDevice::Connect()
- 	request.AddString("name", GetFriendlyName());
- 	request.AddUInt32("record", fDeviceClass.Record());
- 
--	uint16 packetType;
--	fDiscovererLocalDevice->GetProperty("packet_type", (uint32*)&packetType);
--	request.AddUInt16("packet type", packetType);
-+	uint32 packetType = 0;
-+	fDiscovererLocalDevice->GetProperty("packet_type", &packetType);
-+	request.AddUInt16("packet type", (uint16)packetType);
- 
- 	request.AddUInt8("pscan_rep_mode", fPageRepetitionMode);
- 	request.AddUInt8("pscan_mode", fScanMode);
- 	request.AddUInt16("clock_offset", fClockOffset);
- 
--	uint8 roleSwitch;
--	fDiscovererLocalDevice->GetProperty("role_switch_capable", (uint32*)&roleSwitch);
--	request.AddUInt8("role_switch", roleSwitch);
-+	uint32 roleSwitch = 0;
-+	fDiscovererLocalDevice->GetProperty("role_switch_capable", &roleSwitch);
-+	request.AddUInt8("role_switch", roleSwitch != 0 ? 1 : 0);
- 
- 	if (fMessenger->SendMessage(&request) == B_OK)
- 		return B_OK;
-@@ -240,6 +261,12 @@ status_t
- RemoteDevice::CancelConnection()
- {
- 	CALLED();
-+	// devices loaded from the paired list have no owner yet
-+	if (fDiscovererLocalDevice == NULL)
-+		fDiscovererLocalDevice = LocalDevice::GetLocalDevice();
-+	if (fDiscovererLocalDevice == NULL || fMessenger == NULL)
-+		return B_ERROR;
-+
- 	BMessage request(BT_REQ_CANCEL_CONN);
- 
- 	request.AddInt32("hci_id", fDiscovererLocalDevice->ID());
-@@ -257,6 +284,12 @@ status_t
- RemoteDevice::Disconnect(bool removeDevice)
- {
- 	CALLED();
-+	// devices loaded from the paired list have no owner yet
-+	if (fDiscovererLocalDevice == NULL)
-+		fDiscovererLocalDevice = LocalDevice::GetLocalDevice();
-+	if (fDiscovererLocalDevice == NULL || fMessenger == NULL)
-+		return B_ERROR;
-+
- 	BMessage request(BT_REQ_DISCONNECT);
- 	if (removeDevice)
- 		request.what = BT_REQ_REMOVE_DEVICE;
-@@ -337,7 +370,11 @@ RemoteDevice::RemoteDevice(const bdaddr_t address, uint8 record[3])
- 	:
- 	BluetoothDevice(),
+@@ -369,7 +372,9 @@ RemoteDevice::RemoteDevice(const bdaddr_t address, uint8 record[3])
  	fDiscovererLocalDevice(NULL),
--	fScanMode(0)
-+	fPageRepetitionMode(1),
-+	fScanMode(0),
+ 	fPageRepetitionMode(1),
+ 	fScanMode(0),
+-	fClockOffset(0)
 +	fClockOffset(0),
 +	fFriendlyNameIsComplete(false),
 +	fTrusted(false)
  {
  	CALLED();
  	fBdaddr = address;
-@@ -350,7 +387,11 @@ RemoteDevice::RemoteDevice(const BString& address)
- 	:
- 	BluetoothDevice(),
+@@ -384,7 +389,9 @@ RemoteDevice::RemoteDevice(const BString& address)
  	fDiscovererLocalDevice(NULL),
--	fScanMode(0)
-+	fPageRepetitionMode(1),
-+	fScanMode(0),
+ 	fPageRepetitionMode(1),
+ 	fScanMode(0),
+-	fClockOffset(0)
 +	fClockOffset(0),
 +	fFriendlyNameIsComplete(false),
 +	fTrusted(false)
  {
  	CALLED();
  	fBdaddr = bdaddrUtils::FromString((const char*)address.String());
-diff --git a/src/kits/bluetooth/UI/ConnectionIncoming.cpp b/src/kits/bluetooth/UI/ConnectionIncoming.cpp
-index 0f5ccb2dd1..309607ac21 100644
---- a/src/kits/bluetooth/UI/ConnectionIncoming.cpp
-+++ b/src/kits/bluetooth/UI/ConnectionIncoming.cpp
-@@ -38,8 +38,11 @@ ConnectionIncoming::ConnectionIncoming(RemoteDevice* rDevice)
- 	SetPulseRate(1 * 1000 * 1000);
- 		// 1 second
- 
-+	// only the name known already: asking the device would block the caller,
-+	// which can be the thread that handles the answer
- 	if (rDevice != NULL)
--		fView = new ConnectionView(BRect(0, 0, 400, 80), rDevice->GetFriendlyName(),
-+		fView = new ConnectionView(BRect(0, 0, 400, 80),
-+					rDevice->GetCachedFriendlyName(),
- 					bdaddrUtils::ToString(rDevice->GetBluetoothAddress()));
- 	else
- 		fView = new ConnectionView(BRect(0, 0, 400, 80), "<unknown_device>",
 diff --git a/src/kits/debug/arch/arm/arch_debug_support.cpp b/src/kits/debug/arch/arm/arch_debug_support.cpp
 index ee287bb6e4..5706d0483e 100644
 --- a/src/kits/debug/arch/arm/arch_debug_support.cpp
@@ -29114,6 +30076,126 @@ index ee287bb6e4..5706d0483e 100644
 +
 +	return B_ENTRY_NOT_FOUND;
  }
+diff --git a/src/kits/device/USBEndpoint.cpp b/src/kits/device/USBEndpoint.cpp
+index fd0d629f67..9bb379759e 100644
+--- a/src/kits/device/USBEndpoint.cpp
++++ b/src/kits/device/USBEndpoint.cpp
+@@ -7,6 +7,8 @@
+  */
+ 
+ #include <USBKit.h>
++
++#include <errno.h>
+ #include <usb_raw.h>
+ #include <unistd.h>
+ #include <string.h>
+@@ -217,6 +219,106 @@ BUSBEndpoint::IsochronousTransfer(void *data, size_t length,
+ }
+ 
+ 
++status_t
++BUSBEndpoint::StartIsochronousStream(size_t packetSize,
++	uint32 packetsPerTransfer, uint32 transferCount, size_t bufferSize) const
++{
++	usb_raw_command command;
++	command.stream_start.interface = fInterface->Index();
++	command.stream_start.endpoint = fIndex;
++	command.stream_start.packet_size = packetSize;
++	command.stream_start.packets_per_transfer = packetsPerTransfer;
++	command.stream_start.transfer_count = transferCount;
++	command.stream_start.buffer_size = bufferSize;
++
++	if (ioctl(fRawFD, B_USB_RAW_COMMAND_ISOCHRONOUS_STREAM_START, &command,
++			sizeof(command)) != 0) {
++		return errno;
++	}
++
++	switch (command.stream_start.status) {
++		case B_USB_RAW_STATUS_SUCCESS:
++			return B_OK;
++		case B_USB_RAW_STATUS_NO_MEMORY:
++			return B_NO_MEMORY;
++		case B_USB_RAW_STATUS_INVALID_ENDPOINT:
++		case B_USB_RAW_STATUS_INVALID_INTERFACE:
++			return B_BAD_VALUE;
++		default:
++			return B_ERROR;
++	}
++}
++
++
++ssize_t
++BUSBEndpoint::ReadIsochronousStream(void *data, size_t length,
++	bigtime_t timeout) const
++{
++	// This endpoint's stream: a device may stream on several endpoints. A
++	// usb_raw without the command knows only one stream per device.
++	usb_raw_command command;
++	command.stream_read_endpoint.interface = fInterface->Index();
++	command.stream_read_endpoint.endpoint = fIndex;
++	command.stream_read_endpoint.data = data;
++	command.stream_read_endpoint.length = length;
++	command.stream_read_endpoint.timeout = timeout;
++
++	if (ioctl(fRawFD, B_USB_RAW_COMMAND_ISOCHRONOUS_STREAM_READ_ENDPOINT,
++			&command, sizeof(command)) == 0) {
++		switch (command.stream_read_endpoint.status) {
++			case B_USB_RAW_STATUS_SUCCESS:
++				return command.stream_read_endpoint.length;
++			case B_USB_RAW_STATUS_TIMEOUT:
++				return B_TIMED_OUT;
++			default:
++				return B_DEV_NOT_READY;
++		}
++	}
++	if (errno != B_DEV_INVALID_IOCTL)
++		return errno;
++
++	command.stream_read.data = data;
++	command.stream_read.length = length;
++	command.stream_read.timeout = timeout;
++
++	if (ioctl(fRawFD, B_USB_RAW_COMMAND_ISOCHRONOUS_STREAM_READ, &command,
++			sizeof(command)) != 0) {
++		return errno;
++	}
++
++	switch (command.stream_read.status) {
++		case B_USB_RAW_STATUS_SUCCESS:
++			return command.stream_read.length;
++		case B_USB_RAW_STATUS_TIMEOUT:
++			return B_TIMED_OUT;
++		default:
++			return B_DEV_NOT_READY;
++	}
++}
++
++
++status_t
++BUSBEndpoint::StopIsochronousStream() const
++{
++	usb_raw_command command;
++	command.stream_stop_endpoint.interface = fInterface->Index();
++	command.stream_stop_endpoint.endpoint = fIndex;
++	if (ioctl(fRawFD, B_USB_RAW_COMMAND_ISOCHRONOUS_STREAM_STOP_ENDPOINT,
++			&command, sizeof(command)) == 0) {
++		return B_OK;
++	}
++	if (errno != B_DEV_INVALID_IOCTL)
++		return errno;
++
++	if (ioctl(fRawFD, B_USB_RAW_COMMAND_ISOCHRONOUS_STREAM_STOP, &command,
++			sizeof(command)) != 0) {
++		return errno;
++	}
++
++	return B_OK;
++}
++
++
+ bool
+ BUSBEndpoint::IsStalled() const
+ {
 diff --git a/src/kits/interface/Bitmap.cpp b/src/kits/interface/Bitmap.cpp
 index 04b6ba8a75..3054036aa3 100644
 --- a/src/kits/interface/Bitmap.cpp
@@ -32331,7 +33413,7 @@ index 5a8e1cec40..9b38662d57 100644
  		HWInterface&			fHWInterface;
  		const overlay_buffer*	fOverlayBuffer;
 diff --git a/src/servers/bluetooth/BluetoothServer.cpp b/src/servers/bluetooth/BluetoothServer.cpp
-index 9c1dc88669..6467c0ccf0 100644
+index 9c1dc88669..55ccf2d252 100644
 --- a/src/servers/bluetooth/BluetoothServer.cpp
 +++ b/src/servers/bluetooth/BluetoothServer.cpp
 @@ -9,10 +9,14 @@
@@ -32450,17 +33532,87 @@ index 9c1dc88669..6467c0ccf0 100644
  
  	_RemoveDeskbarIcon();
  
-@@ -117,6 +171,9 @@ void BluetoothServer::ReadyToRun(void)
- 	status_t status = fSDPServer->Start();
- 	if (status != B_OK)
- 		TRACE_BT("BluetoothServer: Failed launching the SDP server thread\n");
-+
-+	if (HIDProfile::Listen() != B_OK)
-+		TRACE_BT("BluetoothServer: Failed listening for HID devices\n");
+@@ -100,23 +154,79 @@ void BluetoothServer::ArgvReceived(int32 argc, char **argv)
  }
  
  
-@@ -131,43 +188,119 @@ void BluetoothServer::MessageReceived(BMessage* message)
++/*!	The server once stayed with two threads and answered nothing after it
++	was started again, and could not be made to do it again. The steps of
++	the start are logged when they take long, and a watchdog tells which
++	one has not ended after 10 s.
++*/
++static const char* volatile sStartStep = NULL;
++
++
++static status_t
++start_watchdog(void*)
++{
++	snooze(10000000);
++	const char* step = sStartStep;
++	if (step != NULL) {
++		syslog(LOG_WARNING, "bluetooth_server: starting, still in %s after "
++			"10 s\n", step);
++	}
++	return B_OK;
++}
++
++
++static void
++log_slow_step(const char* step, bigtime_t start)
++{
++	bigtime_t duration = system_time() - start;
++	if (duration > 2000000) {
++		syslog(LOG_WARNING, "bluetooth_server: starting, %s took %" B_PRId64
++			" ms\n", step, duration / 1000);
++	}
++}
++
++
+ void BluetoothServer::ReadyToRun(void)
+ {
++	thread_id watchdog = spawn_thread(start_watchdog,
++		"bluetooth start watchdog", B_LOW_PRIORITY, NULL);
++	if (watchdog >= 0)
++		resume_thread(watchdog);
++
++	sStartStep = "watching the devices";
++	bigtime_t start = system_time();
+ 	fDeviceManager->StartMonitoringDevice("bluetooth/h2");
+ 	fDeviceManager->StartMonitoringDevice("bluetooth/h3");
+ 	fDeviceManager->StartMonitoringDevice("bluetooth/h4");
+ 	fDeviceManager->StartMonitoringDevice("bluetooth/h5");
++	log_slow_step("watching the devices", start);
+ 
++	sStartStep = "the event listener";
++	start = system_time();
+ 	if (fEventListener2->Launch() != B_OK)
+ 		TRACE_BT("General: Bluetooth event listener failed\n");
+ 	else
+ 		TRACE_BT("General: Bluetooth event listener Ready\n");
++	log_slow_step("the event listener", start);
+ 
++	sStartStep = "the Deskbar icon";
++	start = system_time();
+ 	_InstallDeskbarIcon();
++	log_slow_step("the Deskbar icon", start);
+ 
++	sStartStep = "the SDP server";
++	start = system_time();
+ 	status_t status = fSDPServer->Start();
+ 	if (status != B_OK)
+ 		TRACE_BT("BluetoothServer: Failed launching the SDP server thread\n");
++	log_slow_step("the SDP server", start);
++
++	sStartStep = "listening for HID devices";
++	start = system_time();
++	if (HIDProfile::Listen() != B_OK)
++		TRACE_BT("BluetoothServer: Failed listening for HID devices\n");
++	log_slow_step("listening for HID devices", start);
++	sStartStep = NULL;
+ }
+ 
+ 
+@@ -131,43 +241,119 @@ void BluetoothServer::MessageReceived(BMessage* message)
  	BMessage reply;
  	status_t status = B_WOULD_BLOCK; // mark somehow to do not reply anything
  
@@ -32601,7 +33753,7 @@ index 9c1dc88669..6467c0ccf0 100644
  
  		case BT_MSG_COUNT_LOCAL_DEVICES:
  			status = HandleLocalDevicesCount(message, &reply);
-@@ -239,10 +372,17 @@ void BluetoothServer::MessageReceived(BMessage* message)
+@@ -239,10 +425,17 @@ void BluetoothServer::MessageReceived(BMessage* message)
  
  			const bdaddr_t* bdaddr;
  			ssize_t addr_size;
@@ -32621,7 +33773,7 @@ index 9c1dc88669..6467c0ccf0 100644
  		}
  		break;
  
-@@ -280,6 +420,7 @@ void BluetoothServer::MessageReceived(BMessage* message)
+@@ -280,6 +473,7 @@ void BluetoothServer::MessageReceived(BMessage* message)
  					sizeof(rd->classOfDevice));
  				device.AddUInt16("clock_offset", rd->clock_offset);
  				device.AddUInt8("pscan_rep_mode", rd->pscan_rep_mode);
@@ -32629,7 +33781,7 @@ index 9c1dc88669..6467c0ccf0 100644
  
  				reply.AddMessage("remote", &device);
  			}
-@@ -288,6 +429,67 @@ void BluetoothServer::MessageReceived(BMessage* message)
+@@ -288,6 +482,67 @@ void BluetoothServer::MessageReceived(BMessage* message)
  		}
  		break;
  
@@ -32697,7 +33849,7 @@ index 9c1dc88669..6467c0ccf0 100644
  		case BT_REQ_CONN_STATE:
  		{
  			LocalDeviceImpl* lDeviceImpl = LocateDelegateFromMessage(message);
-@@ -340,21 +542,395 @@ BluetoothServer::NotifyWatchers(BMessage* notice)
+@@ -340,21 +595,395 @@ BluetoothServer::NotifyWatchers(BMessage* notice)
  }
  
  
@@ -33098,7 +34250,7 @@ index 9c1dc88669..6467c0ccf0 100644
  void
  BluetoothServer::NotifyServices(ServerRemoteDevice* rd)
  {
-@@ -363,7 +939,11 @@ BluetoothServer::NotifyServices(ServerRemoteDevice* rd)
+@@ -363,7 +992,11 @@ BluetoothServer::NotifyServices(ServerRemoteDevice* rd)
  
  	if (sdpClient.NotifyProfiles() == B_OK)
  		TRACE_BT("SDP: Notified the dedicated profile successfully\n");
@@ -36196,7 +37348,7 @@ index 48b4bd9ae5..da957cf10a 100644
  	bool Available();	
  	void Acquire(void);
 diff --git a/src/servers/bluetooth/LocalDeviceImpl.cpp b/src/servers/bluetooth/LocalDeviceImpl.cpp
-index 79e0c55cff..b299dc28cb 100644
+index f184eb1b60..94d1780375 100644
 --- a/src/servers/bluetooth/LocalDeviceImpl.cpp
 +++ b/src/servers/bluetooth/LocalDeviceImpl.cpp
 @@ -10,6 +10,7 @@
@@ -36596,7 +37748,7 @@ index 79e0c55cff..b299dc28cb 100644
  }
  
  
-@@ -202,6 +409,78 @@ LocalDeviceImpl::GetRemoteDevicesList()
+@@ -202,6 +409,83 @@ LocalDeviceImpl::GetRemoteDevicesList()
  }
  
  
@@ -36610,17 +37762,20 @@ index 79e0c55cff..b299dc28cb 100644
 +{
 +	rd->handle = handle;
 +	rd->conn_state = RemoteDevice::CONNECTED;
-+	Notifications::Connected(rd);
++	// the user hears of it once the link is secured: a device that refuses
++	// to be called (a Google Home does) brings a link up for a moment only
++	rd->announced = false;
 +}
 +
 +
-+/*!	The link to \a rd is gone, or it never came up. The watchers and the user
-+	hear about it only when it had been up.
++/*!	The link to \a rd is gone, or it never came up. The watchers hear about
++	it only when it had been up, the user only when it had been told of it.
 +*/
 +void
 +LocalDeviceImpl::_LinkDown(ServerRemoteDevice* rd)
 +{
 +	bool wasConnected = rd->conn_state == RemoteDevice::CONNECTED;
++	bool wasAnnounced = wasConnected && rd->announced;
 +
 +	rd->conn_state = RemoteDevice::DISCONNECTED;
 +	rd->handle = kInvalidHandle;
@@ -36628,11 +37783,13 @@ index 79e0c55cff..b299dc28cb 100644
 +	rd->keySizeChecked = false;
 +	rd->remoteIOKnown = false;
 +	rd->outgoing = false;
++	rd->announced = false;
 +
 +	if (!wasConnected)
 +		return;
 +
-+	Notifications::Disconnected(rd);
++	if (wasAnnounced)
++		Notifications::Disconnected(rd);
 +
 +	BMessage notice(BT_MSG_DISCONN_COMPLETED);
 +	notice.AddUInt8("status", BT_OK);
@@ -36675,7 +37832,7 @@ index 79e0c55cff..b299dc28cb 100644
  #if 0
  #pragma mark - Event handling methods -
  #endif
-@@ -230,6 +509,36 @@ LocalDeviceImpl::HandleUnexpectedEvent(struct hci_event_header* event)
+@@ -230,6 +514,36 @@ LocalDeviceImpl::HandleUnexpectedEvent(struct hci_event_header* event)
  				JumpEventHeader<struct hci_ev_conn_request>(event), NULL);
  			break;
  
@@ -36712,7 +37869,7 @@ index 79e0c55cff..b299dc28cb 100644
  		case HCI_EVENT_NUM_COMP_PKTS:
  			NumberOfCompletedPackets(
  				JumpEventHeader<struct hci_ev_num_comp_pkts>(event));
-@@ -248,8 +557,37 @@ LocalDeviceImpl::HandleUnexpectedEvent(struct hci_event_header* event)
+@@ -248,8 +562,37 @@ LocalDeviceImpl::HandleUnexpectedEvent(struct hci_event_header* event)
  			EncryptChange(JumpEventHeader<struct hci_ev_encrypt_change>(event));
  			break;
  
@@ -36751,7 +37908,7 @@ index 79e0c55cff..b299dc28cb 100644
  			break;
  	}
  }
-@@ -266,7 +604,7 @@ LocalDeviceImpl::HandleExpectedRequest(struct hci_event_header* event,
+@@ -266,7 +609,7 @@ LocalDeviceImpl::HandleExpectedRequest(struct hci_event_header* event,
  			break;
  
  		case HCI_EVENT_INQUIRY_RESULT:
@@ -36760,7 +37917,7 @@ index 79e0c55cff..b299dc28cb 100644
  			break;
  
  		case HCI_EVENT_AUTH_COMPLETE:
-@@ -351,10 +689,12 @@ LocalDeviceImpl::HandleExpectedRequest(struct hci_event_header* event,
+@@ -351,10 +694,12 @@ LocalDeviceImpl::HandleExpectedRequest(struct hci_event_header* event,
  			break;
  
  		case HCI_EVENT_INQUIRY_RESULT_WITH_RSSI:
@@ -36775,7 +37932,7 @@ index 79e0c55cff..b299dc28cb 100644
  			break;
  
  		case HCI_EVENT_REMOTE_EXTENDED_FEATURES:
-@@ -386,6 +726,15 @@ LocalDeviceImpl::HandleExpectedRequest(struct hci_event_header* event,
+@@ -386,6 +731,15 @@ LocalDeviceImpl::HandleExpectedRequest(struct hci_event_header* event,
  				request);
  			break;
  
@@ -36791,7 +37948,7 @@ index 79e0c55cff..b299dc28cb 100644
  		case HCI_EVENT_PIN_CODE_REQ:
  			PinCodeRequest(JumpEventHeader<struct hci_ev_pin_code_req>(event), NULL);
  			break;
-@@ -406,6 +755,11 @@ LocalDeviceImpl::HandleEvent(struct hci_event_header* event)
+@@ -406,6 +760,11 @@ LocalDeviceImpl::HandleEvent(struct hci_event_header* event)
  	BMessage* request = NULL;
  	int32 eventIndexLocation;
  
@@ -36803,7 +37960,7 @@ index 79e0c55cff..b299dc28cb 100644
  	// Check if it is a requested one
  	switch (event->ecode) {
  		case HCI_EVENT_CMD_COMPLETE:
-@@ -416,6 +770,19 @@ LocalDeviceImpl::HandleEvent(struct hci_event_header* event)
+@@ -416,6 +775,19 @@ LocalDeviceImpl::HandleEvent(struct hci_event_header* event)
  			TRACE_BT("LocalDeviceImpl: Incoming CommandComplete(%d) for %s\n", commandComplete->ncmd,
  				BluetoothCommandOpcode(commandComplete->opcode));
  
@@ -36823,7 +37980,7 @@ index 79e0c55cff..b299dc28cb 100644
  			request = FindPetition(event->ecode, commandComplete->opcode,
  				&eventIndexLocation);
  
-@@ -863,6 +1230,8 @@ LocalDeviceImpl::CommandComplete(struct hci_ev_cmd_complete* event,
+@@ -863,6 +1235,8 @@ LocalDeviceImpl::CommandComplete(struct hci_ev_cmd_complete* event,
  		case PACK_OPCODE(OGF_LINK_CONTROL, OCF_SET_CONN_ENCRYPT):
  		case PACK_OPCODE(OGF_LINK_CONTROL, OCF_CREATE_CONN_CANCEL):
  		case PACK_OPCODE(OGF_CONTROL_BASEBAND, OCF_RESET):
@@ -36832,7 +37989,7 @@ index 79e0c55cff..b299dc28cb 100644
  		case PACK_OPCODE(OGF_CONTROL_BASEBAND, OCF_WRITE_SCAN_ENABLE):
  		case PACK_OPCODE(OGF_CONTROL_BASEBAND, OCF_WRITE_CLASS_OF_DEV):
  		case PACK_OPCODE(OGF_CONTROL_BASEBAND, OCF_WRITE_PG_TIMEOUT):
-@@ -919,6 +1288,12 @@ LocalDeviceImpl::CommandStatus(struct hci_ev_cmd_status* event,
+@@ -919,6 +1293,12 @@ LocalDeviceImpl::CommandStatus(struct hci_ev_cmd_status* event,
  			//printf("Sending reply... %ld\n", status);
  			// debug reply.PrintToStream();
  
@@ -36845,7 +38002,7 @@ index 79e0c55cff..b299dc28cb 100644
  			ClearWantedEvent(request, HCI_EVENT_CMD_STATUS,
  				PACK_OPCODE(OGF_LINK_CONTROL, OCF_INQUIRY));
  		}
-@@ -958,12 +1333,25 @@ LocalDeviceImpl::CommandStatus(struct hci_ev_cmd_status* event,
+@@ -958,12 +1338,25 @@ LocalDeviceImpl::CommandStatus(struct hci_ev_cmd_status* event,
  					break;
  
  				default:
@@ -36871,7 +38028,7 @@ index 79e0c55cff..b299dc28cb 100644
  			}
  		}
  		break;
-@@ -1014,13 +1402,21 @@ LocalDeviceImpl::CommandStatus(struct hci_ev_cmd_status* event,
+@@ -1014,13 +1407,21 @@ LocalDeviceImpl::CommandStatus(struct hci_ev_cmd_status* event,
  
  
  void
@@ -36894,7 +38051,7 @@ index 79e0c55cff..b299dc28cb 100644
  	uint8* base_ptr = numberOfResponses + 1;
  
  	// get pointers ready for the arrays
-@@ -1055,13 +1451,20 @@ LocalDeviceImpl::InquiryResult(uint8* numberOfResponses, BMessage* request)
+@@ -1055,13 +1456,20 @@ LocalDeviceImpl::InquiryResult(uint8* numberOfResponses, BMessage* request)
  
  
  void
@@ -36916,7 +38073,7 @@ index 79e0c55cff..b299dc28cb 100644
  	uint8* base_ptr = numberOfResponses + 1;
  
  	// get pointers ready for the parallel arrays
-@@ -1096,13 +1499,15 @@ LocalDeviceImpl::InquiryResultWithRSSI(uint8* numberOfResponses, BMessage* reque
+@@ -1096,13 +1504,15 @@ LocalDeviceImpl::InquiryResultWithRSSI(uint8* numberOfResponses, BMessage* reque
  
  
  void
@@ -36934,7 +38091,7 @@ index 79e0c55cff..b299dc28cb 100644
  		return;
  
  	hci_ev_extended_inquiry_info* info = (hci_ev_extended_inquiry_info*)(numberOfResponses + 1);
-@@ -1260,6 +1665,17 @@ LocalDeviceImpl::RemoteNameRequestComplete(
+@@ -1260,6 +1670,17 @@ LocalDeviceImpl::RemoteNameRequestComplete(
  
  	if (remotename->status == BT_OK) {
  		reply.AddString("friendlyname", (const char*)remotename->remote_name );
@@ -36952,7 +38109,7 @@ index 79e0c55cff..b299dc28cb 100644
  	}
  
  	reply.AddUInt8("status", remotename->status);
-@@ -1298,11 +1714,16 @@ LocalDeviceImpl::ConnectionRequest(struct hci_ev_conn_request* event,
+@@ -1298,11 +1719,16 @@ LocalDeviceImpl::ConnectionRequest(struct hci_ev_conn_request* event,
  		if (serverRd == NULL) {
  			serverRd = new ServerRemoteDevice();
  			serverRd->bdaddr = event->bdaddr;
@@ -36970,7 +38127,7 @@ index 79e0c55cff..b299dc28cb 100644
  		memcpy(serverRd->classOfDevice, event->dev_class, 3 * sizeof(uint8));
  
  		BMessage notice(BT_MSG_NEW_REMOTE_DEVICE);
-@@ -1359,9 +1780,9 @@ LocalDeviceImpl::CreateConnection(BMessage* message)
+@@ -1359,9 +1785,9 @@ LocalDeviceImpl::CreateConnection(BMessage* message)
  	if (rdConn == NULL) {
  		rdConn = new ServerRemoteDevice();
  		rdConn->bdaddr = *bdaddr;
@@ -36981,18 +38138,7 @@ index 79e0c55cff..b299dc28cb 100644
  	message->FindString("name", &rdConn->friendly_name);
  	message->FindUInt8("pscan_rep_mode", &rdConn->pscan_rep_mode);
  	message->FindUInt16("clock_offset", &rdConn->clock_offset);
-@@ -1385,8 +1806,8 @@ LocalDeviceImpl::CreateConnection(BMessage* message)
- 	command->pkt_type &= ACL_PTYPE_MASK;
- 	command->pscan_rep_mode = rdConn->pscan_rep_mode;
- 	message->FindUInt8("pscan_mode", &command->pscan_mode); // Reserved in spec 2.1
--	command->clock_offset = rdConn->clock_offset;
--	command->clock_offset |= 0x8000; // substract!
-+	// bit 15 is set by the client only when an inquiry gave the offset
-+	command->clock_offset = B_HOST_TO_LENDIAN_INT16(rdConn->clock_offset);
- 	message->FindUInt8("role_switch", &command->role_switch);
- 
- 
-@@ -1401,6 +1822,7 @@ LocalDeviceImpl::CreateConnection(BMessage* message)
+@@ -1401,6 +1827,7 @@ LocalDeviceImpl::CreateConnection(BMessage* message)
  
  	newRequest->AddInt32("hci_id", fHCIDelegate->Id());
  
@@ -37000,7 +38146,7 @@ index 79e0c55cff..b299dc28cb 100644
  	newRequest->AddInt16("eventExpected",  HCI_EVENT_CMD_STATUS);
  	newRequest->AddInt16("opcodeExpected", PACK_OPCODE(OGF_LINK_CONTROL, OCF_CREATE_CONN));
  
-@@ -1455,7 +1877,14 @@ LocalDeviceImpl::Disconnect(BMessage* message)
+@@ -1455,7 +1882,14 @@ LocalDeviceImpl::Disconnect(BMessage* message)
  	ssize_t addr_size;
  	message->FindData("bdaddr", B_ANY_TYPE, (const void**)&bdaddr, &addr_size);
  
@@ -37016,7 +38162,7 @@ index 79e0c55cff..b299dc28cb 100644
  	command->handle = rd->handle;
  	message->FindUInt8("reason", &command->reason);
  
-@@ -1476,6 +1905,253 @@ LocalDeviceImpl::Disconnect(BMessage* message)
+@@ -1476,6 +1910,253 @@ LocalDeviceImpl::Disconnect(BMessage* message)
  }
  
  
@@ -37270,7 +38416,7 @@ index 79e0c55cff..b299dc28cb 100644
  void
  LocalDeviceImpl::SetConnEncryption(uint16 handle, bool encryption_enabled)
  {
-@@ -1546,17 +2222,13 @@ LocalDeviceImpl::ConnectionComplete(struct hci_ev_conn_complete* event)
+@@ -1546,17 +2227,13 @@ LocalDeviceImpl::ConnectionComplete(struct hci_ev_conn_complete* event)
  	reply.AddUInt8("status", event->status);
  	if (event->status == BT_OK) {
  		if (rd != NULL) {
@@ -37291,7 +38437,7 @@ index 79e0c55cff..b299dc28cb 100644
  		TRACE_BT("LocalDeviceImpl: %s: Address %s handle=%#x type=%d encrypt=%d\n", __FUNCTION__,
  				bdaddrUtils::ToString(event->bdaddr).String(), event->handle,
  				event->link_type, event->encrypt_mode);
-@@ -1569,15 +2241,42 @@ LocalDeviceImpl::ConnectionComplete(struct hci_ev_conn_complete* event)
+@@ -1569,15 +2246,42 @@ LocalDeviceImpl::ConnectionComplete(struct hci_ev_conn_complete* event)
  		newrequest->AddInt16("eventExpected", HCI_EVENT_LINK_KEY_NOTIFY);
  		AddWantedEvent(newrequest);
  
@@ -37338,7 +38484,7 @@ index 79e0c55cff..b299dc28cb 100644
  
  		TRACE_BT("LocalDeviceImpl: %s: failed with error %s\n", __FUNCTION__,
  			BluetoothError(event->status));
-@@ -1595,19 +2294,25 @@ LocalDeviceImpl::DisconnectionComplete(hci_ev_disconnection_complete_reply* even
+@@ -1595,19 +2299,25 @@ LocalDeviceImpl::DisconnectionComplete(hci_ev_disconnection_complete_reply* even
  	TRACE_BT("LocalDeviceImpl: %s: Handle=%#x, reason=%s status=%x\n", __FUNCTION__, event->handle,
  		BluetoothError(event->reason), event->status);
  
@@ -37375,7 +38521,7 @@ index 79e0c55cff..b299dc28cb 100644
  }
  
  
-@@ -1615,12 +2320,46 @@ void
+@@ -1615,12 +2325,46 @@ void
  LocalDeviceImpl::PinCodeRequest(struct hci_ev_pin_code_req* event,
  	BMessage* request)
  {
@@ -37422,7 +38568,7 @@ index 79e0c55cff..b299dc28cb 100644
  void
  LocalDeviceImpl::RoleChange(hci_ev_role_change* event, BMessage* request)
  {
-@@ -1644,19 +2383,42 @@ void
+@@ -1644,19 +2388,42 @@ void
  LocalDeviceImpl::LinkKeyNotify(hci_ev_link_key_notify* event,
  	BMessage* request)
  {
@@ -37444,9 +38590,7 @@ index 79e0c55cff..b299dc28cb 100644
 +			bdaddrUtils::ToString(event->bdaddr).String());
  		return;
 +	}
- 
--	rd->link_key = event->link_key;
--	rd->link_type = event->key_type;
++
 +	// How the pairing went: a simple pairing told what both sides asked
 +	// for (we always ask for General Bonding, see IOCapabilityRequest()).
 +	// Without a device in the list, nothing is known of it: a legacy
@@ -37462,7 +38606,9 @@ index 79e0c55cff..b299dc28cb 100644
 +		}
 +		rd->autoPinTried = false;
 +	}
-+
+ 
+-	rd->link_key = event->link_key;
+-	rd->link_type = event->key_type;
 +	if (TraceKeys())
 +		TraceKey("made by the pairing", event->bdaddr, event->link_key);
 +	if (fBonds->PairingFinished(event->bdaddr, event->link_key,
@@ -37472,7 +38618,7 @@ index 79e0c55cff..b299dc28cb 100644
  }
  
  
-@@ -1667,9 +2429,9 @@ LocalDeviceImpl::LinkKeyRequested(struct hci_ev_link_key_req* keyRequested,
+@@ -1667,9 +2434,9 @@ LocalDeviceImpl::LinkKeyRequested(struct hci_ev_link_key_req* keyRequested,
  	TRACE_BT("LocalDeviceImpl: %s: Address %s\n", __FUNCTION__,
  		bdaddrUtils::ToString(keyRequested->bdaddr).String());
  
@@ -37485,7 +38631,7 @@ index 79e0c55cff..b299dc28cb 100644
  		BluetoothCommand<typed_command(hci_cp_link_key_neg_reply)>
  			linkKeyNegativeReply(OGF_LINK_CONTROL, OCF_LINK_KEY_NEG_REPLY);
  
-@@ -1701,7 +2463,9 @@ LocalDeviceImpl::LinkKeyRequested(struct hci_ev_link_key_req* keyRequested,
+@@ -1701,7 +2468,9 @@ LocalDeviceImpl::LinkKeyRequested(struct hci_ev_link_key_req* keyRequested,
  		AddWantedEvent(newrequest);
  
  		bdaddrUtils::Copy(linkKeyReply->bdaddr, keyRequested->bdaddr);
@@ -37496,7 +38642,7 @@ index 79e0c55cff..b299dc28cb 100644
  
  		if ((fHCIDelegate)->IssueCommand(linkKeyReply.Data(), linkKeyReply.Size()) == B_ERROR) {
  			TRACE_BT("LocalDeviceImpl: Command issued error for reply %s\n", __FUNCTION__);
-@@ -1727,9 +2491,8 @@ LocalDeviceImpl::ReturnLinkKeys(struct hci_ev_return_link_keys* returnedKeys)
+@@ -1727,9 +2496,8 @@ LocalDeviceImpl::ReturnLinkKeys(struct hci_ev_return_link_keys* returnedKeys)
  
  	while (numKeys > 0) {
  
@@ -37508,7 +38654,7 @@ index 79e0c55cff..b299dc28cb 100644
  
  		linkKeys++;
  		numKeys--;
-@@ -1750,6 +2513,19 @@ void
+@@ -1750,6 +2518,19 @@ void
  LocalDeviceImpl::HardwareError(struct hci_ev_hardware_error* event)
  {
  	TRACE_BT("LocalDeviceImpl: %s: hardware code=%#x\n",	__FUNCTION__, event->hardware_code);
@@ -37528,7 +38674,7 @@ index 79e0c55cff..b299dc28cb 100644
  }
  
  
-@@ -1780,9 +2556,14 @@ LocalDeviceImpl::IOCapabilityRequest(struct hci_ev_io_capability_request* event,
+@@ -1780,9 +2561,14 @@ LocalDeviceImpl::IOCapabilityRequest(struct hci_ev_io_capability_request* event,
  	TRACE_BT("LocalDeviceImpl: IO Capability Request from %s...\n",
  		bdaddrUtils::ToString(event->bdaddr).String());
  
@@ -37546,7 +38692,7 @@ index 79e0c55cff..b299dc28cb 100644
  
  	BMessage* newrequest = new BMessage;
  
-@@ -1793,6 +2574,7 @@ LocalDeviceImpl::IOCapabilityRequest(struct hci_ev_io_capability_request* event,
+@@ -1793,6 +2579,7 @@ LocalDeviceImpl::IOCapabilityRequest(struct hci_ev_io_capability_request* event,
  	// TODO:Check if there are more events we need to look for
  	newrequest->AddInt16("eventExpected", HCI_EVENT_USER_CONFIRMATION_REQUEST);
  	newrequest->AddInt16("eventExpected", HCI_EVENT_USER_PASSKEY_REQUEST);
@@ -37554,7 +38700,7 @@ index 79e0c55cff..b299dc28cb 100644
  	newrequest->AddInt16("eventExpected", HCI_EVENT_SIMPLE_PAIRING_COMPLETE);
  
  	AddWantedEvent(newrequest);
-@@ -1811,6 +2593,13 @@ LocalDeviceImpl::IOCapabilityResponse(struct hci_ev_io_capability_response* even
+@@ -1811,6 +2598,13 @@ LocalDeviceImpl::IOCapabilityResponse(struct hci_ev_io_capability_response* even
  	TRACE_BT("LocalDeviceImpl: %s for %s - Capability: 0x%02x, OOB: 0x%02x, Auth: 0x%02x\n",
  		__FUNCTION__, bdaddrUtils::ToString(event->bdaddr).String(), event->capability,
  		event->oob_data, event->authentication);
@@ -37568,7 +38714,7 @@ index 79e0c55cff..b299dc28cb 100644
  }
  
  
-@@ -1824,6 +2613,21 @@ LocalDeviceImpl::UserConfirmationRequest(struct hci_ev_user_confirmation_request
+@@ -1824,6 +2618,21 @@ LocalDeviceImpl::UserConfirmationRequest(struct hci_ev_user_confirmation_request
  	TRACE_BT("LocalDeviceImpl: User Confirmation Request for %s (Passkey: %06" B_PRIu32 ")\n",
  		bdaddrUtils::ToString(event->bdaddr).String(), event->passkey);
  
@@ -37590,7 +38736,7 @@ index 79e0c55cff..b299dc28cb 100644
  	command = buildUserConfirmReply(event->bdaddr, &size);
  
  
-@@ -1840,10 +2644,48 @@ LocalDeviceImpl::UserConfirmationRequest(struct hci_ev_user_confirmation_request
+@@ -1840,10 +2649,48 @@ LocalDeviceImpl::UserConfirmationRequest(struct hci_ev_user_confirmation_request
  }
  
  
@@ -37639,7 +38785,7 @@ index 79e0c55cff..b299dc28cb 100644
  	if (event->status == BT_OK) {
  		TRACE_BT("LocalDeviceImpl: %s successfull for %s!\n", __FUNCTION__,
  			bdaddrUtils::ToString(event->bdaddr).String());
-@@ -1852,6 +2694,8 @@ LocalDeviceImpl::SimplePairingComplete(struct hci_ev_simple_pairing_complete* ev
+@@ -1852,6 +2699,8 @@ LocalDeviceImpl::SimplePairingComplete(struct hci_ev_simple_pairing_complete* ev
  		TRACE_BT("LocalDeviceImpl: %s failed for %s with error %s\n", __FUNCTION__,
  			bdaddrUtils::ToString(event->bdaddr).String(), BluetoothError(event->status));
  	}
@@ -37648,7 +38794,7 @@ index 79e0c55cff..b299dc28cb 100644
  	if (request != NULL)
  		ClearWantedEvent(request);
  }
-@@ -1865,17 +2709,17 @@ LocalDeviceImpl::AuthComplete(struct hci_ev_auth_complete* eventData, BMessage*
+@@ -1865,17 +2714,17 @@ LocalDeviceImpl::AuthComplete(struct hci_ev_auth_complete* eventData, BMessage*
  
  	if (status == BT_OK) {
  		TRACE_BT("LocalDeviceImpl: Authentication Successful for handle %d\n", handle);
@@ -37672,7 +38818,7 @@ index 79e0c55cff..b299dc28cb 100644
  			BMessage disconnReq;
  			bdaddr_t bdaddr = rd->bdaddr;
  			disconnReq.AddData("bdaddr", B_ANY_TYPE, &bdaddr, sizeof(bdaddr_t));
-@@ -1898,6 +2742,21 @@ LocalDeviceImpl::AuthComplete(struct hci_ev_auth_complete* eventData, BMessage*
+@@ -1898,6 +2747,21 @@ LocalDeviceImpl::AuthComplete(struct hci_ev_auth_complete* eventData, BMessage*
  }
  
  
@@ -37694,7 +38840,7 @@ index 79e0c55cff..b299dc28cb 100644
  void
  LocalDeviceImpl::EncryptChange(struct hci_ev_encrypt_change* event)
  {
-@@ -1909,8 +2768,83 @@ LocalDeviceImpl::EncryptChange(struct hci_ev_encrypt_change* event)
+@@ -1909,8 +2773,87 @@ LocalDeviceImpl::EncryptChange(struct hci_ev_encrypt_change* event)
  		return;
  
  	rd->encryption_enabled = event->encrypt;
@@ -37767,6 +38913,10 @@ index 79e0c55cff..b299dc28cb 100644
 +LocalDeviceImpl::_LinkSecured(ServerRemoteDevice* rd)
 +{
 +	rd->keySizeChecked = true;
++	if (!rd->announced) {
++		rd->announced = true;
++		Notifications::Connected(rd);
++	}
 +	if (rd->outgoing)
 +		((BluetoothServer*)be_app)->StartServices(rd);
 +	else {
@@ -37781,7 +38931,7 @@ index 79e0c55cff..b299dc28cb 100644
  
  
 diff --git a/src/servers/bluetooth/LocalDeviceImpl.h b/src/servers/bluetooth/LocalDeviceImpl.h
-index c95bff089c..a22ea0a7a6 100644
+index c95bff089c..1b863c325b 100644
 --- a/src/servers/bluetooth/LocalDeviceImpl.h
 +++ b/src/servers/bluetooth/LocalDeviceImpl.h
 @@ -13,6 +13,8 @@
@@ -37793,7 +38943,7 @@ index c95bff089c..a22ea0a7a6 100644
  #include "LocalDeviceHandler.h"
  
  #include "HCIDelegate.h"
-@@ -27,15 +29,35 @@ struct ServerRemoteDevice
+@@ -27,15 +29,37 @@ struct ServerRemoteDevice
  	uint16				clock_offset;
  	uint8				pscan_rep_mode;
  	uint8				classOfDevice[3];
@@ -37819,6 +38969,8 @@ index c95bff089c..a22ea0a7a6 100644
  	BMessage			services;
 +	bool				outgoing;
 +		// we opened the connection, rather than the device
++	bool				announced;
++		// the user was told that the device is connected
  };
  
 +// no link uses it: the handles go up to 0x0eff
@@ -37830,7 +38982,7 @@ index c95bff089c..a22ea0a7a6 100644
  typedef BObjectList<ServerRemoteDevice> RemoteDevicesList;
  
  class LocalDeviceImpl : public LocalDeviceHandler {
-@@ -53,6 +75,10 @@ public:
+@@ -53,6 +77,10 @@ public:
  
  	void HandleEvent(struct hci_event_header* event);
  
@@ -37841,7 +38993,7 @@ index c95bff089c..a22ea0a7a6 100644
  	// Request handling
  	status_t 	ProcessSimpleRequest(BMessage* request);
  
-@@ -60,6 +86,12 @@ public:
+@@ -60,6 +88,12 @@ public:
  	void CreateConnection(BMessage* message);
  	void CancelConnection(BMessage* message);
  	void Disconnect(BMessage* message);
@@ -37854,7 +39006,7 @@ index c95bff089c..a22ea0a7a6 100644
  	void SetConnEncryption(uint16 handle, bool encryption_enabled);
  
  	ServerRemoteDevice*	RemoteDeviceByAddr(bdaddr_t bdaddr);
-@@ -68,12 +100,37 @@ public:
+@@ -68,12 +102,37 @@ public:
  	void				RemoveRemoteDevice(ServerRemoteDevice* rd);
  	RemoteDevicesList*	GetRemoteDevicesList();
  
@@ -37894,7 +39046,7 @@ index c95bff089c..a22ea0a7a6 100644
  
  	void HandleUnexpectedEvent(struct hci_event_header* event);
  	void HandleExpectedRequest(struct hci_event_header* event,
-@@ -88,9 +145,12 @@ private:
+@@ -88,9 +147,12 @@ private:
  	void NumberOfCompletedPackets(struct hci_ev_num_comp_pkts* event);
  
  	// Inquiry
@@ -37910,7 +39062,7 @@ index c95bff089c..a22ea0a7a6 100644
  	void ParseEIR(const uint8* eir, BMessage& reply);
  	void InquiryComplete(uint8* status, BMessage* request);
  	void RemoteNameRequestComplete(struct hci_ev_remote_name_request_complete_reply*
-@@ -123,11 +183,18 @@ private:
+@@ -123,11 +185,18 @@ private:
  	void IOCapabilityResponse(struct hci_ev_io_capability_response* event,
  		BMessage* request);
  	void UserConfirmationRequest(struct hci_ev_user_confirmation_request* event, BMessage* request);
@@ -40045,7 +41197,7 @@ index 0000000000..886d058ad0
 +	long_info = "led_server ©2026 Andrea Bernardi"
 +};
 diff --git a/src/servers/media/DefaultManager.cpp b/src/servers/media/DefaultManager.cpp
-index 1e724ec2ea..4414640220 100644
+index dad94103d7..4414640220 100644
 --- a/src/servers/media/DefaultManager.cpp
 +++ b/src/servers/media/DefaultManager.cpp
 @@ -58,9 +58,12 @@ DefaultManager::DefaultManager()
@@ -40203,29 +41355,6 @@ index 1e724ec2ea..4414640220 100644
  		if (firstReal < 0)
  			firstReal = i;
  
-@@ -582,17 +663,17 @@ DefaultManager::_FindPhysical(volatile media_node_id *id, uint32 default_type,
- 
- 		dormant_node_info dninfo;
- 		if (fRoster->GetDormantNodeFor(info[i].node, &dninfo) != B_OK) {
--			ERROR("Couldn't GetDormantNodeFor\n");
-+			syslog(LOG_DEBUG, "media_server: no dormant node for \"%s\"\n",
-+				info[i].name);
- 			continue;
- 		}
--		if (strcmp(dninfo.name, msgDninfo.name) != 0) {
--			ERROR("Doesn't match name\n");
-+		if (strcmp(dninfo.name, msgDninfo.name) != 0)
- 			continue;
--		}
- 		BPath path;
- 		if (gDormantNodeManager->FindAddOnPath(&path, dninfo.addon) != B_OK
- 			|| path != msgPath) {
--			ERROR("Doesn't match : path\n");
-+			syslog(LOG_DEBUG, "media_server: \"%s\" is from %s, not %s\n",
-+				info[i].name, path.Path(), msgPath.Path());
- 			continue;
- 		}
- 		if (dninfo.flavor_id == msgDninfo.flavor_id) {
 @@ -665,18 +746,23 @@ DefaultManager::_TypeIndex(uint32 defaultType)
  }
  
@@ -42691,10 +43820,10 @@ index 40e2c3bce1..7ce6c1c53d 100644
  	volatile uint32_t *fGiccRegs;
 diff --git a/src/system/kernel/arch/arm/arch_l2_cache.cpp b/src/system/kernel/arch/arm/arch_l2_cache.cpp
 new file mode 100644
-index 0000000000..b564488f87
+index 0000000000..68d8e5b41a
 --- /dev/null
 +++ b/src/system/kernel/arch/arm/arch_l2_cache.cpp
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,173 @@
 +/*
 + * Copyright 2026, Haiku, Inc. All rights reserved.
 + * Distributed under the terms of the MIT License.
@@ -42766,6 +43895,8 @@ index 0000000000..b564488f87
 +	void* settings = load_driver_settings("kernel");
 +	bool enable = get_driver_boolean_parameter(settings, "arm_l2_cache", false,
 +		true);
++	bool prefetch = get_driver_boolean_parameter(settings, "arm_l2_prefetch",
++		false, true);
 +	unload_driver_settings(settings);
 +
 +	void* address;
@@ -42789,10 +43920,16 @@ index 0000000000..b564488f87
 +
 +	// the latencies and the auxiliary control may only be set while it is off;
 +	// all memory is shareable (for SMP), which older revisions would not cache
-+	// without the override; no prefetching (errata on early revisions)
-+	write_reg(l2, L2X0_AUX_CTRL, (read_reg(l2, L2X0_AUX_CTRL)
-+		| L2X0_AUX_SHARED_OVERRIDE)
-+		& ~(L2X0_AUX_INSTRUCTION_PREFETCH | L2X0_AUX_DATA_PREFETCH));
++	// without the override. The instruction and data prefetches stay off
++	// unless "arm_l2_prefetch true" asks for them: on the AC100 (Tegra 2,
++	// r2p0) they gained nothing in copies, reads or gzip and made strided
++	// reads 8% slower.
++	uint32 aux = read_reg(l2, L2X0_AUX_CTRL) | L2X0_AUX_SHARED_OVERRIDE;
++	if (prefetch)
++		aux |= L2X0_AUX_INSTRUCTION_PREFETCH | L2X0_AUX_DATA_PREFETCH;
++	else
++		aux &= ~(L2X0_AUX_INSTRUCTION_PREFETCH | L2X0_AUX_DATA_PREFETCH);
++	write_reg(l2, L2X0_AUX_CTRL, aux);
 +	if (args->arch_args.l2TagLatency != 0)
 +		write_reg(l2, L2X0_TAG_LATENCY, args->arch_args.l2TagLatency);
 +	if (args->arch_args.l2DataLatency != 0)
@@ -45238,50 +46375,8 @@ index e44fb026a8..68f5367696 100644
  	*frequency = 0;
  	return B_OK;
  }
-diff --git a/src/system/kernel/cache/file_cache.cpp b/src/system/kernel/cache/file_cache.cpp
-index c6e2e9a07b..e5e4adf8e2 100644
---- a/src/system/kernel/cache/file_cache.cpp
-+++ b/src/system/kernel/cache/file_cache.cpp
-@@ -15,6 +15,7 @@
- #include <fs_cache.h>
- 
- #include <condition_variable.h>
-+#include <driver_settings.h>
- #include <file_cache.h>
- #include <generic_syscall.h>
- #include <low_resource_manager.h>
-@@ -1234,12 +1235,25 @@ cache_node_launched(size_t argCount, char*  const* args)
- extern "C" status_t
- file_cache_init_post_boot_device(void)
- {
--	// ToDo: get cache module out of driver settings
-+	// A cache module (as file_cache/launch_speedup/v1, which no image
-+	// includes) is only looked for when the kernel settings name one, with
-+	// "file_cache_module <name>"
-+	void* handle = load_driver_settings("kernel");
-+	if (handle == NULL)
-+		return B_OK;
- 
--	if (get_module("file_cache/launch_speedup/v1",
--			(module_info**)&sCacheModule) == B_OK) {
--		dprintf("** opened launch speedup: %" B_PRId64 "\n", system_time());
-+	// Like CACHE_SET_MODULE, only accept a cache module: any other module
-+	// would be called through the cache hooks
-+	const char* name = get_driver_parameter(handle, "file_cache_module", NULL,
-+		NULL);
-+	if (name != NULL) {
-+		if (strncmp(name, CACHE_MODULES_NAME, strlen(CACHE_MODULES_NAME)) != 0)
-+			dprintf("file_cache: %s is not a cache module\n", name);
-+		else if (get_module(name, (module_info**)&sCacheModule) == B_OK)
-+			dprintf("file_cache: using cache module %s\n", name);
- 	}
-+
-+	unload_driver_settings(handle);
- 	return B_OK;
- }
- 
 diff --git a/src/system/kernel/debug/debug.cpp b/src/system/kernel/debug/debug.cpp
-index cde05273ca..dfe3c4f777 100644
+index cde05273ca..ec6929dec3 100644
 --- a/src/system/kernel/debug/debug.cpp
 +++ b/src/system/kernel/debug/debug.cpp
 @@ -95,13 +95,33 @@ static bool sDebugScreenEnabled = false;
@@ -45328,15 +46423,43 @@ index cde05273ca..dfe3c4f777 100644
  #define OUTPUT_BUFFER_SIZE 1024
  static char sOutputBuffer[OUTPUT_BUFFER_SIZE];
  static char sInterruptOutputBuffer[OUTPUT_BUFFER_SIZE];
-@@ -772,16 +792,22 @@ print_kernel_debugger_message()
+@@ -772,16 +792,50 @@ print_kernel_debugger_message()
  }
  
  
 -static void
++/*!	Returns whether the last of the commands in \a commands, separated by
++	';', is one of those that leave the debugger.
++*/
++static bool
++last_command_quits(const char* commands)
++{
++	const char* last = strrchr(commands, ';');
++	last = last != NULL ? last + 1 : commands;
++	while (isspace(*last))
++		last++;
++
++	size_t length = strlen(last);
++	while (length > 0 && isspace(last[length - 1]))
++		length--;
++
++	static const char* const kQuitCommands[] = { "continue", "exit", "es" };
++	for (size_t i = 0; i < B_COUNT_OF(kQuitCommands); i++) {
++		if (length == strlen(kQuitCommands[i])
++			&& strncmp(last, kQuitCommands[i], length) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++
 +/*!	Executes the commands that follow kKDLMessageCommandSeparator in the
 +	kernel debugger message. Returns the return code of the last command, so
 +	that commands ending with "continue" can leave the debugger again without
-+	a keyboard.
++	a keyboard. An error stops the command line before its end; when the last
++	command leaves the debugger, it is still executed then, since nobody may be
++	able to type it.
 +*/
 +static int
  execute_panic_commands()
@@ -45353,16 +46476,22 @@ index cde05273ca..dfe3c4f777 100644
  	const size_t kCommandBufferSize = 512;
  	char* commandBuffer = (char*)debug_malloc(kCommandBufferSize);
  	if (commandBuffer != NULL) {
-@@ -796,7 +822,7 @@ execute_panic_commands()
+@@ -796,7 +850,13 @@ execute_panic_commands()
  			if (commands != NULL) {
  				commands += strlen(kKDLMessageCommandSeparator);
  				kprintf("initial commands: %s\n", commands);
 -				evaluate_debug_command(commands);
 +				returnCode = evaluate_debug_command(commands);
++				if (returnCode != B_KDEBUG_QUIT
++					&& last_command_quits(commands)) {
++					kprintf("initial commands stopped early, leaving the "
++						"debugger as they ask\n");
++					returnCode = B_KDEBUG_QUIT;
++				}
  			}
  		}
  
-@@ -804,6 +830,8 @@ execute_panic_commands()
+@@ -804,6 +864,8 @@ execute_panic_commands()
  
  		debug_free(commandBuffer);
  	}
@@ -45371,7 +46500,7 @@ index cde05273ca..dfe3c4f777 100644
  }
  
  
-@@ -887,6 +915,7 @@ kernel_debugger_loop(const char* messagePrefix, const char* message,
+@@ -887,6 +949,7 @@ kernel_debugger_loop(const char* messagePrefix, const char* message,
  			arch_debug_stack_trace();
  	}
  
@@ -45379,7 +46508,7 @@ index cde05273ca..dfe3c4f777 100644
  	if (has_debugger_command("help")) {
  		// Commands are registered already -- execute panic() commands. Do that
  		// with paging disabled, so everything is printed, even if the user
-@@ -894,7 +923,7 @@ kernel_debugger_loop(const char* messagePrefix, const char* message,
+@@ -894,7 +957,7 @@ kernel_debugger_loop(const char* messagePrefix, const char* message,
  		bool pagingEnabled = blue_screen_paging_enabled();
  		blue_screen_set_paging(false);
  
@@ -45388,7 +46517,7 @@ index cde05273ca..dfe3c4f777 100644
  
  		blue_screen_set_paging(pagingEnabled);
  	}
-@@ -903,7 +932,7 @@ kernel_debugger_loop(const char* messagePrefix, const char* message,
+@@ -903,7 +966,7 @@ kernel_debugger_loop(const char* messagePrefix, const char* message,
  		// Index of the previous command line, if the command returned
  		// B_KDEBUG_CONT, i.e. asked to be repeatable, -1 otherwise.
  
@@ -45397,7 +46526,7 @@ index cde05273ca..dfe3c4f777 100644
  		CommandLineEditingHelper editingHelper;
  		kprintf(kKDLPrompt);
  		char* line = sLineBuffer[sCurrentLine];
-@@ -1327,6 +1356,10 @@ syslog_write(const char* text, int32 length, bool notify)
+@@ -1327,6 +1390,10 @@ syslog_write(const char* text, int32 length, bool notify)
  	}
  
  	ring_buffer_write(sSyslogBuffer, (uint8*)text, length);
@@ -45408,7 +46537,7 @@ index cde05273ca..dfe3c4f777 100644
  
  	if (notify)
  		release_sem_etc(sSyslogNotify, 1, B_DO_NOT_RESCHEDULE);
-@@ -2154,6 +2187,26 @@ kernel_debugger(const char* message)
+@@ -2154,6 +2221,26 @@ kernel_debugger(const char* message)
  }
  
  
@@ -45435,7 +46564,7 @@ index cde05273ca..dfe3c4f777 100644
  bool
  set_dprintf_enabled(bool newState)
  {
-@@ -2310,15 +2363,23 @@ _user_kernel_debugger(const char* userMessage)
+@@ -2310,15 +2397,23 @@ _user_kernel_debugger(const char* userMessage)
  		return B_NOT_ALLOWED;
  
  	char message[512];
@@ -45479,21 +46608,29 @@ index e4890fb38a..7ee457dcc4 100644
  				break;
  		}
 diff --git a/src/system/kernel/device_manager/legacy_drivers.cpp b/src/system/kernel/device_manager/legacy_drivers.cpp
-index 71e20a4eb5..1d8a62d95a 100644
+index c55fdf6be3..1b09764ba0 100644
 --- a/src/system/kernel/device_manager/legacy_drivers.cpp
 +++ b/src/system/kernel/device_manager/legacy_drivers.cpp
-@@ -1306,7 +1306,10 @@ LegacyDevice::UninitDevice()
- 	if (fDriver != NULL) {
- 		if (--fDriver->devices_used == 0 && fDriver->devices.IsEmpty())
- 			unload_driver(fDriver);
--		fDriver = NULL;
-+		// While the device is published, the next open has to count as a
-+		// user of the driver again, or the driver could be reloaded under it
-+		if (fRemovedFromParent)
-+			fDriver = NULL;
- 	}
- }
+@@ -529,11 +529,17 @@ get_priority(const char* path)
+ 	};
+ 	KPath pathBuffer;
  
+-	for (uint32 index = 0; index < B_COUNT_OF(whichPath); index++) {
++	// From the most specific: /boot/system is a prefix of
++	// /boot/system/non-packaged too, and a non-packaged driver got the
++	// priority of the packaged one it is meant to supersede. A prefix only
++	// counts up to a path separator.
++	for (int32 index = B_COUNT_OF(whichPath) - 1; index >= 0; index--) {
+ 		if (__find_directory(whichPath[index], gBootDevice, false,
+ 			pathBuffer.LockBuffer(), pathBuffer.BufferSize()) == B_OK) {
+ 			pathBuffer.UnlockBuffer();
+-			if (strncmp(pathBuffer.Path(), path, pathBuffer.Length()) == 0)
++			size_t length = pathBuffer.Length();
++			if (strncmp(pathBuffer.Path(), path, length) == 0
++				&& (path[length] == '/' || path[length] == '\0'))
+ 				return index;
+ 		} else
+ 			pathBuffer.UnlockBuffer();
 diff --git a/src/system/kernel/fs/socket.cpp b/src/system/kernel/fs/socket.cpp
 index 416280b514..ff1d57b6f6 100644
 --- a/src/system/kernel/fs/socket.cpp
@@ -45857,57 +46994,6 @@ index 1e7a2c62d6..3cff34af45 100644
  
  	: $(TARGET_KERNEL_PIC_CCFLAGS)
  ;
-diff --git a/src/system/kernel/scheduler/low_latency.cpp b/src/system/kernel/scheduler/low_latency.cpp
-index bb81211d4b..12fd3470eb 100644
---- a/src/system/kernel/scheduler/low_latency.cpp
-+++ b/src/system/kernel/scheduler/low_latency.cpp
-@@ -116,9 +116,12 @@ rebalance(const ThreadData* threadData)
- 	ASSERT(other != NULL);
- 
- 	// Check if the least loaded core is significantly less loaded than
--	// the current one.
--	int32 coreLoad = core->GetLoad();
--	int32 otherLoad = other->GetLoad();
-+	// the current one. Without the cap at kMaxLoad: with one CPU per core a
-+	// core with two busy threads would otherwise look as loaded as one with
-+	// a single busy thread, and neither thread would ever move to an idle
-+	// core.
-+	int32 coreLoad = core->GetUncappedLoad();
-+	int32 otherLoad = other->GetUncappedLoad();
- 	if (other == core || otherLoad + kLoadDifference >= coreLoad)
- 		return core;
- 
-diff --git a/src/system/kernel/scheduler/scheduler_cpu.h b/src/system/kernel/scheduler/scheduler_cpu.h
-index fce705f795..449475f8db 100644
---- a/src/system/kernel/scheduler/scheduler_cpu.h
-+++ b/src/system/kernel/scheduler/scheduler_cpu.h
-@@ -157,6 +157,7 @@ public:
- 											bigtime_t activeTime);
- 
- 	inline				int32			GetLoad() const;
-+	inline				int32			GetUncappedLoad() const;
- 	inline				uint32			LoadMeasurementEpoch() const
- 											{ return fLoadMeasurementEpoch; }
- 
-@@ -405,6 +406,18 @@ CoreEntry::GetLoad() const
- }
- 
- 
-+// the load of the threads assigned to this core, even beyond what its CPUs
-+// can take: tells two busy threads on a core from one
-+inline int32
-+CoreEntry::GetUncappedLoad() const
-+{
-+	SCHEDULER_ENTER_FUNCTION();
-+
-+	ASSERT(fCPUCount > 0);
-+	return fLoad / fCPUCount;
-+}
-+
-+
- inline void
- CoreEntry::AddLoad(int32 load, uint32 epoch, bool updateLoad)
- {
 diff --git a/src/system/kernel/vm/vm_init.cpp b/src/system/kernel/vm/vm_init.cpp
 index d319f9eff7..9cd3056a47 100644
 --- a/src/system/kernel/vm/vm_init.cpp

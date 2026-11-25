@@ -2,7 +2,8 @@
 
 Port of [RenkuOS](https://github.com/RenkuOS/Source) (a Haiku fork) to the Toshiba AC100
 netbook (Compal PAZ00): NVIDIA Tegra 2, two Cortex-A9 cores at 1 GHz with a VFPv3-D16
-FPU and no NEON, 512 MB of RAM, 16 GB eMMC.
+FPU and no NEON, 512 MB of RAM, 16 GB eMMC (8 GB on some
+units).
 
 ## Download
 

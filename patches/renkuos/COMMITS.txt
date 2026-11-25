@@ -1,6 +1,6 @@
-# The AC100 commits of the release on RenkuOS main 7d3aff32eb, oldest first.
-# 0001-AC100-tree-at-the-merge-of-RenkuOS-main-7d3aff32eb.patch holds the AC100 tree at the merge of
-# RenkuOS main (63ec5976d5); the patches after it are the commits since, one each.
+# The AC100 commits of the release on RenkuOS main 024d1e98dc, oldest first.
+# 0001-AC100-tree-at-the-merge-of-RenkuOS-main-024d1e98dc.patch holds the AC100 tree at the merge of
+# RenkuOS main (eda34b324e); the patches after it are the commits since, one each.
 
 763a639c5f 2026-10-20 ARM: link kernel and loader against the cross-compiler libgcc
 2ac377c2cd 2026-10-20 ARM: link libroot and applications against the cross-compiler libsupc++ and libgcc
@@ -215,3 +215,4 @@ f64df914e3 2026-10-05 usb_raw, USB Kit: isochronous streams
 fda5f36638 2026-11-22 usb_raw, USB Kit: one isochronous stream per endpoint
 5c81225bbf 2026-11-22 ehci: run the isochronous finisher above real-time media threads
 1e178b1eda 2026-11-24 ehci: an isochronous anchor queued far ahead is not one already passed
+fef61b56fa 2026-11-24 usb_audio: a volume range under a decibel is in plain steps

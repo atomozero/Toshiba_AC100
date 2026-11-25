@@ -102,7 +102,9 @@ you start the AC100; the cable can be removed once U-Boot is running.
 "Install to internal memory", on the desktop, copies the running system, home folder
 included, to the eMMC. **It replaces Android**, or whatever is installed there; only the
 first 16 MB of the eMMC, with the NVIDIA boot data and the original bootloader, are left
-alone. It works in two phases with a restart in between, and explains each one.
+alone. It works in two phases with a restart in between, and explains each one. It
+works with the 16 GB eMMC of most AC100s and with the 8 GB one of some, as long as what
+is on the microSD card fits in it: it checks that first.
 
 Before using it, make a backup of the whole eMMC: start U-Boot as in step 5, choose
 "Internal eMMC as USB disk" and copy the disk that appears on the PC to a file. With that

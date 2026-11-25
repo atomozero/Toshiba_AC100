@@ -73,6 +73,9 @@ For tests, the governor can be stopped: `governor false` in
 - **Microphone**: the built-in one is next to the camera, above the screen. Its level is
   the **Boost** of "Toshiba AC100 audio" in Preferences > Media (24 dB by default; 18
   is quieter, 30 louder). The record gain there only changes the headset microphone.
+- **USB microphones and webcams**: their microphone appears in Preferences > Media as
+  an audio input with the device's name (for example "AUKEY PC-LM1E Camera"); choose it
+  there as the input to record from it. Its level is the volume of that input.
 
 ## Bluetooth
 
@@ -82,15 +85,18 @@ battery level, and works in the games of SalaGiochi.
 
 ## Applications
 
-WebPositive (web), LocalSend (files to and from phones and PCs), Genio (programming),
-BePDF, WonderBrush (drawing), Atomo123, R Television, Cricket, a SIP softphone, and
+WebPositive (web), Cinema (videos and live TV channels), BubiCam (USB webcams),
+LocalSend (files to and from phones and PCs), Genio (programming), BePDF, WonderBrush
+(drawing), Atomo123, R Television, Cricket, a SIP softphone, and
 SalaGiochi: it comes without games; drop the game files you own on "Add games", on the
 desktop. In the Terminal: git, curl, ssh, nano, htop and the usual tools.
 
 ## Things that do not work yet
 
-- The **webcam**: on our AC100 it does not answer on USB, most likely a hardware fault
-  of the camera module or of its cable; tell us if yours does.
+- The **built-in webcam**: on our AC100 it does not answer on USB, most likely a
+  hardware fault of the camera module or of its cable; tell us if yours does. USB
+  webcams work, with BubiCam: 320x240 is clean, at 640x480 and above our camera still
+  loses part of its frames.
 - 3D acceleration and suspend.
 - **Restarting** does not come back by itself when U-Boot was loaded over USB: switch the
   AC100 off and start it again as in INSTALL.md.
