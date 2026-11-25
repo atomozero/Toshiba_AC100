@@ -253,7 +253,7 @@ boot_device()
 
 
 /*!	The eMMC is the MMC disk that is not the boot disk and has the size of
-	the AC100's 16 GB eMMC.
+	the AC100's eMMC: 16 GB on most units, 8 GB on some.
 */
 static bool
 find_emmc(Disk& disk, std::string& error)
@@ -294,7 +294,7 @@ find_emmc(Disk& disk, std::string& error)
 		close(fd);
 		say("  %s: %lld MB, %s\n", raw.c_str(), (long long)(size / kMB),
 			geometry.removable ? "removable" : "fixed");
-		if (geometry.bytes_per_sector != kSectorSize || size < 14000 * kMB
+		if (geometry.bytes_per_sector != kSectorSize || size < 7000 * kMB
 			|| size > 17000 * kMB || (geometry.removable && !sTest)) {
 			continue;
 		}
@@ -307,7 +307,7 @@ find_emmc(Disk& disk, std::string& error)
 	closedir(dir);
 
 	if (found != 1) {
-		error = found == 0 ? "no 16 GB eMMC found"
+		error = found == 0 ? "no 8 or 16 GB eMMC found"
 			: "more than one disk looks like the eMMC";
 		return false;
 	}
@@ -385,6 +385,36 @@ compute_layout(const Disk& disk)
 	uint64 perMB = kMB / kSectorSize;
 	layout.haikuEnd = (layout.lastUsable + 1) / perMB * perMB - 1;
 	return layout;
+}
+
+
+/*!	The Haiku partition has to hold everything on the microSD card's system
+	volume, with some room left: an 8 GB eMMC leaves about 7.5 GB for it.
+*/
+static bool
+check_space(const Layout& layout, std::string& error)
+{
+	static const off_t kSpare = 512 * kMB;
+	fs_info info;
+	if (fs_stat_dev(dev_for_path("/boot"), &info) != 0) {
+		error = "cannot read the size of the system on the microSD card";
+		return false;
+	}
+	off_t used = (info.total_blocks - info.free_blocks) * info.block_size;
+	off_t room = (off_t)(layout.haikuEnd - layout.haikuStart + 1)
+		* kSectorSize;
+	say("  the system on the microSD card uses %lld MB, the Haiku partition "
+		"has %lld MB\n", (long long)(used / kMB), (long long)(room / kMB));
+	if (used + kSpare > room) {
+		char text[200];
+		snprintf(text, sizeof(text), "the system uses %lld MB, more than fits "
+			"in the %lld MB of the Haiku partition with %lld MB to spare: "
+			"delete some files and try again", (long long)(used / kMB),
+			(long long)(room / kMB), (long long)(kSpare / kMB));
+		error = text;
+		return false;
+	}
+	return true;
 }
 
 
@@ -799,6 +829,8 @@ main(int argc, char** argv)
 		return fail("%s", error.c_str());
 
 	Layout layout = compute_layout(disk);
+	if (!check_space(layout, error))
+		return fail("%s", error.c_str());
 
 	if (strcmp(command, "install") == 0)
 		return phase_install(disk, layout);
